@@ -393,6 +393,85 @@ app.get('/api/research/sessions', (req, res) => {
   });
 });
 
+// Visible mock browser-use window: gives operators something to see when
+// LIVE_BROWSER_RESEARCH is off. Real Browser Use sessions return their own
+// liveUrl that points to docs.browser-use.com.
+app.get('/mock/browser-use/:jobId/:sourceType', (req, res) => {
+  const jobId = String(req.params.jobId || '');
+  const sourceType = String(req.params.sourceType || '');
+  const status = getBrowserResearchStatus({ jobId });
+  const session = (status?.sessions || []).find((s) => s.sourceType === sourceType) || null;
+  const businesses = (status?.businesses || []).filter((b) => (b.sources || []).some((src) => src.sourceType === sourceType));
+  const job = status?.job || null;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(renderMockBrowserWindow({ jobId, sourceType, session, businesses, job }));
+});
+
+function renderMockBrowserWindow({ jobId, sourceType, session, businesses, job }) {
+  const sourceLabel = session?.sourceLabel || sourceType || 'source';
+  const niche = job?.niche || 'business';
+  const city = job?.city || 'city';
+  const url = `https://example.com/${escapeHtml(sourceType)}/${encodeURIComponent(niche)}-${encodeURIComponent(city)}`;
+  const step = session?.lastStepSummary || 'Waiting for Browser Use...';
+  const status = session?.normalizedStatus || 'queued';
+  const cards = (businesses || []).slice(0, 8).map((b) => `
+    <div class="biz">
+      <div class="biz-name">${escapeHtml(b.businessName)}</div>
+      <div class="biz-meta">${escapeHtml(b.address || 'address pending')}</div>
+      <div class="biz-meta">${escapeHtml(b.phone || 'phone pending')} · ${escapeHtml(b.websiteUrl || 'no owned site')}</div>
+      <div class="biz-presence presence-${escapeHtml(b.presenceStrength || 'unknown')}">${escapeHtml((b.presenceStrength || 'unknown').toUpperCase())} presence</div>
+    </div>`).join('');
+  return `<!doctype html>
+<html><head><meta charset="utf-8" />
+<title>Browser Use · ${escapeHtml(sourceLabel)}</title>
+<meta http-equiv="refresh" content="2">
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0d1116; color: #e6edf3; }
+.chrome { background: #161b22; border-bottom: 1px solid #30363d; padding: 6px 10px; display: flex; align-items: center; gap: 8px; }
+.dots { display: flex; gap: 4px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #ff5f56; }
+.dot.y { background: #ffbd2e; }
+.dot.g { background: #27c93f; }
+.url { flex: 1; background: #0d1116; border: 1px solid #30363d; padding: 4px 10px; font-size: 12px; color: #8b949e; border-radius: 4px; }
+.tag { font-size: 10px; padding: 2px 6px; border: 1px solid #30363d; color: #58a6ff; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+.tag.live { color: #f97316; border-color: #f97316; animation: pulse 1.5s infinite; }
+.tag.completed { color: #2ea043; border-color: #2ea043; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.body { padding: 14px 18px; }
+.crumb { color: #8b949e; font-size: 11px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.08em; }
+h1 { margin: 0 0 4px; font-size: 18px; }
+.lead { color: #8b949e; font-size: 12px; margin-bottom: 14px; }
+.step { background: #161b22; border: 1px solid #30363d; padding: 8px 10px; font-size: 12px; color: #c9d1d9; margin-bottom: 16px; border-radius: 4px; }
+.cursor { display: inline-block; width: 7px; height: 13px; background: #58a6ff; vertical-align: middle; margin-left: 4px; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.biz { border: 1px solid #30363d; background: #0d1116; padding: 10px; border-radius: 4px; }
+.biz-name { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.biz-meta { color: #8b949e; font-size: 11px; margin-bottom: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.biz-presence { margin-top: 6px; font-size: 10px; letter-spacing: 0.08em; padding: 1px 6px; border-radius: 2px; display: inline-block; }
+.presence-none, .presence-weak { background: rgba(46, 160, 67, 0.15); color: #56d364; }
+.presence-mixed { background: rgba(187, 128, 9, 0.2); color: #f0883e; }
+.presence-strong { background: rgba(248, 81, 73, 0.15); color: #f85149; }
+.empty { color: #6e7681; font-size: 12px; padding: 30px; text-align: center; border: 1px dashed #30363d; border-radius: 4px; }
+</style></head>
+<body>
+  <div class="chrome">
+    <div class="dots"><span class="dot"></span><span class="dot y"></span><span class="dot g"></span></div>
+    <div class="url">${escapeHtml(url)}</div>
+    <span class="tag ${escapeHtml(status === 'completed' ? 'completed' : 'live')}">${escapeHtml(status)}</span>
+  </div>
+  <div class="body">
+    <div class="crumb">Browser Use · ${escapeHtml(sourceLabel)} · job ${escapeHtml(jobId)}</div>
+    <h1>${escapeHtml(niche)} in ${escapeHtml(city)}</h1>
+    <div class="lead">Mock browser session. Each refresh shows the latest agent step + extracted businesses.</div>
+    <div class="step">${escapeHtml(step)}<span class="cursor"></span></div>
+    ${cards ? `<div class="grid">${cards}</div>` : `<div class="empty">Agent is still reading the page...</div>`}
+  </div>
+</body></html>`;
+}
+
 app.post('/api/leads/:id/call', (req, res) => {
   const parsed = CallRequest.safeParse({ leadId: req.params.id, ...req.body });
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });

@@ -343,6 +343,12 @@ export default function App() {
       triggerEdge('scraper-memory');
       refreshLeads();
       refreshHealth();
+      // Auto-focus the first lead surfaced by browser research so the
+      // Memory tab fills up with the discovered businesses immediately.
+      if (evt.worker === 'browser_research' && evt.leadId && !focusedRef.current) {
+        setFocusedLeadId(evt.leadId);
+        setActiveTab('Memory');
+      }
     }
     if (t === 'scraper.profile') {
       bumpActivity('memory');

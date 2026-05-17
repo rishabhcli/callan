@@ -101,6 +101,52 @@ export default function MemoryConsole({ leadId }) {
     refresh();
   }, [refresh]);
 
+  // Keep the memory panel in sync with live memory + research traffic so
+  // discovered businesses appear without manual refresh.
+  useEffect(() => {
+    const stream = new EventSource('/api/events/stream');
+    let timer = null;
+    const schedule = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        refresh();
+      }, 400);
+    };
+    const handle = (data) => {
+      try {
+        const evt = JSON.parse(data);
+        if (!evt?.type) return;
+        if (
+          evt.type === 'lead.created' ||
+          evt.type === 'memory.write.queued' ||
+          evt.type === 'memory.write.succeeded' ||
+          evt.type === 'memory.write.failed' ||
+          evt.type === 'memory.status.checked' ||
+          evt.type === 'research.evidence.captured' ||
+          evt.type === 'research.job.completed'
+        ) schedule();
+      } catch {
+        // ignore malformed event payloads
+      }
+    };
+    const onMessage = (event) => handle(event.data);
+    stream.addEventListener('message', onMessage);
+    for (const name of [
+      'lead.created',
+      'memory.write.queued',
+      'memory.write.succeeded',
+      'memory.write.failed',
+      'memory.status.checked',
+      'research.evidence.captured',
+      'research.job.completed'
+    ]) stream.addEventListener(name, onMessage);
+    return () => {
+      if (timer) clearTimeout(timer);
+      stream.close();
+    };
+  }, [refresh]);
+
   const runSearch = useCallback(async (event) => {
     event?.preventDefault?.();
     if (!leadId || !query.trim()) return;

@@ -14,6 +14,8 @@ import {
   normalizeSessionStatus
 } from '../providers/browserUse.js';
 import { BrowserResearchOutputSchema, SOURCE_TYPES, validateSourceType } from './schemas.js';
+import { leads as leadsTable } from '../db.js';
+import { addDoc, containerTagFor } from '../memory.js';
 
 const DEFAULT_MAX_LEADS = 8;
 const DEFAULT_CONCURRENCY = 5;
@@ -362,19 +364,22 @@ async function runSourceSession({ job, source, active }) {
 async function runMockSourceSession({ job, source, sessionId, selectedModel, maxCostUsd, keepAlive, active }) {
   const providerSessionId = `mock_bu_${job.id.slice(-6)}_${source.type}`;
   active.providerSessions.set(sessionId, providerSessionId);
+  const liveUrl = `/mock/browser-use/${encodeURIComponent(job.id)}/${encodeURIComponent(source.type)}`;
   updateSession(sessionId, {
     provider_session_id: providerSessionId,
-    live_url: `/mock/browser-use/${encodeURIComponent(job.id)}/${encodeURIComponent(source.type)}`,
+    live_url: liveUrl,
     status: 'running',
     normalized_status: 'running',
-    last_step_summary: `Opening ${source.label}.`,
-    raw_json: jsonText({ providerSessionId, mock: true })
+    last_step_summary: `Opening ${source.label} for ${job.niche} in ${job.city}.`,
+    raw_json: jsonText({ providerSessionId, mock: true, liveUrl })
   });
+  emit('research.session.live_url', publicSessionEvent(getSessionRow(sessionId), job));
   emit('research.session.progress', publicSessionEvent(getSessionRow(sessionId), job));
 
-  for (const step of mockSteps(source)) {
+  const sessionStepDelay = mockStepDelayMs();
+  for (const step of mockSteps(source, { job })) {
     if (active.controller.signal.aborted) break;
-    await delay(35);
+    await delay(sessionStepDelay);
     updateSession(sessionId, { last_step_summary: step, updated_at: Date.now() });
     emit('research.session.progress', publicSessionEvent(getSessionRow(sessionId), job));
   }
@@ -391,14 +396,41 @@ async function runMockSourceSession({ job, source, sessionId, selectedModel, max
     return;
   }
 
-  const output = { leads: mockEvidenceForSource({ job, source }), skipped: [] };
-  const persisted = persistEvidenceBatch({
-    job,
-    sessionId,
-    providerSessionId,
-    source,
-    output
-  });
+  // Stream evidence one business at a time so the UI sees discoveries live.
+  const evidenceRows = mockEvidenceForSource({ job, source });
+  const persisted = [];
+  let runningCost = 0;
+  for (let i = 0; i < evidenceRows.length; i += 1) {
+    if (active.controller.signal.aborted) break;
+    const row = evidenceRows[i];
+    updateSession(sessionId, {
+      last_step_summary: `Extracting ${row.businessName} from ${source.label}.`,
+      updated_at: Date.now()
+    });
+    emit('research.session.progress', publicSessionEvent(getSessionRow(sessionId), job));
+    await delay(sessionStepDelay);
+
+    const persistedOne = persistEvidenceBatch({
+      job,
+      sessionId,
+      providerSessionId,
+      source,
+      output: { leads: [row], skipped: [] }
+    });
+    persisted.push(...persistedOne);
+
+    runningCost = source.type === 'website' ? 0.012 + i * 0.005 : 0.004 + i * 0.003;
+    updateSession(sessionId, {
+      output_count: persisted.length,
+      cost_usd: runningCost,
+      input_tokens: 240 + persisted.length * 150,
+      output_tokens: 80 + persisted.length * 80,
+      last_step_summary: `Captured ${row.businessName}.`,
+      updated_at: Date.now()
+    });
+    emit('research.session.progress', publicSessionEvent(getSessionRow(sessionId), job));
+  }
+
   updateSession(sessionId, {
     status: 'stopped',
     normalized_status: 'completed',
@@ -408,10 +440,14 @@ async function runMockSourceSession({ job, source, sessionId, selectedModel, max
     output_tokens: 420 + persisted.length * 80,
     finished_at: Date.now(),
     last_step_summary: `Captured ${persisted.length} structured evidence record${persisted.length === 1 ? '' : 's'}.`,
-    raw_json: jsonText({ output, model: selectedModel, maxCostUsd, keepAlive, mock: true })
+    raw_json: jsonText({ output: { leads: evidenceRows }, model: selectedModel, maxCostUsd, keepAlive, mock: true })
   });
   refreshJobCounts(job.id);
   emit('research.session.completed', publicSessionEvent(getSessionRow(sessionId), job));
+}
+
+function mockStepDelayMs() {
+  return clampInt(process.env.BROWSER_USE_RESEARCH_MOCK_STEP_DELAY_MS, 10, 5000, 250);
 }
 
 async function runLiveSourceSession({ job, source, sessionId, selectedModel, maxCostUsd, keepAlive, active }) {
@@ -535,9 +571,98 @@ function persistEvidenceBatch({ job, sessionId, providerSessionId, source, outpu
       skipped: saved.skipped,
       skippedReason: saved.skippedReason
     });
+    if (!saved.skipped) {
+      mirrorBusinessToMemory({ job, evidence: saved, source });
+    }
   }
   refreshJobCounts(job.id);
   return persisted;
+}
+
+function mirrorBusinessToMemory({ job, evidence, source }) {
+  try {
+    const profile = evidenceToBusinessProfile(evidence, { niche: job.niche, city: job.city });
+    const requestedLeadId = `lead_research_${slugify(evidence.businessName).slice(0, 28)}_${stableHash(evidence.businessName + ':' + (evidence.phone || ''))}`;
+    const containerTag = containerTagFor(requestedLeadId);
+    const insertResult = leadsTable.upsertResearch({
+      id: requestedLeadId,
+      container_tag: containerTag,
+      business_name: profile.businessName,
+      phone: profile.phone || evidence.phone || null,
+      address: profile.address || evidence.address || null,
+      niche: job.niche,
+      city: job.city,
+      website: profile.websiteUrl || evidence.websiteUrl || null,
+      status: 'discovered',
+      research_status: 'complete',
+      outreach_status: 'not_queued',
+      risk_status: 'pending',
+      consent_status: 'public_business',
+      phone_classification: (profile.phone || evidence.phone) ? 'business' : 'invalid',
+      next_action: 'classify_outreach',
+      source_url: evidence.sourceUrl || profile.sourceUrl || null,
+      online_presence_strength: profile.onlinePresenceStrength || evidence.presenceStrength || null,
+      presence_confidence: profile.onlinePresenceConfidence ?? evidence.confidence ?? null,
+      callable_reason: profile.callRecommendation?.whyCall || null,
+      blocked_reason: profile.callRecommendation?.whyNotCall || profile.notWorthCallingReason || null,
+      research_json: JSON.stringify(profile)
+    }, { actor: 'browser_research', profile, runId: job.id });
+
+    const lead = insertResult.lead;
+    emit('lead.created', {
+      worker: 'browser_research',
+      runId: job.id,
+      leadId: lead.id,
+      businessName: lead.business_name,
+      phone: lead.phone,
+      niche: lead.niche,
+      city: lead.city,
+      sourceUrl: lead.source_url,
+      duplicate: !!insertResult.duplicate,
+      mock: job.mode === 'mock'
+    });
+
+    // Mirror business_profile to Supermemory (per-lead containerTag).
+    addDoc(lead.container_tag, 'business_profile', profile, {
+      businessName: profile.businessName,
+      niche: job.niche,
+      city: job.city,
+      sourceUrl: evidence.sourceUrl || profile.sourceUrl || null,
+      profileSource: 'browser_research',
+      sourceId: `research:${job.id}:${source.type}:${evidence.id}`,
+      sourceEvent: `research.evidence.captured:${evidence.id}`
+    }).catch((err) => {
+      log.warn('browser_research.memory_write_failed', {
+        jobId: job.id,
+        leadId: lead.id,
+        error: err?.message || String(err)
+      });
+    });
+
+    // Also mirror the raw research_evidence so the Memory ledger shows source provenance.
+    addDoc(lead.container_tag, 'research_evidence', evidence, {
+      businessName: profile.businessName,
+      sourceType: source.type,
+      sourceUrl: evidence.sourceUrl || null,
+      sourceId: `evidence:${evidence.id}`,
+      sourceEvent: `research.evidence.captured:${evidence.id}`
+    }).catch(() => null);
+  } catch (err) {
+    log.warn('browser_research.mirror_failed', {
+      jobId: job.id,
+      businessName: evidence?.businessName,
+      error: err?.message || String(err)
+    });
+  }
+}
+
+function stableHash(value) {
+  let hash = 0;
+  const str = String(value || '');
+  for (let i = 0; i < str.length; i += 1) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36).slice(0, 8);
 }
 
 function normalizeOutputLeads(output, source) {
@@ -1172,11 +1297,15 @@ async function runLimited(items, concurrency, worker) {
   await Promise.all(runners);
 }
 
-function mockSteps(source) {
+function mockSteps(source, { job } = {}) {
+  const target = job ? `${job.niche} in ${job.city}` : 'targets';
   return [
-    `Loaded ${source.label}.`,
-    'Extracting public business fields.',
+    `Opening ${source.label} to scan ${target}.`,
+    `Loaded ${source.label} results page.`,
+    'Scrolling listings and collecting public business cards.',
+    'Following each business profile for phone, address, hours.',
     'Checking website, social, reviews, and hours evidence.',
+    'Scoring online presence strength for each candidate.',
     'Returning Browser Use structured output.'
   ];
 }
