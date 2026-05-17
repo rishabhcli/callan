@@ -23,7 +23,21 @@ function Profile({ data }) {
       <Row label="phone" mono>{maskPhone(data.phone)}</Row>
       <Row label="hours">{data.hours || '—'}</Row>
       <Row label="owner">{data.ownerHypothesis || '—'}</Row>
+      <Row label="presence">
+        <div className="stack">
+          <span className={`chip chip-presence-${data.onlinePresenceStrength || 'mixed'}`}>{data.onlinePresenceStrength || 'mixed'}</span>
+          <span>{data.onlinePresenceSummary || '—'}</span>
+        </div>
+      </Row>
       <Row label="summary">{data.whatTheyDo}</Row>
+      <Row label="needs">
+        <div className="chips">
+          {(data.needs || []).map((s, i) => (
+            <span key={i} className="chip mono">{s}</span>
+          ))}
+        </div>
+      </Row>
+      <Row label="email" mono>{data.bestContactEmail || '—'}</Row>
       <Row label="signals">
         <div className="chips">
           {(data.signals || []).map((s, i) => (
@@ -86,6 +100,10 @@ function PostMortem({ data }) {
         <span className={`chip chip-outcome chip-${outcome}`}>{outcome}</span>
         <span className="pm-reason"><em>{data.reason}</em></span>
       </div>
+      <div className="kv">
+        <Row label="invoice email" mono>{data.invoiceEmail || '—'}</Row>
+        <Row label="confirmed" mono>{data.confirmedEmail ? 'yes' : 'no'}</Row>
+      </div>
       <div className="pm-grid">
         <div>
           <div className="hd hd-sub">what worked</div>
@@ -114,6 +132,14 @@ function PostMortem({ data }) {
               </div>
             ))}
           </div>
+        </>
+      )}
+      {(data.customerQuestions || []).length > 0 && (
+        <>
+          <div className="hd hd-sub">agentmail questions</div>
+          <ul className="bulletlist">
+            {data.customerQuestions.map((q, i) => <li key={i}>{q}</li>)}
+          </ul>
         </>
       )}
     </div>

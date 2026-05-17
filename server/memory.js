@@ -17,7 +17,7 @@ function client() {
 }
 
 const TAG_RE = /^[A-Za-z0-9._-]{1,100}$/;
-const KINDS = new Set(['profile', 'pitch', 'call_log', 'post_mortem']);
+const KINDS = new Set(['profile', 'pitch', 'call_log', 'post_mortem', 'mail_thread']);
 
 export function containerTagFor(leadId) {
   const tag = `biz_${leadId}`;
@@ -61,7 +61,7 @@ export async function listKinds(containerTag) {
   if (!TAG_RE.test(containerTag)) throw new Error(`bad containerTag: ${containerTag}`);
   const sm = client();
   const res = await sm.memories.list({ containerTags: [containerTag], includeContent: true, limit: 50 });
-  const out = { profile: [], pitch: [], call_log: [], post_mortem: [] };
+  const out = { profile: [], pitch: [], call_log: [], post_mortem: [], mail_thread: [] };
   const docs = res?.memories || [];
   for (const d of docs) {
     const kind = d?.metadata?.kind;

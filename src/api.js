@@ -25,6 +25,10 @@ export const api = {
   getLead: (id) => call('GET', `/api/leads/${id}`),
   discover: ({ niche, city, count }) => call('POST', '/api/leads/discover', { niche, city, count }),
   startCall: (id, body = {}) => call('POST', `/api/leads/${id}/call`, body),
+  approveLiveCall: (id) => call('POST', `/api/leads/${id}/approve-live-call`, {}),
   followup: (id, toEmail) => call('POST', `/api/leads/${id}/followup`, { toEmail }),
-  build: (id) => call('POST', `/api/leads/${id}/build`, {})
+  build: (id) => call('POST', `/api/leads/${id}/build`, {}),
+  outreachStatus: () => call('GET', '/api/outreach/status'),
+  startOutreach: () => call('POST', '/api/outreach/start', {}),
+  stopOutreach: () => call('POST', '/api/outreach/stop', {})
 };

@@ -36,6 +36,15 @@ export async function runAnalyst({ leadId, callId }) {
       systemInstruction: 'You are a brutally honest call coach. No flattery. Be specific.',
       thinkingLevel: 'medium'
     });
+    const invoiceEmail = sanitizeEmail(postMortem.invoiceEmail) || extractEmailFromTranscript(transcript);
+    if (invoiceEmail) {
+      postMortem.invoiceEmail = invoiceEmail;
+      postMortem.confirmedEmail = Boolean(postMortem.confirmedEmail || transcriptConfirmsEmail(transcript, invoiceEmail));
+    } else {
+      postMortem.invoiceEmail = null;
+      postMortem.confirmedEmail = false;
+    }
+    if (!Array.isArray(postMortem.customerQuestions)) postMortem.customerQuestions = [];
 
     await addDoc(tag, 'post_mortem', postMortem, { callId, outcome: postMortem.outcome });
 
@@ -51,7 +60,7 @@ export async function runAnalyst({ leadId, callId }) {
     });
 
     if (postMortem.outcome === 'won') {
-      const toEmail = resolveMailerEmail(lead);
+      const toEmail = resolveMailerEmail(lead, postMortem);
       if (toEmail) {
         import('./mailer.js')
           .then((m) => m.runMailer({ leadId, toEmail }))
@@ -109,11 +118,16 @@ function buildPrompt({ lead, profileDoc, pitchDoc, transcript }) {
     'outcome ∈ {won,lost,callback,unreachable}. reason is one sentence.',
     'whatWorked and whatToTryNext: short, concrete, no platitudes.',
     'replayMoments: up to 5 entries pointing at exact transcript excerpts that turned the call.',
+    'invoiceEmail: the email address the owner gave for the invoice, only if the agent read it back and the owner confirmed it. Otherwise null.',
+    'confirmedEmail: true only when the transcript shows the owner confirming the read-back.',
+    'customerQuestions: concrete questions the owner asked that AgentMail should be ready to answer.',
     'followupEmailDraft: only fill if outcome=="won". Otherwise null.'
   ].join('\n');
 }
 
-function resolveMailerEmail(lead) {
+function resolveMailerEmail(lead, postMortem) {
+  const invoiceEmail = sanitizeEmail(postMortem?.invoiceEmail);
+  if (invoiceEmail) return invoiceEmail;
   if (env.allowedEmails?.length) return env.allowedEmails[0];
   if (env.runMode === 'mock') {
     const slug = String(lead.business_name || 'business')
@@ -123,4 +137,39 @@ function resolveMailerEmail(lead) {
     return `owner@${slug}.com`;
   }
   return null;
+}
+
+function sanitizeEmail(email) {
+  if (!email || typeof email !== 'string') return null;
+  const cleaned = email.trim().replace(/^mailto:/i, '').replace(/[<>"'(),;]+$/g, '');
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned) ? cleaned.toLowerCase() : null;
+}
+
+function extractEmailFromTranscript(transcript) {
+  const text = transcriptText(transcript);
+  if (!text) return null;
+  const direct = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
+  if (direct) return sanitizeEmail(direct);
+  const spoken = text
+    .toLowerCase()
+    .replace(/\s+at\s+/g, '@')
+    .replace(/\s+dot\s+/g, '.')
+    .replace(/\s+/g, '');
+  return sanitizeEmail(spoken.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/)?.[0]);
+}
+
+function transcriptConfirmsEmail(transcript, email) {
+  const text = transcriptText(transcript).toLowerCase();
+  if (!text || !email) return false;
+  const emailMentioned = text.includes(email.toLowerCase());
+  const confirmed = /\b(yes|correct|right|that's right|that is right|confirmed|yep|yeah)\b/i.test(text);
+  return emailMentioned && confirmed;
+}
+
+function transcriptText(transcript) {
+  if (!transcript) return '';
+  if (typeof transcript === 'string') return transcript;
+  if (Array.isArray(transcript)) return transcript.map((t) => t?.text || JSON.stringify(t)).join('\n');
+  if (Array.isArray(transcript.turns)) return transcript.turns.map((t) => t?.text || JSON.stringify(t)).join('\n');
+  try { return JSON.stringify(transcript); } catch { return ''; }
 }

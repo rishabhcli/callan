@@ -91,6 +91,7 @@ function MemoryTab({ detail }) {
       <MemoryDoc kind="pitch"       doc={mem.pitch?.[0]}       />
       <MemoryDoc kind="call_log"    doc={mem.call_log?.[0]}    />
       <MemoryDoc kind="post_mortem" doc={mem.post_mortem?.[0]} />
+      <MemoryDoc kind="mail_thread" doc={mem.mail_thread?.[0]} />
     </div>
   );
 }
@@ -174,12 +175,17 @@ function MailerTab({ detail }) {
     if (!mailerRun?.detail_json) return null;
     try { return JSON.parse(mailerRun.detail_json); } catch { return null; }
   }, [mailerRun]);
-  const threadId = detailJson?.threadId || '—';
+  const threadId = detail?.latestThread?.threadId || detailJson?.threadId || detail?.lead?.agentmail_thread_id || '—';
+  const invoiceUrl = payment?.hosted_invoice_url || payment?.payment_link_url;
+  const mailEvents = useMemo(
+    () => (detail?.contactEvents || []).filter((e) => e.channel === 'agentmail').slice().reverse(),
+    [detail]
+  );
 
   const [copied, setCopied] = useState(false);
   const copy = () => {
-    if (!payment?.payment_link_url) return;
-    navigator.clipboard?.writeText(payment.payment_link_url).then(() => {
+    if (!invoiceUrl) return;
+    navigator.clipboard?.writeText(invoiceUrl).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     });
@@ -189,7 +195,8 @@ function MailerTab({ detail }) {
     return (
       <div className="empty-inspector">
         <div className="hd">mailer</div>
-        <div className="mono note">// no payment link yet. Trigger followup.</div>
+        <div className="mono note">// no invoice yet. Trigger AgentMail invoice.</div>
+        <ThreadView events={mailEvents} />
       </div>
     );
   }
@@ -197,11 +204,11 @@ function MailerTab({ detail }) {
   const created = payment.status === 'created';
   return (
     <div className="mailertab">
-      <div className="hd">payment link</div>
+      <div className="hd">agentmail invoice</div>
       <div className="paylink">
         <span className="chip chip-amount">{fmtPaymentAmount(payment.amount_cents)}</span>
-        <a className="paylink-url mono" href={payment.payment_link_url} target="_blank" rel="noreferrer">
-          {payment.payment_link_url}
+        <a className="paylink-url mono" href={invoiceUrl} target="_blank" rel="noreferrer">
+          {invoiceUrl}
         </a>
         <button className="btn btn-mini" onClick={copy}>{copied ? 'copied' : 'copy'}</button>
       </div>
@@ -211,8 +218,20 @@ function MailerTab({ detail }) {
           <div className="kv-val mono">{threadId}</div>
         </div>
         <div className="kv-row">
+          <div className="kv-key mono">invoice</div>
+          <div className="kv-val mono">{payment.stripe_invoice_id || payment.stripe_session_id || payment.id}</div>
+        </div>
+        <div className="kv-row">
+          <div className="kv-key mono">due</div>
+          <div className="kv-val mono">{payment.due_at ? new Date(payment.due_at).toLocaleDateString() : '—'}</div>
+        </div>
+        <div className="kv-row">
           <div className="kv-key mono">subject</div>
-          <div className="kv-val">Your website with callmemaybe — payment link + meeting invite</div>
+          <div className="kv-val">Your callmemaybe website invoice + meeting invite</div>
+        </div>
+        <div className="kv-row">
+          <div className="kv-key mono">replies</div>
+          <div className="kv-val">Customer replies stay in AgentMail so the agent can answer questions and keep the sale moving.</div>
         </div>
         <div className="kv-row">
           <div className="kv-key mono">ICS</div>
@@ -226,10 +245,35 @@ function MailerTab({ detail }) {
         </div>
       </div>
       {created && (
-        <a className="btn btn-primary" href={payment.payment_link_url} target="_blank" rel="noreferrer">
-          open payment link (demo)
+        <a className="btn btn-primary" href={invoiceUrl} target="_blank" rel="noreferrer">
+          open invoice
         </a>
       )}
+      <ThreadView events={mailEvents} />
+    </div>
+  );
+}
+
+function ThreadView({ events }) {
+  if (!events.length) {
+    return <div className="thread-empty mono">// no AgentMail conversation events yet.</div>;
+  }
+  return (
+    <div className="thread-view">
+      <div className="thread-title mono">AgentMail thread</div>
+      {events.map((event) => (
+        <div key={event.id} className={`thread-msg thread-${event.direction}`}>
+          <div className="thread-meta mono">
+            <span>{event.direction}</span>
+            <span className="dot">·</span>
+            <span>{event.type.replace(/_/g, ' ')}</span>
+            <span className="dot">·</span>
+            <span>{new Date(event.created_at).toLocaleTimeString()}</span>
+          </div>
+          {event.subject ? <div className="thread-subject">{event.subject}</div> : null}
+          <div className="thread-body">{event.body}</div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -240,6 +284,7 @@ function BuilderTab({ detail, builderInfo }) {
   const liveUrl = builderInfo?.liveUrl || latest?.live_url;
   const projectUrl = builderInfo?.projectUrl || latest?.project_url;
   const brief = builderInfo?.brief;
+  const blockedAuth = latest?.status === 'blocked_auth';
 
   if (!liveUrl && !projectUrl) {
     return (
@@ -255,7 +300,9 @@ function BuilderTab({ detail, builderInfo }) {
       <div className="hd-row">
         <div className="hd">live build</div>
         <div className="mono note">
-          {projectUrl ? (
+          {blockedAuth ? (
+            <span className="chip chip-pay-failed">auth needed</span>
+          ) : projectUrl ? (
             <a className="accent" href={projectUrl} target="_blank" rel="noreferrer">open site →</a>
           ) : 'building…'}
         </div>

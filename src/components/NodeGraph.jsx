@@ -1,11 +1,11 @@
 import React, { useMemo } from 'react';
 
 const NODES = [
-  { id: 'scraper',  label: 'Scraper',  x:  80, y: 110, gloss: 'discover' },
+  { id: 'scraper',  label: 'Research', x:  80, y: 110, gloss: 'presence' },
   { id: 'memory',   label: 'Memory',   x: 360, y: 110, gloss: 'long-term' },
   { id: 'caller',   label: 'Caller',   x: 640, y:  40, gloss: 'voice' },
-  { id: 'analyst',  label: 'Analyst',  x: 640, y: 180, gloss: 'post-mortem' },
-  { id: 'mailer',   label: 'Mailer',   x: 880, y:  40, gloss: 'follow-up' },
+  { id: 'analyst',  label: 'Analyst',  x: 640, y: 180, gloss: 'needs' },
+  { id: 'mailer',   label: 'Mailer',   x: 880, y:  40, gloss: 'invoice' },
   { id: 'builder',  label: 'Builder',  x: 880, y: 180, gloss: 'live build' }
 ];
 

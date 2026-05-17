@@ -1,9 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { emit } from '../sse.js';
-import { runs, payments, leads } from '../db.js';
+import { runs, payments, leads, contactEvents } from '../db.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
-import { containerTagFor, getLatest } from '../memory.js';
+import { addDoc, containerTagFor, getLatest } from '../memory.js';
 import { generateText } from '../gemini.js';
 
 const ICS_DT_FMT = (d) =>
@@ -20,15 +20,15 @@ function maskEmail(addr) {
   return `${local[0]}***@***.${tld}`;
 }
 
-function shouldMockPayments() {
-  return env.runMode !== 'live' || !env.live.payments || !env.stripe.secretKey;
+function shouldMockInvoices() {
+  return !['live', 'demo_live', 'autonomous_live'].includes(env.runMode) || !env.live.payments || !env.stripe.secretKey;
 }
 
 function shouldMockEmail(toEmail) {
-  if (env.runMode !== 'live') return true;
+  if (!['live', 'demo_live', 'autonomous_live'].includes(env.runMode)) return true;
   if (!env.live.emails) return true;
   if (!env.agentmail.apiKey || !env.agentmail.inboxId) return true;
-  if (!env.allowedEmails.includes(toEmail)) return true;
+  if (env.runMode === 'demo_live' && !env.allowedEmails.includes(toEmail)) return true;
   return false;
 }
 
@@ -108,30 +108,50 @@ async function writeRecap({ businessName, profile, postMortem }) {
     '',
     `Thanks for the chat earlier. As we discussed, we will put together a simple, polished website that shows off what you do, makes you easy to find, and gives your customers a clear way to reach you.`,
     '',
-    `Once payment is in, the build kicks off and you can watch it happen live. There is also a 30-minute follow-up on the calendar so we can lock in the details.`,
+      `Your invoice is below. Once it is paid, the build kicks off and you can watch it happen live. You can also reply to this AgentMail thread with questions before or after payment.`,
     '',
     `Talk soon,`,
     `the team at callmemaybe`
   ].join('\n');
 }
 
-async function createStripeLink({ leadId, businessName }) {
+async function createStripeInvoice({ leadId, businessName, toEmail, idempotencyKey }) {
   const { default: Stripe } = await import('stripe');
-  const stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2024-12-18.acacia' });
-  const product = await stripe.products.create({
-    name: `${env.stripe.productName} for ${businessName}`
-  });
-  const price = await stripe.prices.create({
-    product: product.id,
-    unit_amount: env.stripe.priceCents,
-    currency: 'usd'
-  });
-  const link = await stripe.paymentLinks.create({
-    line_items: [{ price: price.id, quantity: 1 }],
-    after_completion: { type: 'redirect', redirect: { url: env.stripe.successUrl } },
+  const stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2026-02-25.clover' });
+  const customer = await stripe.customers.create({
+    email: toEmail,
+    name: businessName,
     metadata: { leadId }
+  }, {
+    idempotencyKey: `${idempotencyKey}:customer`
   });
-  return link.url;
+  await stripe.invoiceItems.create({
+    customer: customer.id,
+    amount: env.stripe.priceCents,
+    currency: 'usd',
+    description: `${env.stripe.productName} for ${businessName}`,
+    metadata: { leadId }
+  }, {
+    idempotencyKey: `${idempotencyKey}:item`
+  });
+  const invoice = await stripe.invoices.create({
+    customer: customer.id,
+    collection_method: 'send_invoice',
+    days_until_due: 7,
+    auto_advance: false,
+    metadata: { leadId }
+  }, {
+    idempotencyKey: `${idempotencyKey}:invoice`
+  });
+  const finalized = await stripe.invoices.finalizeInvoice(invoice.id, {}, {
+    idempotencyKey: `${idempotencyKey}:finalize`
+  });
+  return {
+    id: finalized.id,
+    customerId: customer.id,
+    url: finalized.hosted_invoice_url || finalized.invoice_pdf,
+    dueAt: finalized.due_date ? finalized.due_date * 1000 : null
+  };
 }
 
 async function sendAgentMail({ toEmail, subject, text, html, icsBase64 }) {
@@ -174,26 +194,43 @@ export async function runMailer({ leadId, toEmail }) {
     const businessName = lead.business_name || profile.businessName || 'your business';
     const recap = await writeRecap({ businessName, profile, postMortem });
 
-    let paymentLinkUrl;
-    if (shouldMockPayments()) {
-      paymentLinkUrl = `https://buy.stripe.com/test_demo/${leadId}`;
-      log.info('mailer.payment_mock', { leadId });
+    const idempotencyKey = `invoice_${leadId}_${env.stripe.priceCents}`;
+    const existingPayment = payments.getByIdempotency(idempotencyKey);
+    let invoice = existingPayment ? {
+      id: existingPayment.stripe_invoice_id || existingPayment.stripe_session_id,
+      customerId: existingPayment.stripe_customer_id,
+      url: existingPayment.hosted_invoice_url || existingPayment.payment_link_url,
+      dueAt: existingPayment.due_at
+    } : { id: `in_demo_${leadId}`, customerId: null, url: `https://invoice.stripe.com/i/demo_${leadId}`, dueAt: Date.now() + 7 * 86400000 };
+    if (existingPayment) {
+      log.info('mailer.invoice_reuse', { leadId, paymentId: existingPayment.id });
+    } else if (shouldMockInvoices()) {
+      log.info('mailer.invoice_mock', { leadId });
     } else {
-      paymentLinkUrl = await createStripeLink({ leadId, businessName });
+      invoice = await createStripeInvoice({ leadId, businessName, toEmail, idempotencyKey });
     }
 
-    payments.insert({
-      id: `pay_${randomBytes(6).toString('hex')}`,
-      lead_id: leadId,
-      payment_link_url: paymentLinkUrl,
-      amount_cents: env.stripe.priceCents,
-      status: 'created'
-    });
-    emit('mailer.payment_link', {
+    if (!existingPayment) {
+      payments.insert({
+        id: `pay_${randomBytes(6).toString('hex')}`,
+        lead_id: leadId,
+        stripe_session_id: invoice.id,
+        stripe_invoice_id: invoice.id,
+        stripe_customer_id: invoice.customerId,
+        payment_link_url: invoice.url,
+        hosted_invoice_url: invoice.url,
+        amount_cents: env.stripe.priceCents,
+        status: 'created',
+        due_at: invoice.dueAt,
+        idempotency_key: idempotencyKey
+      });
+    }
+    emit('mailer.invoice_link', {
       worker: 'mailer',
       leadId,
       runId,
-      paymentLinkUrl,
+      invoiceUrl: invoice.url,
+      paymentLinkUrl: invoice.url,
       amount: env.stripe.priceCents
     });
 
@@ -212,14 +249,15 @@ export async function runMailer({ leadId, toEmail }) {
     });
     const icsBase64 = Buffer.from(ics, 'utf8').toString('base64');
 
-    const subject = `Your website with callmemaybe — payment link + meeting invite`;
+    const subject = `Your callmemaybe website invoice + meeting invite`;
     const bodyText = [
       recap,
       '',
-      `Pay here to kick off the build: ${paymentLinkUrl}`,
-      `Follow-up meeting: ${meetingUrl} (calendar invite attached)`
+      `Invoice: ${invoice.url}`,
+      `Follow-up meeting: ${meetingUrl} (calendar invite attached)`,
+      `Reply to this email anytime — the agent will use this AgentMail thread to answer questions and keep the build moving.`
     ].join('\n');
-    const bodyHtml = `<p>${recap.replace(/\n+/g, '</p><p>')}</p><p><a href="${paymentLinkUrl}">Pay here to kick off the build</a></p><p>Follow-up meeting: <a href="${meetingUrl}">${meetingUrl}</a> (calendar invite attached)</p>`;
+    const bodyHtml = `<p>${recap.replace(/\n+/g, '</p><p>')}</p><p><a href="${invoice.url}">Open invoice</a></p><p>Follow-up meeting: <a href="${meetingUrl}">${meetingUrl}</a> (calendar invite attached)</p><p>Reply to this email anytime — the agent will use this AgentMail thread to answer questions and keep the build moving.</p>`;
 
     let threadId;
     let mock = false;
@@ -237,6 +275,37 @@ export async function runMailer({ leadId, toEmail }) {
       });
     }
 
+    contactEvents.add({
+      lead_id: leadId,
+      type: 'invoice_email',
+      direction: 'outbound',
+      channel: 'agentmail',
+      provider_id: threadId,
+      thread_id: threadId,
+      subject,
+      body: bodyText,
+      metadata: {
+        toMasked: maskEmail(toEmail),
+        invoiceId: invoice.id,
+        invoiceUrl: invoice.url,
+        mockEmail: mock,
+        mockInvoice: shouldMockInvoices()
+      }
+    });
+
+    try {
+      await addDoc(tag, 'mail_thread', {
+        direction: 'outbound',
+        threadId,
+        subject,
+        body: bodyText,
+        invoiceUrl: invoice.url,
+        at: new Date().toISOString()
+      }, { kind: 'invoice_email', mockEmail: mock });
+    } catch (err) {
+      log.warn('mailer.memory.add_failed', { leadId, error: err?.message || String(err) });
+    }
+
     emit('mailer.email_sent', {
       worker: 'mailer',
       leadId,
@@ -247,13 +316,25 @@ export async function runMailer({ leadId, toEmail }) {
       mock
     });
 
-    leads.update(leadId, { status: 'awaiting_payment' });
+    leads.update(leadId, {
+      status: 'awaiting_payment',
+      agentmail_thread_id: threadId,
+      next_action: 'await_payment',
+      outreach_status: 'awaiting_payment'
+    });
 
-    const detail = { paymentLinkUrl, threadId, mockEmail: mock, mockPayment: shouldMockPayments() };
+    const detail = {
+      invoiceUrl: invoice.url,
+      paymentLinkUrl: invoice.url,
+      stripeInvoiceId: invoice.id,
+      threadId,
+      mockEmail: mock,
+      mockInvoice: shouldMockInvoices()
+    };
     runs.finish(runId, { state: 'completed', detail });
-    emit('mailer.done', { worker: 'mailer', leadId, runId, paymentLinkUrl, threadId });
+    emit('mailer.done', { worker: 'mailer', leadId, runId, invoiceUrl: invoice.url, paymentLinkUrl: invoice.url, threadId });
 
-    return { paymentLinkUrl, threadId };
+    return { invoiceUrl: invoice.url, threadId };
   } catch (err) {
     runs.finish(runId, { state: 'failed', error: err.message });
     emit('mailer.error', { worker: 'mailer', leadId, runId, error: err.message });

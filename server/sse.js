@@ -5,7 +5,7 @@ const bus = new EventEmitter();
 bus.setMaxListeners(100);
 
 export function emit(type, data = {}) {
-  const event = { type, ts: Date.now(), ...data };
+  const event = { ts: Date.now(), ...data, type };
   eventStore.insert({
     type,
     lead_id: data.leadId || data.lead_id || null,

@@ -6,7 +6,7 @@ let _stripe;
 export function stripeClient() {
   if (!_stripe) {
     if (!env.stripe.secretKey) throw new Error('STRIPE_SECRET_KEY missing');
-    _stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2024-12-18.acacia' });
+    _stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2026-02-25.clover' });
   }
   return _stripe;
 }

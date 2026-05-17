@@ -55,7 +55,7 @@ export default function DiscoverForm() {
           />
         </label>
         <button type="submit" className="btn btn-primary" disabled={busy}>
-          {busy ? 'dispatching…' : 'discover'}
+          {busy ? 'researching…' : 'research'}
         </button>
       </div>
       {err ? <div className="field-error">{err}</div> : null}

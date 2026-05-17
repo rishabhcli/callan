@@ -8,10 +8,15 @@ export const BusinessProfile = z.object({
   niche: z.string(),
   hasWebsite: z.boolean(),
   websiteUrl: z.string().nullable(),
+  onlinePresenceStrength: z.enum(['none', 'weak', 'mixed', 'strong']),
+  onlinePresenceSummary: z.string(),
   ownerHypothesis: z.string().nullable(),
+  customerPersona: z.string().nullable(),
   hours: z.string().nullable(),
   whatTheyDo: z.string(),
+  needs: z.array(z.string()).max(6),
   signals: z.array(z.string()).max(8),
+  bestContactEmail: z.string().nullable(),
   yelpUrl: z.string().nullable(),
   sourceUrl: z.string().nullable()
 });
@@ -28,6 +33,8 @@ export const SalesPitch = z.object({
     })
   ).min(3).max(6),
   close: z.string(),
+  emailAsk: z.string().describe('Question used after a yes to collect and confirm the invoice email.'),
+  invoiceClose: z.string().describe('One sentence explaining that AgentMail will send the invoice and can handle replies.'),
   beginMessage: z.string().describe('Recording disclosure + greeting. Spoken first.')
 });
 export const SalesPitchSchema = jsonSchema(SalesPitch);
@@ -44,6 +51,9 @@ export const PostMortem = z.object({
       note: z.string()
     })
   ).max(5),
+  invoiceEmail: z.string().nullable(),
+  confirmedEmail: z.boolean(),
+  customerQuestions: z.array(z.string()).max(5),
   followupEmailDraft: z.string().nullable()
 });
 export const PostMortemSchema = jsonSchema(PostMortem);

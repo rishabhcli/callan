@@ -2,6 +2,10 @@ import 'dotenv/config';
 
 const bool = (v) => v === 'true' || v === '1' || v === 'yes';
 const list = (v) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
+const num = (v, fallback) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
 
 export const env = {
   port: Number(process.env.PORT || 8787),
@@ -18,13 +22,22 @@ export const env = {
   },
   allowedPhones: list(process.env.ALLOWED_TARGET_PHONES),
   allowedEmails: list(process.env.ALLOWED_TARGET_EMAILS),
+  outreach: {
+    enabled: bool(process.env.AUTONOMOUS_OUTREACH_ENABLED),
+    intervalMs: num(process.env.OUTREACH_INTERVAL_MS, 15000),
+    batchSize: num(process.env.OUTREACH_BATCH_SIZE, 1),
+    maxAttemptsPerPhone: num(process.env.MAX_ATTEMPTS_PER_PHONE, 1),
+    quietHoursStart: num(process.env.QUIET_HOURS_START, 20),
+    quietHoursEnd: num(process.env.QUIET_HOURS_END, 9),
+    timezone: process.env.OUTREACH_TIMEZONE || 'America/Los_Angeles'
+  },
 
   hackathon: {
     name: process.env.HACKATHON_NAME || 'Call My Agent Hackathon',
     date: process.env.HACKATHON_DATE || '2026-05-17',
     location: process.env.HACKATHON_LOCATION || 'Y Combinator, San Francisco',
     url: process.env.HACKATHON_URL || 'https://events.ycombinator.com/CallMyAgentHackathon',
-    sponsors: list(process.env.HACKATHON_SPONSORS)
+    sponsors: list(process.env.HACKATHON_SPONSORS || 'Google DeepMind,Stripe,Moss,Browser Use,AgentMail,Supermemory,Sponge')
   },
 
   gemini: {
@@ -81,19 +94,21 @@ export const env = {
 export function canCallPhone(phone) {
   if (!phone) return false;
   if (env.runMode === 'mock' || !env.live.calls) return false;
-  return env.allowedPhones.includes(phone);
+  if (env.runMode === 'demo_live' || env.runMode === 'live') return env.allowedPhones.includes(phone);
+  return env.runMode === 'autonomous_live';
 }
 
 export function canEmail(email) {
   if (!email) return false;
   if (env.runMode === 'mock' || !env.live.emails) return false;
-  return env.allowedEmails.includes(email);
+  if (env.runMode === 'demo_live') return env.allowedEmails.includes(email);
+  return ['live', 'autonomous_live'].includes(env.runMode);
 }
 
 export function canPay() {
-  return env.runMode === 'live' && env.live.payments && env.stripe.secretKey;
+  return ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.payments && env.stripe.secretKey;
 }
 
 export function canBuild() {
-  return env.runMode === 'live' && env.live.builds && env.browserUse.apiKey;
+  return ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.builds && env.browserUse.apiKey;
 }

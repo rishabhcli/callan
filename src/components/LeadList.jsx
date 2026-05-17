@@ -26,6 +26,26 @@ function statusClass(s) {
 
 const FALLBACK_EMAIL = 'owner@demo.callmemaybe.dev';
 
+function leadBadges(lead) {
+  const out = [];
+  if (lead.risk_status && !['unknown', 'pending', 'needs_callability_check', 'callable'].includes(lead.risk_status)) {
+    out.push({ text: lead.risk_status, tone: 'warn' });
+  }
+  if (lead.phone_classification && !['unknown', 'business'].includes(lead.phone_classification)) {
+    out.push({ text: lead.phone_classification, tone: lead.phone_classification === 'invalid' ? 'bad' : 'info' });
+  }
+  if (lead.outreach_status) out.push({ text: lead.outreach_status.replace(/_/g, ' '), tone: outreachTone(lead.outreach_status) });
+  if (['paid', 'shipped'].includes(lead.status)) out.push({ text: lead.status, tone: 'good' });
+  return out.slice(0, 4);
+}
+
+function outreachTone(status) {
+  if (['blocked', 'retry'].includes(status)) return 'bad';
+  if (['queued', 'calling', 'awaiting_payment'].includes(status)) return 'info';
+  if (['paid', 'shipped', 'called'].includes(status)) return 'good';
+  return 'muted';
+}
+
 export default function LeadList({ leads, focusedLeadId, onFocus }) {
   const [actionId, setActionId] = useState(null);
   const [actionErr, setActionErr] = useState(null);
@@ -35,6 +55,7 @@ export default function LeadList({ leads, focusedLeadId, onFocus }) {
     setActionErr(null);
     try {
       if (action === 'call') await api.startCall(leadId);
+      else if (action === 'approve') await api.approveLiveCall(leadId);
       else if (action === 'followup') await api.followup(leadId, FALLBACK_EMAIL);
       else if (action === 'build') await api.build(leadId);
     } catch (e) {
@@ -56,6 +77,7 @@ export default function LeadList({ leads, focusedLeadId, onFocus }) {
         )}
         {leads.map((lead) => {
           const focused = focusedLeadId === lead.id;
+          const badges = leadBadges(lead);
           return (
             <div
               key={lead.id}
@@ -75,6 +97,11 @@ export default function LeadList({ leads, focusedLeadId, onFocus }) {
                   <span className="lead-phone">{maskPhone(lead.phone)}</span>
                 </div>
                 <div className="lead-id mono">{lead.id}</div>
+                <div className="lead-badges">
+                  {badges.map((b) => (
+                    <span key={`${lead.id}:${b.text}`} className={`lead-badge lead-badge-${b.tone}`}>{b.text}</span>
+                  ))}
+                </div>
               </div>
               <div className="lead-actions" onClick={(e) => e.stopPropagation()}>
                 <button
@@ -87,11 +114,19 @@ export default function LeadList({ leads, focusedLeadId, onFocus }) {
                 </button>
                 <button
                   className="btn btn-mini"
+                  disabled={actionId === `${lead.id}:approve`}
+                  onClick={() => act('approve', lead.id)}
+                  title="Manual demo/live override"
+                >
+                  approve
+                </button>
+                <button
+                  className="btn btn-mini"
                   disabled={actionId === `${lead.id}:followup`}
                   onClick={() => act('followup', lead.id)}
-                  title="Send follow-up"
+                  title="Send invoice through AgentMail"
                 >
-                  mail
+                  invoice
                 </button>
                 <button
                   className="btn btn-mini"

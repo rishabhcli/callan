@@ -30,6 +30,16 @@ const EDGE_FOR = {
 const MAX_TRANSCRIPT = 200;
 const COUNTER_WINDOW_MS = 60000;
 
+const PROVIDER_BADGES = [
+  { key: 'gemini', label: 'GD', title: 'Google DeepMind / Gemini' },
+  { key: 'supermemory', label: 'SUP', title: 'Supermemory' },
+  { key: 'moss', label: 'MOS', title: 'Moss' },
+  { key: 'agentphone', label: 'PHO', title: 'AgentPhone' },
+  { key: 'browserUse', label: 'BRO', title: 'Browser Use' },
+  { key: 'agentmail', label: 'AML', title: 'AgentMail' },
+  { key: 'stripe', label: 'STR', title: 'Stripe invoices' }
+];
+
 export default function App() {
   const [health, setHealth] = useState(null);
   const [leads, setLeads] = useState([]);
@@ -37,6 +47,7 @@ export default function App() {
   const [leadDetail, setLeadDetail] = useState(null);
   const [activeTab, setActiveTab] = useState('Memory');
   const [focusedNodeId, setFocusedNodeId] = useState(null);
+  const [outreach, setOutreach] = useState(null);
 
   const [nodeStates, setNodeStates] = useState({
     scraper: 'idle', memory: 'idle', caller: 'idle',
@@ -91,6 +102,19 @@ export default function App() {
     }
   }, []);
 
+  const refreshHealth = useCallback(async () => {
+    try {
+      const [healthData, outreachData] = await Promise.all([
+        api.health(),
+        api.outreachStatus()
+      ]);
+      setHealth(healthData);
+      setOutreach(outreachData);
+    } catch {
+      setHealth((h) => h || { ok: false });
+    }
+  }, []);
+
   const refreshLeadDetail = useCallback(async (id) => {
     if (!id) { setLeadDetail(null); return; }
     try {
@@ -102,11 +126,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setHealth({ ok: false }));
+    refreshHealth();
     refreshLeads();
-    const id = setInterval(refreshLeads, 5000);
-    return () => clearInterval(id);
-  }, [refreshLeads]);
+    const leadsId = setInterval(refreshLeads, 5000);
+    const healthId = setInterval(refreshHealth, 8000);
+    return () => {
+      clearInterval(leadsId);
+      clearInterval(healthId);
+    };
+  }, [refreshHealth, refreshLeads]);
 
   useEffect(() => { refreshLeadDetail(focusedLeadId); }, [focusedLeadId, refreshLeadDetail]);
 
@@ -139,6 +167,7 @@ export default function App() {
       bumpActivity('memory');
       triggerEdge('scraper-memory');
       refreshLeads();
+      refreshHealth();
     }
     if (t === 'scraper.profile') {
       bumpActivity('memory');
@@ -170,9 +199,19 @@ export default function App() {
       triggerEdge('analyst-memory');
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
-    if (t === 'mailer.payment_link' || t === 'mailer.email_sent' || t === 'mailer.done') {
+    if (t === 'mailer.payment_link' || t === 'mailer.invoice_link' || t === 'mailer.email_sent' || t === 'mailer.inbound_message' || t === 'mailer.done') {
       triggerEdge('mailer-memory');
       refreshLeadDetail(evt.leadId || focusedRef.current);
+    }
+    if (t === 'mailer.auto_reply') {
+      triggerEdge('mailer-memory');
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+      refreshHealth();
+    }
+    if (t.startsWith('outreach.')) {
+      refreshLeads();
+      refreshHealth();
+      if (evt.leadId === focusedRef.current) refreshLeadDetail(evt.leadId);
     }
     if (t === 'builder.live_url') {
       setBuilderInfo({
@@ -188,15 +227,16 @@ export default function App() {
       setBuilderInfo((prev) => ({ ...prev, projectUrl: evt.projectUrl }));
       triggerEdge('builder-memory');
     }
-    if (t === 'builder.done' || t === 'builder.error') {
+    if (t === 'builder.blocked_auth' || t === 'builder.done' || t === 'builder.error') {
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
     if (t === 'stripe.webhook') {
       bumpActivity('mailer');
       triggerEdge('mailer-memory');
       refreshLeadDetail(focusedRef.current);
+      refreshHealth();
     }
-  }, [bumpActivity, triggerEdge, refreshLeads, refreshLeadDetail, liveLeadId]);
+  }, [bumpActivity, triggerEdge, refreshLeads, refreshLeadDetail, refreshHealth, liveLeadId]);
 
   const sseStatus = useSSE(onEvent);
 
@@ -237,6 +277,18 @@ export default function App() {
   const mode = (health?.mode || '').toUpperCase() || 'INIT';
   const providers = health?.providers || {};
 
+  const startAutonomy = useCallback(async () => {
+    const data = await api.startOutreach();
+    setOutreach(data);
+    refreshHealth();
+  }, [refreshHealth]);
+
+  const stopAutonomy = useCallback(async () => {
+    const data = await api.stopOutreach();
+    setOutreach(data);
+    refreshHealth();
+  }, [refreshHealth]);
+
   return (
     <div className="app">
       <header className="topbar">
@@ -259,15 +311,22 @@ export default function App() {
           <div className="meta-cell providers">
             <span className="meta-key">providers</span>
             <span className="meta-val providers-row">
-              {['gemini', 'supermemory', 'agentphone', 'browserUse', 'agentmail', 'stripe'].map((p) => (
-                <span key={p} className={`prov ${providers[p] ? 'prov-on' : 'prov-off'}`} title={p}>
-                  <span className="prov-dot" />{p.slice(0, 3)}
+              {PROVIDER_BADGES.map((p) => (
+                <span key={p.key} className={`prov ${providers[p.key] ? 'prov-on' : 'prov-off'}`} title={p.title}>
+                  <span className="prov-dot" />{p.label}
                 </span>
               ))}
             </span>
           </div>
         </div>
       </header>
+
+      <AutonomyStrip
+        health={health}
+        outreach={outreach}
+        onStart={startAutonomy}
+        onStop={stopAutonomy}
+      />
 
       <main className="layout">
         <section className="left-pane">
@@ -290,6 +349,7 @@ export default function App() {
                 <div key={i} className="event-row">
                   <span className="event-ts">{new Date(e._ts).toLocaleTimeString()}</span>
                   <span className="event-type">{e.type}</span>
+                  {e.providerType ? <span className="event-extra">· {e.providerType}</span> : null}
                   {e.businessName ? <span className="event-extra">· {e.businessName}</span> : null}
                   {e.outcome ? <span className="event-extra">· {e.outcome}</span> : null}
                   {e.error ? <span className="event-extra event-err">· {e.error}</span> : null}
@@ -330,5 +390,35 @@ export default function App() {
         <span>{new Date().toISOString().slice(0, 10)}</span>
       </footer>
     </div>
+  );
+}
+
+function AutonomyStrip({ health, outreach, onStart, onStop }) {
+  const readiness = outreach?.readiness || health?.readiness || {};
+  const q = readiness.outreach || {};
+  const blockers = readiness.blockers || [];
+  const active = outreach?.activeJob;
+  const mode = readiness.mode || health?.mode || 'mock';
+  return (
+    <section className="autonomy-strip">
+      <div className="auto-main">
+        <span className={`auto-pill ${outreach?.running ? 'auto-on' : 'auto-off'}`}>
+          {outreach?.running ? 'autonomy running' : 'autonomy paused'}
+        </span>
+        <span className="auto-stat mono">mode {mode}</span>
+        <span className="auto-stat mono">queue {q.queued ?? 0}</span>
+        <span className="auto-stat mono">blocked {q.blocked ?? 0}</span>
+        <span className="auto-stat mono">calls today {q.todaysCalls ?? 0}</span>
+        <span className="auto-stat mono">opt-outs {q.optOuts ?? 0}</span>
+        <span className="auto-stat mono">mail replies {q.repliesWaiting ?? 0}</span>
+      </div>
+      <div className="auto-side">
+        {active ? <span className="auto-active mono">active: {active.businessName}</span> : null}
+        {blockers.length ? <span className="auto-blocker mono">{blockers[0]}</span> : <span className="auto-ready mono">ready</span>}
+        <button className="btn btn-mini" onClick={outreach?.running ? onStop : onStart}>
+          {outreach?.running ? 'pause' : 'start'}
+        </button>
+      </div>
+    </section>
   );
 }

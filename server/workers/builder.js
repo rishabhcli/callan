@@ -1,5 +1,5 @@
 import { emit } from '../sse.js';
-import { runs, leads, builds } from '../db.js';
+import { runs, leads, builds, payments, contactEvents } from '../db.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
 import { containerTagFor, getLatest } from '../memory.js';
@@ -24,7 +24,7 @@ export async function runBuilder({ leadId }) {
 
     const brief = await buildBrief({ lead, profileDoc, postMortemDoc });
     const lovableUrl = `https://lovable.dev/?autosubmit=true#prompt=${encodeURIComponent(brief)}`;
-    const isLive = env.runMode === 'live' && env.live.builds && !!env.browserUse.apiKey;
+    const isLive = ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.builds && !!env.browserUse.apiKey;
     const buildId = `bld_${Date.now().toString(36)}`;
 
     if (!isLive) {
@@ -104,9 +104,10 @@ async function runLive({ leadId, lead, runId, buildId, brief, lovableUrl }) {
   });
 
   let projectUrl = null;
+  let blockedAuth = false;
   try {
     const task = client.run(
-      `Open ${lovableUrl} and watch Lovable build the website. If a login wall appears, do not click anything — just wait. When the build starts, stay on the page so the operator can watch progress.`,
+      `Open ${lovableUrl} and watch Lovable build the website. If a Lovable login or sign-in wall appears, stop and report BLOCKED_AUTH. When the build starts, stay on the page so the operator can watch progress. When a final .lovable.app URL appears, report it exactly.`,
       { sessionId }
     );
 
@@ -114,13 +115,26 @@ async function runLive({ leadId, lead, runId, buildId, brief, lovableUrl }) {
       const summary = summarizeMsg(msg);
       if (summary) {
         emit('builder.progress', { worker: 'builder', leadId, runId, buildId, summary });
+        if (isAuthWall(summary)) {
+          blockedAuth = true;
+          break;
+        }
       }
       const match = findLovableUrl(msg);
       if (match && !projectUrl) projectUrl = match;
     }
 
-    const final = await task.result.catch(() => null);
+    const final = blockedAuth ? null : await task.result.catch(() => null);
     if (!projectUrl && final) projectUrl = findLovableUrl(final);
+    if (!blockedAuth && isAuthWall(summarizeMsg(final))) blockedAuth = true;
+
+    if (blockedAuth) {
+      builds.update(buildId, { status: 'blocked_auth', finished_at: Date.now() });
+      leads.update(leadId, { next_action: 'lovable_auth_needed' });
+      runs.finish(runId, { state: 'blocked', detail: { liveUrl, sessionId, reason: 'lovable auth needed' } });
+      emit('builder.blocked_auth', { worker: 'builder', leadId, runId, buildId, liveUrl, sessionId });
+      return { liveUrl, projectUrl: null, brief, sessionId, blockedAuth: true };
+    }
 
     const patch = { status: 'completed', finished_at: Date.now() };
     if (projectUrl) patch.project_url = projectUrl;
@@ -144,6 +158,13 @@ async function runLive({ leadId, lead, runId, buildId, brief, lovableUrl }) {
 async function buildBrief({ lead, profileDoc, postMortemDoc }) {
   const profile = parseDocContent(profileDoc);
   const postMortem = parseDocContent(postMortemDoc);
+  const latestPayment = payments.listByLead(lead.id)[0];
+  const recentMail = contactEvents
+    .listByLead(lead.id, { limit: 8 })
+    .filter((e) => e.channel === 'agentmail')
+    .map((e) => `${e.direction}: ${e.subject || ''} ${e.body || ''}`.trim())
+    .slice(0, 5)
+    .join('\n');
   const niche = (lead.niche || profile?.niche || 'local services').toLowerCase();
   const style = pickStyle(niche);
 
@@ -153,9 +174,14 @@ async function buildBrief({ lead, profileDoc, postMortemDoc }) {
     `Niche: ${niche}`,
     `City: ${lead.city || profile?.city || 'their local area'}`,
     `Phone: ${lead.phone || profile?.phone || '(use placeholder)'}`,
+    `Hours: ${profile?.hours || 'unknown'}`,
+    `Online presence audit: ${profile?.onlinePresenceStrength || 'unknown'} — ${profile?.onlinePresenceSummary || 'no summary'}`,
     `Owner hypothesis: ${profile?.ownerHypothesis || profile?.owner || 'unknown'}`,
     `What they do: ${profile?.summary || profile?.whatTheyDo || profile?.description || 'see profile'}`,
+    `Specific business needs: ${Array.isArray(profile?.needs) ? profile.needs.join('; ') : 'contact path, service clarity, trust proof'}`,
     `From the post-mortem, the customer cared about: ${postMortem?.customerCares || postMortem?.summary || postMortem?.reason || 'standard concerns for this niche'}`,
+    `Customer questions/details from AgentMail: ${recentMail || 'none yet'}`,
+    `Invoice/customer context: ${latestPayment ? `invoice ${latestPayment.stripe_invoice_id || latestPayment.id}, status ${latestPayment.status}, amount $${((latestPayment.amount_cents || 0) / 100).toFixed(2)}` : 'no invoice row found'}`,
     `Required pages: Home, Services, Contact. Add Hours if relevant.`,
     `Tone/style: ${style.tone}. Color palette: ${style.palette}.`,
     `Primary CTAs: tap-to-call phone number, "Book online" button.`,
@@ -220,6 +246,10 @@ function findLovableUrl(value) {
   const haystack = typeof value === 'string' ? value : safeStringify(value);
   const m = haystack.match(LOVABLE_RE);
   return m ? m[0] : null;
+}
+
+function isAuthWall(text) {
+  return /\b(BLOCKED_AUTH|login wall|sign in|sign-in|log in|auth needed|authenticate|continue with google)\b/i.test(text || '');
 }
 
 function safeStringify(v) {

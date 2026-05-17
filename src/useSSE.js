@@ -10,11 +10,14 @@ const KNOWN_EVENTS = [
   'caller.done', 'caller.error',
   'pitch.created',
   'agentphone.webhook',
+  'outreach.started', 'outreach.stopped', 'outreach.blocked',
+  'outreach.calling', 'outreach.lead_blocked', 'outreach.lead_approved', 'outreach.error',
   'analyst.start', 'analyst.done', 'analyst.error',
-  'mailer.start', 'mailer.payment_link', 'mailer.email_sent',
+  'mailer.start', 'mailer.payment_link', 'mailer.invoice_link', 'mailer.email_sent',
+  'mailer.inbound_message', 'mailer.auto_reply',
   'mailer.done', 'mailer.error',
   'builder.start', 'builder.live_url', 'builder.progress',
-  'builder.project_url', 'builder.done', 'builder.error',
+  'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error',
   'stripe.webhook', 'agentmail.webhook'
 ];
 
