@@ -11,6 +11,7 @@ import { createStripeSmokeInvoice } from '../server/providers/stripe.js';
 import { agentPhoneOwnedNumberSmoke } from '../server/providers/agentphone.js';
 import { runAgentMailLiveSendSmoke } from '../server/providers/agentmail.js';
 import { BrowserUseLovableAdapter } from '../server/providers/browserUse.js';
+import { smokeV0 } from '../server/providers/v0.js';
 
 const dry = (provider, configured, detail = {}) => {
   const status = configured ? 'configured' : 'missing';
@@ -100,6 +101,16 @@ async function smokeLovable() {
   });
 }
 
+async function smokeV0Provider() {
+  try {
+    const result = await smokeV0();
+    providerSmoke.set('v0', result.status, result.detail || {});
+    return { provider: 'v0', status: result.status, detail: result.detail };
+  } catch (err) {
+    return failed('v0', err);
+  }
+}
+
 async function smokeAgentPhone() {
   const configured = !!env.agentphone.apiKey;
   if (!configured) return dry('agentphone', false);
@@ -141,6 +152,7 @@ async function main() {
     await smokeStripe(),
     await smokeBrowserUse(),
     await smokeLovable(),
+    await smokeV0Provider(),
     await smokeMoss()
   ];
   console.log('\n=== PROVIDER SMOKE RESULTS ===\n');

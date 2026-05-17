@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto';
 import { env } from '../env.js';
 import { log } from '../logger.js';
 import { stripeClient } from '../providers/stripe.js';
+import { webhookEvents } from '../db.js';
+import { emit } from '../sse.js';
+import {
+  leadIdFromStripeObject,
+  recordPaidPayment,
+  stripePaymentDetails
+} from '../paymentFlow.js';
 
 export function verifyStripe(rawBody, signatureHeader) {
   if (!env.stripe.webhookSecret) {
@@ -66,6 +73,52 @@ export function stripeWebhookEventId(_req, event = {}, normalized = normalizeStr
     amountCents: normalized.amountCents,
     raw: event
   })}`;
+}
+
+export function processStripeWebhookEvent(event = {}, { req = null, startBuilder } = {}) {
+  const normalized = normalizeStripeWebhook(event);
+  const eventId = stripeWebhookEventId(req, event, normalized);
+  const recorded = webhookEvents.recordOnce({
+    provider: 'stripe',
+    event_id: eventId,
+    type: normalized.eventType,
+    payload: event
+  });
+  if (!recorded) return { received: true, duplicate: true, eventId, normalized };
+
+  emit('stripe.webhook', {
+    providerType: normalized.eventType,
+    eventId,
+    leadId: normalized.leadId || null,
+    invoiceId: normalized.invoiceId || null,
+    objectId: normalized.objectId || null,
+    livemode: normalized.livemode
+  });
+
+  if (!normalized.paid) {
+    return { received: true, duplicate: false, eventId, normalized, paid: false };
+  }
+
+  const object = event.data?.object || {};
+  const stripeId = normalized.invoiceId || normalized.sessionId || normalized.objectId || object.id;
+  const paid = recordPaidPayment(
+    stripeId,
+    normalized.leadId || leadIdFromStripeObject(object),
+    { payment: stripePaymentDetails(object, normalized.eventType), startBuilder }
+  );
+
+  emit('stripe.paid', {
+    worker: 'stripe',
+    leadId: paid.leadId || normalized.leadId || null,
+    invoiceId: normalized.invoiceId || stripeId,
+    eventId,
+    paymentChanged: paid.changed,
+    builderTriggerClaimed: paid.builderTriggerClaimed,
+    buildTrigger: paid.build?.reason,
+    duplicate: false
+  });
+
+  return { received: true, duplicate: false, eventId, normalized, paid };
 }
 
 export function isPaidStripeEvent(eventType, object = {}) {

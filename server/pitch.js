@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import { CallScript, toGeminiJsonSchema } from './reasoning/schemas.js';
+
+export const CallScriptSchema = toGeminiJsonSchema(CallScript);
 
 export const SalesPitchGenerationSchema = {
   type: 'object',
@@ -162,12 +165,40 @@ export function createFallbackPitch({ disclosure, profile = {}, lead = {} } = {}
   }, { disclosure, profile, lead }), { disclosure, source: 'fallback' });
 }
 
+export function buildPitchHotStrategy({ pitch = {}, profile = {}, lead = {} } = {}) {
+  const context = buildPitchResearchContext({ profile, lead });
+  const needs = context.research.needs.length
+    ? context.research.needs.join(', ')
+    : 'services, proof, and a clear contact step';
+  return [
+    `Open with this concrete business signal: ${pitch.openingLine || context.research.whatTheyDo}`,
+    `Tie the offer to these customer needs: ${needs}.`,
+    `Use this value prop when the owner gives you a few seconds: ${pitch.valueProp || 'A focused $500 same-day website can make the next customer action obvious.'}`,
+    `Close only after positive intent: ${pitch.close || 'If this sounds useful, ask for the best invoice email and read it back.'}`,
+    `If the owner agrees, follow the email readback rule exactly: ${pitch.emailReadbackInstruction || 'Read the email back and ask for confirmation.'}`
+  ].filter(Boolean);
+}
+
 function parseStrictPitch(raw, source) {
-  const parsed = StrictSalesPitch.safeParse(raw);
+  const parsed = StrictSalesPitch.safeParse(pickPitchFields(raw));
   if (!parsed.success) {
     throw new Error(`sales pitch ${source} schema failed: ${formatIssues(parsed.error.issues)}`);
   }
   return parsed.data;
+}
+
+function pickPitchFields(raw = {}) {
+  return {
+    openingLine: raw.openingLine,
+    valueProp: raw.valueProp,
+    discoveryQuestions: raw.discoveryQuestions,
+    objections: raw.objections,
+    close: raw.close,
+    emailAsk: raw.emailAsk,
+    emailReadbackInstruction: raw.emailReadbackInstruction,
+    invoiceClose: raw.invoiceClose,
+    beginMessage: raw.beginMessage
+  };
 }
 
 function validatePitch(pitch, { disclosure, source }) {

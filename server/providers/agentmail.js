@@ -28,9 +28,10 @@ export function agentMailReadinessDetails(config = env.agentmail) {
     objectModel: 'organization_inbox_thread_message',
     inbound: {
       webhook: config.webhookSecret ? 'svix_signature_configured' : 'dev_unsigned_or_polling',
-      polling: 'inboxes.messages.list'
+      polling: 'inboxes.messages.list',
+      events: ['message.received', 'message.received.spam', 'message.received.blocked', 'message.received.unauthenticated']
     },
-    replyTextSource: 'extractedText_preferred',
+    replyTextSource: 'extractedText_or_extractedHtml_preferred',
     smoke: env.smoke.agentmailSend ? 'enabled_by_SMOKE_AGENTMAIL_SEND' : 'disabled_by_default'
   };
 }
@@ -207,6 +208,16 @@ export async function fetchAgentMailThread({ inboxId = env.agentmail.inboxId, th
   };
 }
 
+export async function getAgentMailMessage({ inboxId = env.agentmail.inboxId, messageId } = {}, options = {}) {
+  requireAgentMailConfig(inboxId);
+  if (!messageId) throw new Error('AgentMail message fetch requires messageId');
+  const mail = await agentMailClient();
+  const message = await agentMailCall('getMessage', () => (
+    mail.inboxes.messages.get(inboxId, messageId, requestOptions(options))
+  ));
+  return normalizeAgentMailMessage(message, { inboxId, messageId });
+}
+
 export async function runAgentMailLiveSendSmoke({
   toEmail = process.env.SMOKE_TEST_EMAIL,
   subject = 'callmemaybe AgentMail smoke',
@@ -266,18 +277,16 @@ export function normalizeAgentMailMessage(raw = {}, fallback = {}) {
   const source = raw?.message || raw?.data?.message || raw?.data || raw || {};
   const eventType = first(raw.event, raw.type, raw.event_type, source.event, source.type, fallback.eventType);
   const labels = normalizeStringList(first(raw.labels, source.labels, fallback.labels));
-  const text = first(
-    raw.text,
-    raw.body,
-    raw.plain,
-    raw.snippet,
-    source.text,
-    source.body,
-    source.plain,
-    source.snippet,
-    source.preview,
-    htmlToText(first(raw.html, source.html))
-  );
+  const textPick = firstTextWithSource([
+    ['extractedText', raw.extractedText, raw.extracted_text, source.extractedText, source.extracted_text],
+    ['extractedHtml', htmlToText(first(raw.extractedHtml, raw.extracted_html, source.extractedHtml, source.extracted_html))],
+    ['text', raw.text, source.text],
+    ['body', raw.body, source.body],
+    ['plain', raw.plain, source.plain],
+    ['snippet', raw.snippet, source.snippet],
+    ['preview', source.preview, raw.preview],
+    ['html', htmlToText(first(raw.html, source.html))]
+  ]);
   const direction = normalizeDirection(first(raw.direction, source.direction, fallback.direction), eventType, labels);
   const toEmails = normalizeAddressList(first(raw.to, raw.to_email, raw.toEmail, source.to, source.to_email, source.toEmail, fallback.to));
   const fromValue = first(raw.from, raw.from_email, raw.fromEmail, source.from, source.from_email, source.fromEmail, fallback.from);
@@ -292,7 +301,8 @@ export function normalizeAgentMailMessage(raw = {}, fallback = {}) {
     toEmail: toEmails[0] || null,
     toEmails,
     subject: first(raw.subject, source.subject, fallback.subject, '(no subject)'),
-    text: typeof text === 'string' ? text : safeString(text || ''),
+    text: textPick.text,
+    textSource: textPick.source,
     html: first(raw.html, source.html, fallback.html) || null,
     preview: first(raw.preview, source.preview, fallback.preview) || null,
     direction,
@@ -421,6 +431,16 @@ function normalizeStringList(value) {
 
 function first(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function firstTextWithSource(groups) {
+  for (const [source, ...values] of groups) {
+    for (const value of values) {
+      if (typeof value !== 'string' || !value.trim()) continue;
+      return { source, text: value.trim() };
+    }
+  }
+  return { source: 'empty', text: '' };
 }
 
 function compact(obj) {

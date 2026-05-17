@@ -7,6 +7,61 @@ const num = (v, fallback) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+export const RUN_MODES = Object.freeze([
+  'mock',
+  'demo_live',
+  'autonomous_live',
+  'production_review',
+  'production_live'
+]);
+
+export const SIDE_EFFECTS = Object.freeze([
+  'calls',
+  'emails',
+  'invoices',
+  'browserSessions',
+  'publicOutreach',
+  'builds'
+]);
+
+const RUN_MODE_SET = new Set(RUN_MODES);
+const SIDE_EFFECT_LABELS = Object.freeze({
+  calls: 'outbound calls',
+  emails: 'outbound emails',
+  invoices: 'Stripe invoices',
+  browserSessions: 'Browser Use sessions',
+  publicOutreach: 'public outreach',
+  builds: 'site builds'
+});
+
+const MODE_POLICIES = Object.freeze({
+  mock: {
+    label: 'Mock harness',
+    description: 'Synthetic providers only. Exercises the orchestration path without live side effects.',
+    sideEffects: { calls: false, emails: false, invoices: false, browserSessions: false, publicOutreach: false, builds: false }
+  },
+  demo_live: {
+    label: 'Owned-target live demo',
+    description: 'Live providers are allowed only for operator-owned or explicitly seeded targets.',
+    sideEffects: { calls: 'allowlist', emails: 'allowlist', invoices: 'allowlist', browserSessions: true, publicOutreach: false, builds: true }
+  },
+  autonomous_live: {
+    label: 'Autonomous live lab',
+    description: 'Autonomous outreach can run against public business targets with strict compliance gates.',
+    sideEffects: { calls: 'compliance', emails: 'compliance', invoices: 'invoice_consent', browserSessions: true, publicOutreach: 'compliance', builds: true }
+  },
+  production_review: {
+    label: 'Production review',
+    description: 'Production credentials and webhooks can be reviewed, but live side effects remain disabled.',
+    sideEffects: { calls: false, emails: false, invoices: false, browserSessions: false, publicOutreach: false, builds: false }
+  },
+  production_live: {
+    label: 'Production live',
+    description: 'Full production operation. Requires every provider, webhook, compliance gate, quota, and emergency stop surface.',
+    sideEffects: { calls: 'compliance', emails: 'compliance', invoices: 'invoice_consent', browserSessions: true, publicOutreach: 'compliance', builds: true }
+  }
+});
+
 export const env = {
   port: Number(process.env.PORT || 8787),
   publicUrl: process.env.APP_PUBLIC_URL || 'http://localhost:8787',
@@ -14,10 +69,14 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
 
   runMode: process.env.RUN_MODE || 'mock',
+  productionLiveAck: process.env.PRODUCTION_LIVE_ACK || '',
   live: {
     calls: bool(process.env.LIVE_CALLS),
     emails: bool(process.env.LIVE_EMAILS),
     payments: bool(process.env.LIVE_PAYMENTS),
+    invoices: bool(process.env.LIVE_PAYMENTS),
+    browserSessions: bool(process.env.LIVE_BROWSER_SESSIONS) || bool(process.env.LIVE_BUILDS),
+    publicOutreach: bool(process.env.LIVE_PUBLIC_OUTREACH),
     builds: bool(process.env.LIVE_BUILDS)
   },
   smoke: {
@@ -102,24 +161,123 @@ export const env = {
   }
 };
 
+export function validRunModes() {
+  return [...RUN_MODES];
+}
+
+export function isValidRunMode(mode = env.runMode) {
+  return RUN_MODE_SET.has(mode);
+}
+
+export function modePolicy(mode = env.runMode) {
+  return MODE_POLICIES[mode] || null;
+}
+
+export function isMockMode(mode = env.runMode) {
+  return mode === 'mock';
+}
+
+export function isProductionReviewMode(mode = env.runMode) {
+  return mode === 'production_review';
+}
+
+export function isProductionLiveMode(mode = env.runMode) {
+  return mode === 'production_live';
+}
+
+export function isAutonomousLiveMode(mode = env.runMode) {
+  return mode === 'autonomous_live';
+}
+
+export function isDemoLiveMode(mode = env.runMode) {
+  return mode === 'demo_live';
+}
+
+export function isLiveProviderMode(mode = env.runMode) {
+  return ['demo_live', 'autonomous_live', 'production_live'].includes(mode);
+}
+
+export function isPublicOutreachMode(mode = env.runMode) {
+  return ['autonomous_live', 'production_live'].includes(mode);
+}
+
+export function isProductionAcked() {
+  return env.productionLiveAck === 'I_UNDERSTAND_LIVE_OUTREACH';
+}
+
+export function modeAllowsSideEffect(action, mode = env.runMode) {
+  const value = modePolicy(mode)?.sideEffects?.[action];
+  return value === true || typeof value === 'string';
+}
+
+export function sideEffectMatrix(mode = env.runMode) {
+  const policy = modePolicy(mode);
+  return Object.fromEntries(SIDE_EFFECTS.map((action) => {
+    const requirement = policy?.sideEffects?.[action] ?? false;
+    const modeAllowed = modeAllowsSideEffect(action, mode);
+    const flagEnabled = sideEffectFlagEnabled(action);
+    const blockers = [];
+    if (!policy) blockers.push(`invalid RUN_MODE ${mode}`);
+    if (!modeAllowed) blockers.push(`${mode || 'unknown mode'} disallows ${SIDE_EFFECT_LABELS[action]}`);
+    if (modeAllowed && !flagEnabled) blockers.push(`${envNameForSideEffect(action)} is not enabled`);
+    if (action === 'publicOutreach' && modeAllowed && !env.outreach.enabled) blockers.push('AUTONOMOUS_OUTREACH_ENABLED is not enabled');
+    return [action, {
+      label: SIDE_EFFECT_LABELS[action],
+      requirement,
+      modeAllowed,
+      flagEnabled,
+      allowed: Boolean(policy && modeAllowed && flagEnabled),
+      blockers
+    }];
+  }));
+}
+
+export function sideEffectFlagEnabled(action) {
+  if (action === 'calls') return !!env.live.calls;
+  if (action === 'emails') return !!env.live.emails;
+  if (action === 'invoices') return !!env.live.payments;
+  if (action === 'browserSessions') return !!env.live.browserSessions;
+  if (action === 'publicOutreach') return !!env.outreach.enabled && !!env.live.publicOutreach;
+  if (action === 'builds') return !!env.live.builds;
+  return false;
+}
+
+export function envNameForSideEffect(action) {
+  if (action === 'calls') return 'LIVE_CALLS';
+  if (action === 'emails') return 'LIVE_EMAILS';
+  if (action === 'invoices') return 'LIVE_PAYMENTS';
+  if (action === 'browserSessions') return 'LIVE_BROWSER_SESSIONS';
+  if (action === 'publicOutreach') return 'LIVE_PUBLIC_OUTREACH/AUTONOMOUS_OUTREACH_ENABLED';
+  if (action === 'builds') return 'LIVE_BUILDS';
+  return 'UNKNOWN_SIDE_EFFECT';
+}
+
 export function canCallPhone(phone) {
   if (!phone) return false;
-  if (env.runMode === 'mock' || !env.live.calls) return false;
-  if (env.runMode === 'demo_live' || env.runMode === 'live') return env.allowedPhones.includes(phone);
-  return env.runMode === 'autonomous_live';
+  if (!modeAllowsSideEffect('calls') || !env.live.calls) return false;
+  if (env.runMode === 'demo_live') return env.allowedPhones.includes(phone);
+  return ['autonomous_live', 'production_live'].includes(env.runMode);
 }
 
 export function canEmail(email) {
   if (!email) return false;
-  if (env.runMode === 'mock' || !env.live.emails) return false;
+  if (!modeAllowsSideEffect('emails') || !env.live.emails) return false;
   if (env.runMode === 'demo_live') return env.allowedEmails.includes(email);
-  return ['live', 'autonomous_live'].includes(env.runMode);
+  return ['autonomous_live', 'production_live'].includes(env.runMode);
 }
 
 export function canPay() {
-  return ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.payments && env.stripe.secretKey;
+  return modeAllowsSideEffect('invoices') && env.live.payments && !!env.stripe.secretKey;
 }
 
 export function canBuild() {
-  return ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.builds && env.browserUse.apiKey;
+  return modeAllowsSideEffect('builds') && env.live.builds && !!env.browserUse.apiKey;
+}
+
+export function canStartBrowserSession() {
+  return modeAllowsSideEffect('browserSessions') && env.live.browserSessions && !!env.browserUse.apiKey;
+}
+
+export function canPublicOutreach() {
+  return modeAllowsSideEffect('publicOutreach') && env.outreach.enabled;
 }

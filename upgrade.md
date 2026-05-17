@@ -39,6 +39,11 @@ npm run check            # node --check over server/ and scripts/
 npm run check:presence   # online-presence scoring regression check
 npm run check:dedupe     # lead dedupe/history regression check
 npm run check:autonomy   # outreach/compliance/payment recovery regression check
+npm run check:growth     # GrowthPlan, offers, opt-out, and handoff regression check
+npm run check:production # read-only production readiness report
+npm run check:safety     # local safety, HMAC/replay, and idempotency checks
+npm run check:browser-console # Browser Use command center/session API regression check
+npm run drill:reliability # isolated reliability/backpressure drill
 npm run smoke:providers  # provider readiness and opt-in live smoke checks
 ```
 
@@ -48,6 +53,45 @@ The fastest judge-safe proof is:
 npm run demo:e2e -- --data-dir .data/demo --reset-demo-data
 DATA_DIR=.data/demo npm run dev
 ```
+
+### Growth agency layer
+
+The agency now evaluates what a small business needs after the first website sale. The persisted `GrowthPlan` is generated from existing lead research, call analysis, AgentMail thread history, and delivery state; mock mode uses a synthetic provider but still runs the same plan, SQLite persistence, Supermemory write, event emission, and AgentMail follow-up path.
+
+The schema covers:
+
+- `localSeoGaps`
+- `googleBusinessProfileTasks`
+- `reviewCapturePlan`
+- `bookingContactFlowPlan`
+- `analyticsSetup`
+- `contentIdeas`
+- `monthlyMaintenancePlan`
+- `automationIdeas`
+- `evidence`
+- `risk` and `unsupportedFlags`
+
+The offer engine evaluates starter website, website + local SEO, review system, booking/contact automation, and monthly maintenance. Every recommendation must cite evidence. AgentMail growth recaps are post-delivery only, blocked by opt-outs, and replies classify as `interested`, `not_now`, `unsubscribe`, or `handoff`. Unsupported legal/tax/contract/ranking-guarantee asks are not answered by the agent.
+
+Growth routes:
+
+```sh
+GET  /api/growth/status
+GET  /api/leads/:id/growth
+POST /api/leads/:id/growth/plan
+POST /api/leads/:id/growth/followup
+POST /api/leads/:id/growth/replies
+```
+
+Source links used for this layer:
+
+- AgentMail messages and thread model: https://docs.agentmail.to/messages
+- AgentMail webhook/event model: https://docs.agentmail.to/webhooks-overview
+- Supermemory document ingestion and `containerTag`: https://supermemory.ai/docs/add-memories
+- Supermemory metadata/container filtering: https://supermemory.ai/docs/memory-api/features/filtering
+- Google Business Profile local ranking basics: https://support.google.com/business/answer/7091
+- Google Business Profile customer features: https://business.google.com/us/business-profile/
+- Google LocalBusiness structured data: https://developers.google.com/search/docs/appearance/structured-data/local-business
 
 Useful mock-demo variants:
 
@@ -69,9 +113,13 @@ RUN_MODE=mock
 LIVE_CALLS=false
 LIVE_EMAILS=false
 LIVE_PAYMENTS=false
+LIVE_BROWSER_SESSIONS=false
+LIVE_PUBLIC_OUTREACH=false
 LIVE_BUILDS=false
 AUTONOMOUS_OUTREACH_ENABLED=false
 ```
+
+Launch modes are now explicit: `mock`, `demo_live`, `autonomous_live`, `production_review`, and `production_live`. `production_review` is the credential/webhook review posture with live side effects disabled. `production_live` refuses operation unless `PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH`, `NODE_ENV=production`, a public `https://` `APP_PUBLIC_URL`, provider smoke rows, webhooks, side-effect flags, and compliance gates are all green.
 
 Owned-target live demo posture:
 
@@ -82,6 +130,7 @@ ALLOWED_TARGET_EMAILS=operator@example.com
 LIVE_CALLS=true
 LIVE_EMAILS=true
 LIVE_PAYMENTS=true
+LIVE_BROWSER_SESSIONS=true
 LIVE_BUILDS=true
 ```
 
@@ -90,6 +139,7 @@ Autonomous outreach posture, for controlled experiments only:
 ```sh
 RUN_MODE=autonomous_live
 AUTONOMOUS_OUTREACH_ENABLED=true
+LIVE_PUBLIC_OUTREACH=true
 OUTREACH_INTERVAL_MS=15000
 OUTREACH_BATCH_SIZE=1
 MAX_ATTEMPTS_PER_PHONE=1
@@ -130,6 +180,17 @@ STRIPE_CANCEL_URL=http://localhost:8787/cancel
 ```
 
 Lovable has no direct `LOVABLE_*` env in this repo. Live Lovable work happens through Browser Use and an authenticated Lovable browser session.
+
+Production readiness source docs to keep in sync with code:
+
+- AgentPhone webhook security, replay window, and `X-Webhook-ID`: https://docs.agentphone.ai/documentation/guides/webhooks
+- AgentPhone call-ended transcript and transcript SSE: https://docs.agentphone.ai/documentation/reference/faq
+- AgentMail webhook event IDs and partial payload hydration: https://docs.agentmail.to/events and https://docs.agentmail.to/overview
+- Stripe invoice paid lifecycle: https://docs.stripe.com/invoicing/integration
+- Browser Use sessions/status/cost: https://docs.browser-use.com/guides/sessions and https://docs.browser-use.com/cloud/api-v2/tasks/get-task-status
+- Supermemory `containerTags`: https://docs.supermemory.ai/memory-api/features/filtering
+- Moss `getIndex` readiness: https://docs.usemoss.dev/docs/api-reference/v1/index-management/getIndex
+- Gemini structured output JSON Schema: https://ai.google.dev/gemini-api/docs/structured-output
 
 ### Provider smoke commands
 
@@ -225,6 +286,7 @@ These are the **current** API surfaces. Do not trust the existing `.env.example`
   - **MCP server** at `https://mcp.lovable.dev` (Research Preview) — usable from Claude/Cursor for create + manage. Treat as experimental.
 - The demo plan: when a call closes, the agent fires a Browser Use cloud task with the customer's brief. Browser Use opens Lovable's build-with-URL flow, drives the build, and **the `liveUrl` from Browser Use is what the customer watches on the call** — that is the "watch the agent build your website" moment.
 - Custom domain on Lovable requires Pro ($25/mo). Either use the default `<project>.lovable.app` URL for the demo or wire Entri auto-DNS post-publish.
+- Current Browser Use dashboard/status source docs: get-session fields (`https://docs.browser-use.com/cloud/api-v3/sessions/get-session`), live preview/recordings (`https://docs.browser-use.com/cloud/browser/live-preview`), and pricing/cost fields (`https://docs.browser-use.com/cloud/pricing`).
 
 ### 2.8 Google DeepMind / Gemini 3.1 Pro (the brain)
 - Current flagship is **`gemini-3.1-pro-preview`** (Gemini 3 Pro was deprecated March 2026). SDK: `@google/genai` (the older `@google/generative-ai` is dead — do not import it).

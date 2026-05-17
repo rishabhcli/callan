@@ -96,6 +96,7 @@ export function normalizeAgentMailWebhook(body = {}) {
     text: textPick.text,
     textSource: textPick.source,
     direction: String(firstString(body.direction, message.direction, '')).toLowerCase(),
+    labels: normalizeStringList(body.labels || message.labels || body.data?.labels),
     rawMessage: message
   };
 }
@@ -157,6 +158,12 @@ function emailOf(value) {
     return null;
   }
   return emailOf(value.email || value.address || value.value || value.mail);
+}
+
+function normalizeStringList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
+  return [String(value)].filter(Boolean);
 }
 
 function extractEmail(value) {

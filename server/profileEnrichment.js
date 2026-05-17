@@ -1,4 +1,4 @@
-import { BusinessProfile } from './types.js';
+import { BusinessProfile } from './reasoning/schemas.js';
 
 const PRESENCE = new Set(['none', 'weak', 'mixed', 'strong']);
 const PROFILE_SOURCES = new Set(['live_browser', 'gemini_mock', 'provided', 'memory_write', 'memory_repair', 'unknown']);

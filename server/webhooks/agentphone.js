@@ -12,38 +12,36 @@ import {
   normalizeAgentPhoneTranscript
 } from '../providers/agentphone.js';
 
-// AgentPhone webhook signature: the provider emits the signature either as
-// X-Webhook-Signature: sha256=<hex>  (upgrade.md / older spec)
-// or as
-// X-Signature-256: <hex>             (current API reference)
-// We accept both, HMAC-SHA256 of either `${ts}.${raw}` (with timestamp header)
-// or just `raw` (no timestamp). Constant-time compare on every candidate.
+const AGENTPHONE_REPLAY_WINDOW_SECONDS = 300;
+
+// AgentPhone webhook security per provider docs:
+// X-Webhook-Signature = sha256=<hex HMAC>
+// X-Webhook-Timestamp = Unix timestamp used for replay protection
+// X-Webhook-ID = unique delivery id used for idempotency
+// The signed string is `${timestamp}.${raw_body}`.
 export function verifyAgentPhone(req, rawBody) {
   if (!env.agentphone.webhookSecret) {
     log.warn('AGENTPHONE_WEBHOOK_SECRET not set; rejecting webhook');
     return { ok: false, reason: 'no secret configured' };
   }
 
-  const sig256 = String(req.headers['x-signature-256'] || '').trim();
-  const sigGeneric = String(req.headers['x-webhook-signature'] || '').trim();
-  const ts = String(req.headers['x-webhook-timestamp'] || req.headers['x-timestamp'] || req.headers['x-signature-timestamp'] || '').trim();
-
-  const provided = pickHex(sigGeneric) || pickHex(sig256);
+  const sig = String(req.headers['x-webhook-signature'] || req.headers['x-signature-256'] || '').trim();
+  const ts = String(req.headers['x-webhook-timestamp'] || '').trim();
+  const webhookId = String(req.headers['x-webhook-id'] || '').trim();
+  const timestamp = parseAgentPhoneTimestamp(ts);
+  const provided = pickHex(sig);
   if (!provided) return { ok: false, reason: 'no signature header' };
+  if (!timestamp) return { ok: false, reason: 'missing or invalid X-Webhook-Timestamp' };
+  if (Math.abs(Date.now() - timestamp) > AGENTPHONE_REPLAY_WINDOW_SECONDS * 1000) {
+    return { ok: false, reason: 'timestamp outside replay window' };
+  }
+  if (!webhookId) return { ok: false, reason: 'missing X-Webhook-ID' };
 
   const secret = env.agentphone.webhookSecret;
   const raw = rawBody.toString('utf8');
-  const candidates = [
-    ts ? `${ts}.${raw}` : null,
-    ts ? `${ts}${raw}` : null,
-    raw
-  ].filter(Boolean);
-
-  for (const payload of candidates) {
-    const expected = crypto.createHmac('sha256', secret).update(payload).digest();
-    if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
-      return { ok: true };
-    }
+  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${raw}`).digest();
+  if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
+    return { ok: true, webhookId, replayWindowSeconds: AGENTPHONE_REPLAY_WINDOW_SECONDS };
   }
 
   return { ok: false, reason: 'bad signature' };
@@ -214,6 +212,14 @@ function pickHex(value) {
   } catch {
     return null;
   }
+}
+
+function parseAgentPhoneTimestamp(value) {
+  if (!value) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const millis = n > 10_000_000_000 ? n : n * 1000;
+  return Number.isFinite(millis) ? millis : null;
 }
 
 function findCallRow(callRef) {

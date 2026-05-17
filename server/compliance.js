@@ -26,6 +26,8 @@ export const REASON_CODES = Object.freeze({
   LIVE_TARGET_NOT_OWNED: 'LIVE_TARGET_NOT_OWNED',
   DEMO_LIVE_TARGET_NOT_OWNED_OR_SEEDED: 'DEMO_LIVE_TARGET_NOT_OWNED_OR_SEEDED',
   AUTONOMOUS_PHONE_NOT_BUSINESS_LANDLINE: 'AUTONOMOUS_PHONE_NOT_BUSINESS_LANDLINE',
+  PRODUCTION_REVIEW_NO_OUTBOUND_CALLS: 'PRODUCTION_REVIEW_NO_OUTBOUND_CALLS',
+  PRODUCTION_PHONE_NOT_BUSINESS_LANDLINE: 'PRODUCTION_PHONE_NOT_BUSINESS_LANDLINE',
   PHONE_MOBILE_RISK: 'PHONE_MOBILE_RISK',
   PHONE_UNKNOWN_RISK: 'PHONE_UNKNOWN_RISK'
 });
@@ -182,18 +184,20 @@ export function evaluateOutboundCallability({
         blockers.push({ code: REASON_CODES.MAX_ATTEMPTS_BUSINESS, count: attempts.businessAttempts, limit: attempts.limit });
       }
     }
-    if (mode === 'live' && !owned) {
-      blockers.push({ code: REASON_CODES.LIVE_TARGET_NOT_OWNED });
+    if (mode === 'production_review') {
+      blockers.push({ code: REASON_CODES.PRODUCTION_REVIEW_NO_OUTBOUND_CALLS });
     }
     if (mode === 'demo_live' && !(owned || seeded)) {
       blockers.push({ code: REASON_CODES.DEMO_LIVE_TARGET_NOT_OWNED_OR_SEEDED });
     }
-    if (mode === 'autonomous_live' && !(owned || phoneClassification === PHONE_CLASSIFICATIONS.BUSINESS_LANDLINE)) {
+    if ((mode === 'autonomous_live' || mode === 'production_live') && !(owned || phoneClassification === PHONE_CLASSIFICATIONS.BUSINESS_LANDLINE)) {
       const code = phoneClassification === PHONE_CLASSIFICATIONS.MOBILE_RISK
         ? REASON_CODES.PHONE_MOBILE_RISK
         : phoneClassification === PHONE_CLASSIFICATIONS.UNKNOWN
           ? REASON_CODES.PHONE_UNKNOWN_RISK
-          : REASON_CODES.AUTONOMOUS_PHONE_NOT_BUSINESS_LANDLINE;
+          : mode === 'production_live'
+            ? REASON_CODES.PRODUCTION_PHONE_NOT_BUSINESS_LANDLINE
+            : REASON_CODES.AUTONOMOUS_PHONE_NOT_BUSINESS_LANDLINE;
       blockers.push({ code, phoneClassification });
     }
   }
@@ -258,6 +262,27 @@ export function callingWindowStatus(now = new Date(), { mode = env.runMode, time
   if (start === end) return { allowed: true, timezone, timezoneValid: true, localHour: local.hour, quietHoursStart: start, quietHoursEnd: end };
   const quiet = start < end ? local.hour >= start && local.hour < end : local.hour >= start || local.hour < end;
   return { allowed: !quiet, timezone, timezoneValid: true, localHour: local.hour, localMinute: local.minute, quietHoursStart: start, quietHoursEnd: end };
+}
+
+export function complianceGateReport({ mode = env.runMode, now = new Date() } = {}) {
+  const disclosure = recordingDisclosure('Example Business');
+  const callingWindow = callingWindowStatus(now, { mode });
+  const maxAttempts = Math.max(0, Number(env.outreach.maxAttemptsPerPhone) || 0);
+  return {
+    policyVersion: POLICY_VERSION,
+    gates: [
+      gate('dnc', true, 'do_not_call table blocks recorded phone opt-outs before any call'),
+      gate('opt_out', true, 'call transcripts and AgentMail replies persist stop/remove/unsubscribe requests'),
+      gate('quiet_hours', callingWindow.timezoneValid !== false, callingWindow.timezoneValid === false ? `invalid timezone ${env.outreach.timezone}` : `${env.outreach.quietHoursStart}:00-${env.outreach.quietHoursEnd}:00 ${env.outreach.timezone}`),
+      gate('max_attempts', maxAttempts > 0, `MAX_ATTEMPTS_PER_PHONE=${maxAttempts}`),
+      gate('business_phone_classification', true, 'production/autonomous calls require owned or business-landline evidence'),
+      gate('recording_ai_disclosure', hasRecordingDisclosure(disclosure), disclosure),
+      gate('invoice_consent', true, 'analyst requires confirmed read-back email before invoice handoff'),
+      gate('unsubscribe', true, 'AgentMail opt-out classification records email-opt-out and stops automated replies')
+    ],
+    outboundCallReasonCodes: REASON_CODES,
+    phoneClassifications: PHONE_CLASSIFICATIONS
+  };
 }
 
 function sourceUrlFor({ lead, profile } = {}) {
@@ -524,4 +549,13 @@ function timePartsInTimezone(now, timezone) {
 
 function firstString(...values) {
   return values.find((v) => typeof v === 'string' && v.trim())?.trim() || null;
+}
+
+function gate(name, ok, detail) {
+  return {
+    name,
+    ok: Boolean(ok),
+    detail,
+    nextAction: ok ? 'monitor' : `fix_${name}`
+  };
 }

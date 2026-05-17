@@ -39,6 +39,38 @@ export async function generateJson({
   throw normalizedGeminiThrow('generateJson', lastError);
 }
 
+export async function generateStructuredText({
+  prompt,
+  jsonSchema,
+  schema,
+  systemInstruction,
+  model,
+  thinkingLevel = 'medium',
+  flash = false
+}) {
+  const chain = modelChain(model || (flash ? env.gemini.modelFlash : env.gemini.modelPro));
+  let lastError;
+
+  for (const useModel of chain) {
+    try {
+      const text = await callModel({
+        model: useModel,
+        prompt,
+        systemInstruction,
+        thinkingLevel,
+        schema: jsonSchema || schema
+      });
+      return { text, model: useModel };
+    } catch (err) {
+      lastError = normalizeGeminiError(err);
+      if (!shouldTryNextModel(lastError)) throw err;
+      log.warn('gemini.fallback.structured_text', { from: useModel, error: lastError.message });
+    }
+  }
+
+  throw normalizedGeminiThrow('generateStructuredText', lastError);
+}
+
 export async function generateText({ prompt, systemInstruction, model, thinkingLevel = 'low', flash = false }) {
   const chain = modelChain(model || (flash ? env.gemini.modelFlash : env.gemini.modelPro));
   let lastError;

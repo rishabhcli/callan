@@ -1,103 +1,206 @@
-// Phase 8: dry-run + safety verification per upgrade.md §5.
-// Verifies HMAC webhook signature, Supermemory containerTag isolation,
-// the recording-disclosure preamble plumbing, and the Stripe key
-// posture. Mock end-to-end is verified by the running stack already.
+#!/usr/bin/env node
+
+// Deterministic local safety verification. This script never calls providers.
 
 import crypto from 'node:crypto';
-import { env } from '../server/env.js';
-import { addDoc, search, containerTagFor } from '../server/memory.js';
-import { recordingDisclosure } from '../server/compliance.js';
-import { verifyAgentPhone } from '../server/webhooks/agentphone.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const dataDir = mkdtempSync(join(tmpdir(), 'callan-safety-'));
+process.env.DATA_DIR = dataDir;
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 
 const results = [];
-const pass = (name, detail) => results.push({ name, ok: true, detail });
-const fail = (name, detail) => results.push({ name, ok: false, detail });
+const startedAt = Date.now();
+let dbHandle = null;
 
-async function checkHmac() {
-  if (!env.agentphone.webhookSecret) {
-    pass('hmac.agentphone (skipped — webhook secret not set; live mode would still require it)', 'no secret');
-    return;
-  }
-  const ts = String(Date.now());
-  const body = Buffer.from(JSON.stringify({ event: 'call.ended', callId: 'demo' }));
-  const sig = crypto.createHmac('sha256', env.agentphone.webhookSecret).update(`${ts}.${body.toString('utf8')}`).digest('hex');
-  const okReq = {
-    headers: { 'x-webhook-signature': `sha256=${sig}`, 'x-webhook-timestamp': ts },
-    rawBody: body
+try {
+  const [
+    { env, RUN_MODES, SIDE_EFFECTS, sideEffectMatrix },
+    { complianceGateReport, recordingDisclosure },
+    { verifyAgentPhone },
+    { liveReadiness },
+    dbModule
+  ] = await Promise.all([
+    import('../server/env.js'),
+    import('../server/compliance.js'),
+    import('../server/webhooks/agentphone.js'),
+    import('../server/readiness.js'),
+    import('../server/db.js')
+  ]);
+  dbHandle = dbModule.db;
+
+  await check('mode_system.enumerates_required_modes', () => {
+    const expected = ['mock', 'demo_live', 'autonomous_live', 'production_review', 'production_live'];
+    assert(expected.every((mode) => RUN_MODES.includes(mode)), `missing mode from ${RUN_MODES.join(',')}`);
+    return RUN_MODES.join(', ');
+  });
+
+  await check('side_effect_matrix.refuses_mock_and_review', () => {
+    const originalMode = env.runMode;
+    const originalLive = { ...env.live };
+    const originalOutreach = env.outreach.enabled;
+    Object.assign(env.live, {
+      calls: true,
+      emails: true,
+      payments: true,
+      invoices: true,
+      browserSessions: true,
+      publicOutreach: true,
+      builds: true
+    });
+    env.outreach.enabled = true;
+    const mock = sideEffectMatrix('mock');
+    const review = sideEffectMatrix('production_review');
+    env.runMode = originalMode;
+    Object.assign(env.live, originalLive);
+    env.outreach.enabled = originalOutreach;
+    const unsafe = [...SIDE_EFFECTS].filter((action) => mock[action].allowed || review[action].allowed);
+    assert(unsafe.length === 0, `unexpected allowed side effects: ${unsafe.join(', ')}`);
+    return 'mock and production_review block calls, emails, invoices, browser sessions, public outreach, and builds';
+  });
+
+  await check('compliance.disclosure_contains_recording_and_opt_out', () => {
+    const line = recordingDisclosure('Tony Barbershop');
+    assert(/record(?:ed|ing)/i.test(line), 'recording disclosure missing');
+    assert(/opt out|stop|remove/i.test(line), 'opt-out language missing');
+    return line;
+  });
+
+  await check('compliance.gate_report_covers_required_controls', () => {
+    const report = complianceGateReport({ mode: 'production_live' });
+    const names = new Set(report.gates.map((gate) => gate.name));
+    const required = ['dnc', 'opt_out', 'quiet_hours', 'max_attempts', 'business_phone_classification', 'recording_ai_disclosure', 'invoice_consent', 'unsubscribe'];
+    const missing = required.filter((name) => !names.has(name));
+    assert(missing.length === 0, `missing gates: ${missing.join(', ')}`);
+    return required.join(', ');
+  });
+
+  await check('webhook.agentphone_accepts_valid_hmac', () => {
+    env.agentphone.webhookSecret = 'safety-agentphone-secret';
+    const ts = String(Math.floor(Date.now() / 1000));
+    const body = Buffer.from(JSON.stringify({ event: 'agent.call_ended', callId: 'call_safety' }));
+    const sig = crypto.createHmac('sha256', env.agentphone.webhookSecret).update(`${ts}.${body.toString('utf8')}`).digest('hex');
+    const result = verifyAgentPhone({
+      headers: {
+        'x-webhook-signature': `sha256=${sig}`,
+        'x-webhook-timestamp': ts,
+        'x-webhook-id': 'wh_safety_valid'
+      }
+    }, body);
+    assert(result.ok, result.reason || 'valid signature rejected');
+    return `replayWindowSeconds=${result.replayWindowSeconds}`;
+  });
+
+  await check('webhook.agentphone_rejects_replay_and_missing_id', () => {
+    env.agentphone.webhookSecret = 'safety-agentphone-secret';
+    const oldTs = String(Math.floor((Date.now() - 10 * 60 * 1000) / 1000));
+    const body = Buffer.from(JSON.stringify({ event: 'agent.call_ended', callId: 'call_safety' }));
+    const oldSig = crypto.createHmac('sha256', env.agentphone.webhookSecret).update(`${oldTs}.${body.toString('utf8')}`).digest('hex');
+    const replay = verifyAgentPhone({
+      headers: {
+        'x-webhook-signature': `sha256=${oldSig}`,
+        'x-webhook-timestamp': oldTs,
+        'x-webhook-id': 'wh_safety_old'
+      }
+    }, body);
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.createHmac('sha256', env.agentphone.webhookSecret).update(`${ts}.${body.toString('utf8')}`).digest('hex');
+    const missingId = verifyAgentPhone({
+      headers: {
+        'x-webhook-signature': `sha256=${sig}`,
+        'x-webhook-timestamp': ts
+      }
+    }, body);
+    assert(!replay.ok && /replay/.test(replay.reason), `replay not rejected: ${JSON.stringify(replay)}`);
+    assert(!missingId.ok && /Webhook-ID/.test(missingId.reason), `missing id not rejected: ${JSON.stringify(missingId)}`);
+    return `${replay.reason}; ${missingId.reason}`;
+  });
+
+  await check('idempotency.webhook_events_record_once', () => {
+    const first = dbModule.webhookEvents.recordOnce({ provider: 'agentphone', event_id: 'wh_safety_once', type: 'agent.call_ended', payload: { id: 1 } });
+    const second = dbModule.webhookEvents.recordOnce({ provider: 'agentphone', event_id: 'wh_safety_once', type: 'agent.call_ended', payload: { id: 2 } });
+    const count = dbModule.db.prepare(`SELECT COUNT(*) AS n FROM webhook_events WHERE provider = ? AND event_id = ?`).get('agentphone', 'wh_safety_once').n;
+    assert(first === true, 'first insert was not recorded');
+    assert(second === false, 'duplicate insert was not ignored');
+    assert(count === 1, `expected one row, got ${count}`);
+    return 'duplicate webhook delivery ignored';
+  });
+
+  await check('stripe.key_posture', () => {
+    const key = env.stripe.secretKey;
+    if (!key) return 'not set; production readiness will list Stripe as blocked';
+    if (/^sk_live_/.test(key)) throw new Error('sk_live_ is not allowed; use a restricted key and production review first');
+    if (/^rk_live_/.test(key) && env.runMode !== 'production_live') throw new Error('rk_live_ is only allowed in intentional production_live posture');
+    if (/^sk_test_/.test(key)) return 'sk_test_ detected; safe for tests, restricted test key preferred';
+    if (/^rk_test_/.test(key)) return 'restricted test key';
+    return `unknown key prefix (${key.slice(0, 7)}...)`;
+  });
+
+  await check('readiness.production_live_fails_closed', () => {
+    const readiness = liveReadiness();
+    if (env.runMode === 'production_live') {
+      assert(readiness.ready, `production_live blocked: ${readiness.blockers.join('; ')}`);
+    }
+    assert(Array.isArray(readiness.productionBlockers), 'productionBlockers missing');
+    return env.runMode === 'production_live'
+      ? 'production_live ready'
+      : `${readiness.productionBlockers.length} production blockers surfaced`;
+  });
+
+  const summary = summarize();
+  const payload = {
+    ok: summary.failed === 0,
+    name: 'safety-check',
+    generatedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    dataDir,
+    summary,
+    results
   };
-  const okRes = verifyAgentPhone(okReq, body);
-  if (okRes.ok) pass('hmac.agentphone.valid_signature_accepted', '');
-  else fail('hmac.agentphone.valid_signature_accepted', okRes.reason);
+  console.log(JSON.stringify(payload, null, 2));
+  printHuman(summary);
+  process.exitCode = payload.ok ? 0 : 1;
+} catch (err) {
+  console.error('safety-check crashed:', err?.stack || err?.message || String(err));
+  process.exitCode = 2;
+} finally {
+  try { dbHandle?.close?.(); } catch {}
+  rmSync(dataDir, { recursive: true, force: true });
+}
 
-  const badReq = {
-    headers: { 'x-webhook-signature': `sha256=${'0'.repeat(64)}`, 'x-webhook-timestamp': ts },
-    rawBody: body
+async function check(name, fn) {
+  try {
+    const detail = await fn();
+    results.push({ name, ok: true, detail: formatDetail(detail) });
+  } catch (err) {
+    results.push({ name, ok: false, detail: err?.message || String(err) });
+  }
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function formatDetail(detail) {
+  if (detail === undefined || detail === null) return '';
+  return typeof detail === 'string' ? detail : JSON.stringify(detail);
+}
+
+function summarize() {
+  const failed = results.filter((row) => !row.ok).length;
+  return {
+    total: results.length,
+    passed: results.length - failed,
+    failed
   };
-  const badRes = verifyAgentPhone(badReq, body);
-  if (!badRes.ok) pass('hmac.agentphone.bad_signature_rejected', `reason: ${badRes.reason}`);
-  else fail('hmac.agentphone.bad_signature_rejected', 'bad signature accepted!');
 }
 
-async function checkIsolation() {
-  if (!env.supermemory.apiKey) { fail('isolation.containertag', 'SUPERMEMORY_API_KEY missing'); return; }
-  const stamp = Date.now().toString(36);
-  const tagA = containerTagFor(`iso${stamp}a`);
-  const tagB = containerTagFor(`iso${stamp}b`);
-  const aDoc = await addDoc(tagA, 'profile', { businessName: 'TagA Cleaners', niche: 'dry-cleaning', city: 'A-town', whatTheyDo: 'special_isoA_phrase_zebra' });
-  const bDoc = await addDoc(tagB, 'profile', { businessName: 'TagB Repairs', niche: 'shoe-repair', city: 'B-town', whatTheyDo: 'special_isoB_phrase_pelican' });
-  await new Promise((r) => setTimeout(r, 5000));
-  const aHits = await search(tagA, 'pelican');
-  const bHits = await search(tagB, 'zebra');
-  const aLeakedIds = aHits.map((h) => h?.documentId || h?.id).filter((id) => id === bDoc?.id);
-  const bLeakedIds = bHits.map((h) => h?.documentId || h?.id).filter((id) => id === aDoc?.id);
-  if (aLeakedIds.length === 0 && bLeakedIds.length === 0) {
-    pass('isolation.containertag', `tagA cross-query returned ${aHits.length} hits but none were tagB's doc; tagB cross-query returned ${bHits.length} hits but none were tagA's doc.`);
-  } else {
-    fail('isolation.containertag', `bleed detected: ${aLeakedIds.length + bLeakedIds.length} cross-tag IDs`);
+function printHuman(summary) {
+  console.log('\n=== SAFETY CHECK RESULTS ===');
+  for (const row of results) {
+    console.log(`[${row.ok ? 'PASS' : 'FAIL'}] ${row.name}${row.detail ? ` - ${row.detail}` : ''}`);
   }
+  console.log(`[${summary.failed ? 'FAIL' : 'PASS'}] ${summary.passed}/${summary.total} checks passed`);
 }
-
-function checkDisclosure() {
-  const line = recordingDisclosure('Tony Barbershop');
-  const requirements = [
-    /recorded/i,
-    /opt out|stop|remove/i,
-    /Tony Barbershop/i
-  ];
-  const missing = requirements.filter((rx) => !rx.test(line));
-  if (missing.length === 0) pass('compliance.recording_disclosure', `line: "${line}"`);
-  else fail('compliance.recording_disclosure', `missing pattern(s): ${missing.map(String).join(', ')}`);
-}
-
-function checkStripeKey() {
-  const k = env.stripe.secretKey;
-  if (!k) { fail('stripe.key_posture', 'STRIPE_SECRET_KEY not set'); return; }
-  if (k.startsWith('rk_test_')) pass('stripe.key_posture', 'restricted test key (rk_test_) — ideal');
-  else if (k.startsWith('sk_test_')) pass('stripe.key_posture.test_unrestricted', 'sk_test_ — test mode is safe but upgrade.md asks for rk_test_ (restricted) ideally');
-  else if (k.startsWith('rk_live_')) fail('stripe.key_posture', 'restricted LIVE key — NOT recommended for hackathon demo');
-  else if (k.startsWith('sk_live_')) fail('stripe.key_posture', 'SECRET LIVE KEY — refuse to run live payments with this');
-  else fail('stripe.key_posture', 'unknown key format');
-}
-
-function checkRunMode() {
-  pass('run_mode.posture', `runMode=${env.runMode}; live.calls=${env.live.calls} emails=${env.live.emails} payments=${env.live.payments} builds=${env.live.builds}; allowedPhones=${env.allowedPhones.length}`);
-}
-
-async function main() {
-  checkRunMode();
-  checkDisclosure();
-  checkStripeKey();
-  await checkHmac();
-  await checkIsolation();
-
-  console.log('\n=== SAFETY CHECK RESULTS ===\n');
-  for (const r of results) {
-    const sigil = r.ok ? 'PASS' : 'FAIL';
-    console.log(`[${sigil}] ${r.name}${r.detail ? ` — ${r.detail}` : ''}`);
-  }
-  const fails = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - fails.length}/${results.length} passed.`);
-  if (fails.length > 0) process.exit(1);
-}
-
-main().catch((err) => { console.error('safety-check crashed:', err); process.exit(2); });

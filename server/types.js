@@ -145,7 +145,9 @@ export const FollowupRequest = z.object({
 });
 
 export const BuildRequest = z.object({
-  leadId: z.string()
+  leadId: z.string(),
+  target: z.enum(['lovable', 'v0']).optional(),
+  images: z.array(z.string().url()).max(10).optional()
 });
 
 function jsonSchema(zodSchema) {

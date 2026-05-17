@@ -69,6 +69,7 @@ try {
 
   const scenarios = [];
   scenarios.push(await scenarioBaselineReady(context, leadIds));
+  scenarios.push(await scenarioProductionLiveFailsClosed(context));
   scenarios.push(await scenarioSponsorMissingProvider(context));
   scenarios.push(await scenarioSponsorSmokeDegraded(context));
   scenarios.push(await scenarioQueuePaused(context, leadIds.ready));
@@ -138,6 +139,8 @@ function configureIsolatedEnv(dir) {
     LIVE_CALLS: 'false',
     LIVE_EMAILS: 'false',
     LIVE_PAYMENTS: 'false',
+    LIVE_BROWSER_SESSIONS: 'false',
+    LIVE_PUBLIC_OUTREACH: 'false',
     LIVE_BUILDS: 'false',
     SMOKE_GEMINI: 'false',
     SMOKE_SUPERMEMORY_WRITE: 'false',
@@ -188,6 +191,9 @@ function seedConfiguredPosture({ env }) {
   env.live.calls = false;
   env.live.emails = false;
   env.live.payments = false;
+  env.live.invoices = false;
+  env.live.browserSessions = false;
+  env.live.publicOutreach = false;
   env.live.builds = false;
   Object.assign(env.smoke, {
     gemini: false,
@@ -305,7 +311,11 @@ async function scenarioSponsorMissingProvider(ctx) {
   const readiness = ctx.liveReadiness();
   const assertions = [
     assertion('readiness fails closed', readiness.ready === false, readiness.blockers),
-    assertion('agentphone blocker is surfaced', readiness.blockers.includes('agentphone not configured'), readiness.blockers),
+    assertion(
+      'agentphone blocker is surfaced',
+      readiness.blockers.some((blocker) => /agentphone/i.test(blocker) && /(not configured|missing)/i.test(blocker)),
+      readiness.blockers
+    ),
     assertion('provider lastError is surfaced', readiness.providers.agentphone.lastError === 'simulated sponsor outage: auth endpoint unavailable', readiness.providers.agentphone)
   ];
   seedConfiguredPosture(ctx);
@@ -315,6 +325,40 @@ async function scenarioSponsorMissingProvider(ctx) {
       ready: readiness.ready,
       blockers: readiness.blockers,
       provider: readiness.providers.agentphone
+    },
+    sideEffects: isolatedSideEffects()
+  });
+}
+
+async function scenarioProductionLiveFailsClosed(ctx) {
+  seedConfiguredPosture(ctx);
+  seedSponsorSmoke(ctx, 'ok');
+  ctx.env.runMode = 'production_live';
+  ctx.env.nodeEnv = 'test';
+  ctx.env.publicUrl = 'http://localhost:8787';
+  ctx.env.productionLiveAck = '';
+  ctx.env.live.calls = false;
+  ctx.env.live.emails = false;
+  ctx.env.live.payments = false;
+  ctx.env.live.invoices = false;
+  ctx.env.live.browserSessions = false;
+  ctx.env.live.publicOutreach = false;
+  ctx.env.live.builds = false;
+  const readiness = ctx.liveReadiness();
+  const assertions = [
+    assertion('production_live is not ready without explicit ack and live flags', readiness.ready === false, readiness.blockers),
+    assertion('production ack blocker is surfaced', readiness.blockers.some((b) => /PRODUCTION_LIVE_ACK/.test(b)), readiness.blockers),
+    assertion('public https URL blocker is surfaced', readiness.blockers.some((b) => /APP_PUBLIC_URL/.test(b)), readiness.blockers),
+    assertion('side-effect blockers are surfaced', readiness.blockers.some((b) => /outbound calls|LIVE_CALLS/.test(b)), readiness.blockers)
+  ];
+  seedConfiguredPosture(ctx);
+  seedSponsorSmoke(ctx, 'ok');
+  return scenario('production_live_fails_closed', 'readiness', assertions, {
+    expected: 'production_live refuses operation unless ack, public webhooks, production env, live flags, and safety gates are all present',
+    observed: {
+      ready: readiness.ready,
+      blockers: readiness.blockers,
+      productionBlockers: readiness.productionBlockers
     },
     sideEffects: isolatedSideEffects()
   });
@@ -339,15 +383,24 @@ async function scenarioSponsorSmokeDegraded(ctx) {
   });
   const readiness = ctx.liveReadiness();
   const degraded = degradedProviders(readiness);
+  const expectedDegradedProviders = new Set(['stripe', 'browserUse']);
   const assertions = [
-    assertion('configured providers can remain ready while smoke is degraded', readiness.ready === true, readiness.blockers),
-    assertion('degraded smoke rows are machine-readable', degraded.length === 2, degraded),
+    assertion(
+      'failed required smoke blocks readiness',
+      readiness.ready === false && readiness.blockers.some((blocker) => /stripe smoke failed/i.test(blocker)),
+      readiness.blockers
+    ),
+    assertion(
+      'degraded smoke rows are machine-readable',
+      [...expectedDegradedProviders].every((provider) => degraded.some((row) => row.provider === provider)),
+      degraded
+    ),
     assertion('stripe failure is visible', degraded.some((p) => p.provider === 'stripe' && p.lastError), degraded),
     assertion('browserUse degradation is visible', degraded.some((p) => p.provider === 'browserUse' && p.lastError), degraded)
   ];
   seedSponsorSmoke(ctx, 'ok');
   return scenario('degraded_sponsor_smoke', 'degraded_readiness', assertions, {
-    expected: 'non-side-effect smoke failures stay in JSON so operators can see degraded sponsors without placing calls, sending mail, or creating invoices',
+    expected: 'required provider smoke failures block readiness and stay in JSON without placing calls, sending mail, or creating invoices',
     observed: {
       ready: readiness.ready,
       blockers: readiness.blockers,

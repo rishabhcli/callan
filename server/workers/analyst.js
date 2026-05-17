@@ -1,9 +1,12 @@
 import { emit } from '../sse.js';
 import { runs, leads, calls } from '../db.js';
 import { containerTagFor, addDoc, getLatest } from '../memory.js';
-import { generateJson } from '../gemini.js';
+import { generateStructured } from '../reasoning/geminiReasoner.js';
+import { CallAnalysis } from '../reasoning/schemas.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
+import { generateGrowthPlanForLead } from '../growth/index.js';
+import { applyMossAnalystFeedback } from '../moss/analysis.js';
 
 const OUTCOME_TO_STATUS = {
   won: 'closing',
@@ -13,56 +16,6 @@ const OUTCOME_TO_STATUS = {
 };
 
 const OUTCOMES = new Set(['won', 'lost', 'callback', 'unreachable']);
-
-const CallAnalysisSchema = {
-  type: 'object',
-  properties: {
-    outcome: { type: 'string', enum: ['won', 'lost', 'callback', 'unreachable'] },
-    reason: { type: 'string' },
-    failureReason: { type: 'string', nullable: true },
-    whatWorked: { type: 'array', maxItems: 5, items: { type: 'string' } },
-    whatToTryNext: { type: 'array', maxItems: 5, items: { type: 'string' } },
-    replayMoments: {
-      type: 'array',
-      maxItems: 5,
-      items: {
-        type: 'object',
-        properties: {
-          ts: { type: 'number' },
-          excerpt: { type: 'string' },
-          note: { type: 'string' }
-        },
-        required: ['ts', 'excerpt', 'note']
-      }
-    },
-    invoiceEmail: { type: 'string', nullable: true },
-    confirmedEmail: { type: 'boolean' },
-    customerQuestions: { type: 'array', maxItems: 5, items: { type: 'string' } },
-    nextBestAction: {
-      type: 'object',
-      properties: {
-        code: { type: 'string' },
-        label: { type: 'string' },
-        reason: { type: 'string' }
-      },
-      required: ['code', 'label', 'reason']
-    },
-    followupEmailDraft: { type: 'string', nullable: true }
-  },
-  required: [
-    'outcome',
-    'reason',
-    'failureReason',
-    'whatWorked',
-    'whatToTryNext',
-    'replayMoments',
-    'invoiceEmail',
-    'confirmedEmail',
-    'customerQuestions',
-    'nextBestAction',
-    'followupEmailDraft'
-  ]
-};
 
 export async function runAnalyst({ leadId, callId }) {
   const runId = `run_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -82,16 +35,30 @@ export async function runAnalyst({ leadId, callId }) {
     const transcript = call?.transcript || null;
 
     const prompt = buildPrompt({ lead, profileDoc, pitchDoc, call, transcript });
-    const modelAnalysis = await generateJson({
-      schema: CallAnalysisSchema,
+    const { output: modelAnalysis, trace } = await generateStructured({
+      kind: 'callAnalysis',
+      schema: CallAnalysis,
+      evidence: {
+        lead,
+        profile: profileDoc?.content || null,
+        pitch: pitchDoc?.content || null,
+        call: call?.row || null,
+        transcript
+      },
       prompt,
-      systemInstruction: 'You are a brutally honest call analyst. No flattery. Be specific, evidence-led, and strict about whether an invoice email was actually confirmed.',
+      leadId,
+      worker: 'analyst',
+      eventId: callId || runId,
       thinkingLevel: 'medium'
     });
 
     const postMortem = normalizeAnalysis({ modelAnalysis, lead, call, transcript });
+    postMortem.mossSnippetFeedback = await applyMossAnalystFeedback({ leadId, callId, postMortem, transcript }).catch((err) => {
+      log.warn('analyst.moss_feedback.failed', { leadId, callId, error: err?.message || String(err) });
+      return { error: err?.message || String(err), retrievalCount: 0, helped: [], dead: [], improved: [] };
+    });
 
-    await addDoc(tag, 'post_mortem', postMortem, {
+    await safeAddMemory(tag, 'post_mortem', postMortem, {
       callId,
       outcome: postMortem.outcome,
       confirmedEmail: postMortem.confirmedEmail,
@@ -106,6 +73,17 @@ export async function runAnalyst({ leadId, callId }) {
       runId,
       analysis: eventAnalysis(postMortem)
     });
+    emit('analyst.reasoning', {
+      worker: 'analyst',
+      leadId,
+      callId,
+      runId,
+      traceId: trace?.id,
+      schemaName: trace?.schemaName,
+      valid: trace?.valid,
+      repairAttempts: trace?.repairAttempts,
+      confidence: modelAnalysis.confidence
+    });
 
     const status = OUTCOME_TO_STATUS[postMortem.outcome];
     const leadPatch = {
@@ -118,6 +96,20 @@ export async function runAnalyst({ leadId, callId }) {
     }
     if (Object.keys(leadPatch).length) leads.update(leadId, leadPatch);
 
+    let growthPlan = null;
+    try {
+      growthPlan = await generateGrowthPlanForLead({ leadId, source: 'analyst' });
+    } catch (err) {
+      log.warn('analyst.growth_plan_skipped', { leadId, callId, error: err?.message || String(err) });
+      emit('analyst.growth_skipped', {
+        worker: 'analyst',
+        leadId,
+        callId,
+        runId,
+        reason: err?.message || String(err)
+      });
+    }
+
     emit('analyst.done', {
       worker: 'analyst',
       leadId,
@@ -126,7 +118,9 @@ export async function runAnalyst({ leadId, callId }) {
       reason: postMortem.reason,
       failureReason: postMortem.failureReason,
       nextBestAction: postMortem.nextBestAction?.code,
-      confirmedEmail: postMortem.confirmedEmail
+      confirmedEmail: postMortem.confirmedEmail,
+      growthPlanId: growthPlan?.row?.id || null,
+      growthNextService: growthPlan?.offers?.nextRecommendedService?.id || null
     });
 
     if (postMortem.outcome === 'won') {
@@ -155,7 +149,14 @@ export async function runAnalyst({ leadId, callId }) {
         nextBestAction: postMortem.nextBestAction?.code,
         invoiceEmail: postMortem.invoiceEmail,
         confirmedEmail: postMortem.confirmedEmail,
-        customerQuestions: postMortem.customerQuestions
+        customerQuestions: postMortem.customerQuestions,
+        mossSnippetFeedback: postMortem.mossSnippetFeedback,
+        reasoningTraceId: trace?.id || null,
+        growthPlan: growthPlan ? {
+          id: growthPlan.row?.id || null,
+          nextRecommendedService: growthPlan.offers?.nextRecommendedService?.id || null,
+          unsupportedFlags: growthPlan.plan?.unsupportedFlags || []
+        } : null
       }
     });
     return { postMortem };
@@ -163,6 +164,15 @@ export async function runAnalyst({ leadId, callId }) {
     runs.finish(runId, { state: 'failed', error: err?.message || String(err) });
     emit('analyst.error', { worker: 'analyst', leadId, runId, error: err?.message || String(err) });
     throw err;
+  }
+}
+
+async function safeAddMemory(containerTag, kind, content, metadata) {
+  try {
+    return await addDoc(containerTag, kind, content, metadata);
+  } catch (err) {
+    log.warn('analyst.memory.add.skipped', { containerTag, kind, error: err?.message || String(err) });
+    return null;
   }
 }
 

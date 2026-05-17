@@ -133,12 +133,12 @@ async function findReusableCustomer(stripe, { email, leadId }) {
     return metadata.leadId === String(leadId) || metadata.callmemaybeLeadId === String(leadId);
   });
   if (sameLead) return { customer: sameLead, reused: true, reason: 'same_lead_metadata' };
-  if (exactMatches.length === 1) return { customer: exactMatches[0], reused: true, reason: 'single_email_match' };
+  if (exactMatches.length) return { customer: exactMatches[0], reused: true, reason: exactMatches.length === 1 ? 'single_email_match' : 'first_normalized_email_match' };
 
   return {
     customer: null,
     reused: false,
-    reason: exactMatches.length > 1 ? 'ambiguous_email_matches' : 'not_found'
+    reason: 'not_found'
   };
 }
 
@@ -174,9 +174,11 @@ export async function createHostedInvoice({
   amountCents = env.stripe.priceCents,
   productName = env.stripe.productName,
   daysUntilDue = 7,
+  offerVersion,
   metadata = {}
 }) {
   if (!idempotencyKey) throw new Error('Stripe invoice idempotencyKey missing');
+  const email = normalizeStripeEmail(toEmail);
 
   try {
     const stripe = stripeClient();
@@ -191,6 +193,7 @@ export async function createHostedInvoice({
       leadId,
       callmemaybeLeadId: leadId,
       source: 'callmemaybe',
+      offerVersion,
       ...metadata
     });
 
@@ -227,10 +230,15 @@ export async function createHostedInvoice({
     return {
       id: finalized.id,
       customerId: customer.id,
+      customerEmail: email,
+      amountCents,
+      status: finalized.status || invoice.status || 'open',
       url: finalized.hosted_invoice_url,
       hostedInvoiceUrl: finalized.hosted_invoice_url,
       invoicePdf: finalized.invoice_pdf || null,
+      invoicePdfUrl: finalized.invoice_pdf || null,
       dueAt: finalized.due_date ? finalized.due_date * 1000 : null,
+      offerVersion: offerVersion || metadata.offerVersion || null,
       customerReused: customerResult.reused,
       customerReuseReason: customerResult.reason
     };

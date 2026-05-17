@@ -1,10 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { emit } from '../sse.js';
 import { contactEvents, leads } from '../db.js';
-import { env } from '../env.js';
+import { canEmail, env } from '../env.js';
 import { log } from '../logger.js';
 import { addDoc, containerTagFor } from '../memory.js';
-import { generateText } from '../gemini.js';
+import { generateStructured } from '../reasoning/geminiReasoner.js';
+import { EmailReplyDecision } from '../reasoning/schemas.js';
 import {
   createMockAgentMailSendResult,
   fetchAgentMailIncomingMessages,
@@ -12,6 +13,7 @@ import {
   normalizeAgentMailMessage,
   replyAgentMailMessage
 } from '../providers/agentmail.js';
+import { classifyGrowthReply } from '../growth/replyPolicy.js';
 
 export { fetchAgentMailIncomingMessages };
 
@@ -24,12 +26,15 @@ const SUPPORTED_SCOPES = Object.freeze([
   'revisions',
   'pricing',
   'build progress',
-  'opt-out'
+  'opt-out',
+  'growth follow-up'
 ]);
 
 const UNSUPPORTED_SCOPES = Object.freeze([
   'legal',
   'custom contract',
+  'refund threat',
+  'security issue',
   'tax',
   'guarantees',
   'weird request'
@@ -42,7 +47,8 @@ const SUPPORTED_SCOPE = [
   'website revisions',
   'pricing',
   'build progress',
-  'opt-out or unsubscribe'
+  'opt-out or unsubscribe',
+  'post-delivery growth follow-up'
 ].join(', ');
 
 const OPT_OUT_PATTERNS = Object.freeze([
@@ -82,6 +88,28 @@ const UNSUPPORTED_SCOPE_PATTERNS = Object.freeze([
       /\bliability\b/i,
       /\bvendor\s+agreement\b/i,
       /\bsign\s+(?:our|my|a)\s+contract\b/i
+    ]
+  },
+  {
+    scope: 'refund threat',
+    patterns: [
+      /\brefund\b/i,
+      /\bchargeback\b/i,
+      /\bdispute\s+(?:the\s+)?(?:charge|payment|invoice)\b/i,
+      /\bthreaten(?:ing)?\s+(?:a\s+)?refund\b/i,
+      /\bget\s+my\s+money\s+back\b/i
+    ]
+  },
+  {
+    scope: 'security issue',
+    patterns: [
+      /\bsecurity\b/i,
+      /\bbreach\b/i,
+      /\bvulnerability\b/i,
+      /\bdata\s+leak\b/i,
+      /\bpassword\b/i,
+      /\baccount\s+(?:takeover|compromised|hacked)\b/i,
+      /\bhacked\b/i
     ]
   },
   {
@@ -264,7 +292,7 @@ export async function handleAgentMailInbound(body = {}, {
   const leadId = lead?.id || body.leadId || body.lead_id || null;
   const resolvedLead = lead || (leadId ? leads.get(leadId) : null);
   const bodyText = msg.text || '';
-  const classification = classifyMessage({ subject: msg.subject, text: bodyText });
+  const classification = await decideEmailReply({ lead: resolvedLead, msg, subject: msg.subject, text: bodyText });
 
   contactEvents.add({
     lead_id: leadId,
@@ -451,8 +479,9 @@ export function classifyMessage(input = '') {
   const optOutMatches = matchingPatterns(policyText, OPT_OUT_PATTERNS);
   const unsupportedMatches = matchingScopePatterns(policyText, UNSUPPORTED_SCOPE_PATTERNS);
   const supportedMatches = matchingScopePatterns(policyText, SUPPORTED_SCOPE_PATTERNS);
+  const growthReply = classifyGrowthReply({ subject, text });
 
-  if (optOutMatches.length) {
+  if (optOutMatches.length || growthReply.kind === 'unsubscribe') {
     return classificationResult({
       kind: 'opt_out',
       scope: 'opt-out',
@@ -464,12 +493,13 @@ export function classifyMessage(input = '') {
       matches: {
         supported: ['opt-out'],
         unsupported: unsupportedMatches.map((m) => m.scope)
-      }
+      },
+      growthReply
     });
   }
 
   if (unsupportedMatches.length) {
-    const scope = unsupportedMatches[0].scope;
+    const scope = unsupportedMatches[0]?.scope;
     return classificationResult({
       kind: 'handoff',
       scope,
@@ -481,7 +511,26 @@ export function classifyMessage(input = '') {
       matches: {
         supported: supportedMatches.map((m) => m.scope),
         unsupported: unsupportedMatches.map((m) => m.scope)
-      }
+      },
+      growthReply
+    });
+  }
+
+  if (growthReply.kind === 'interested' || growthReply.kind === 'not_now') {
+    const scope = `growth ${growthReply.kind.replace('_', ' ')}`;
+    return classificationResult({
+      kind: 'supported',
+      scope,
+      scopes: [scope, 'growth follow-up'],
+      supported: true,
+      operatorFlag: false,
+      replyMode: 'autonomous_reply',
+      reason: growthReply.reason,
+      matches: {
+        supported: [scope, 'growth follow-up'],
+        unsupported: []
+      },
+      growthReply
     });
   }
 
@@ -499,7 +548,25 @@ export function classifyMessage(input = '') {
       matches: {
         supported: scopes,
         unsupported: []
-      }
+      },
+      growthReply
+    });
+  }
+
+  if (growthReply.kind === 'handoff') {
+    return classificationResult({
+      kind: 'handoff',
+      scope: 'growth follow-up',
+      scopes: ['growth follow-up'],
+      supported: false,
+      operatorFlag: true,
+      replyMode: 'safe_handoff',
+      reason: growthReply.reason,
+      matches: {
+        supported: [],
+        unsupported: ['growth follow-up']
+      },
+      growthReply
     });
   }
 
@@ -514,11 +581,70 @@ export function classifyMessage(input = '') {
     matches: {
       supported: [],
       unsupported: ['weird request']
-    }
+    },
+    growthReply
   });
 }
 
+export async function decideEmailReply({
+  lead = null,
+  msg = {},
+  subject = '',
+  text = '',
+  history = [],
+  eventId = null,
+  forceMock = false
+} = {}) {
+  const deterministic = classifyMessage({ subject: subject || msg.subject, text: text || msg.text || msg.body || msg.preview });
+  const evidence = {
+    lead: lead ? {
+      id: lead.id,
+      businessName: lead.business_name,
+      status: lead.status,
+      nextAction: lead.next_action
+    } : null,
+    message: {
+      subject: subject || msg.subject || '',
+      text: text || msg.text || msg.body || msg.preview || '',
+      fromEmail: msg.fromEmail || null,
+      threadId: msg.threadId || null
+    },
+    deterministicPolicy: deterministic,
+    history
+  };
+  const prompt = [
+    `Classify the AgentMail customer reply and draft the exact reply body when autonomous reply is allowed.`,
+    `Supported autonomous scopes: ${SUPPORTED_SCOPE}.`,
+    `Unsupported scopes: ${UNSUPPORTED_SCOPES.join(', ')}.`,
+    `Opt-out requests must be kind="opt_out" and replyMode="opt_out_confirmation".`,
+    `Legal, custom contract, refund threats, security issues, tax, SEO/revenue guarantees, banking, medical, or weird requests must be safe handoff.`,
+    `Reply text must be concise, no markdown, no subject line, no unsupported promises.`
+  ].join('\n');
+
+  try {
+    const { output, trace } = await generateStructured({
+      kind: 'emailReplyDecision',
+      schema: EmailReplyDecision,
+      evidence,
+      prompt,
+      leadId: lead?.id || null,
+      worker: 'mailer',
+      eventId: eventId || msg.messageId || msg.threadId || null,
+      thinkingLevel: 'medium',
+      flash: true,
+      forceMock: forceMock || !env.gemini.apiKey
+    });
+    return normalizeModelEmailDecision(output, deterministic, { trace });
+  } catch (err) {
+    log.warn('agentmail.policy.gemini_fallback', { error: err?.message || String(err), leadId: lead?.id });
+    return deterministic;
+  }
+}
+
 async function draftReply({ lead, msg, classification, forceFallbackReply = false }) {
+  if (!forceFallbackReply && classification.replyText && classification.replyText.trim().length > 15) {
+    return classification.replyText.trim();
+  }
   if (classification.kind === 'opt_out') {
     return 'Understood. We will stop emailing this thread. Thanks for letting us know.';
   }
@@ -527,31 +653,6 @@ async function draftReply({ lead, msg, classification, forceFallbackReply = fals
   }
   if (forceFallbackReply) {
     return fallbackSupportedReply(classification.scope);
-  }
-
-  try {
-    if (!env.gemini.apiKey) throw new Error('GEMINI_API_KEY missing');
-    const prompt = [
-      `Business: ${lead?.business_name || 'unknown small business'}`,
-      `Customer email subject: ${msg.subject}`,
-      `Customer message:`,
-      msg.text || '(empty)',
-      '',
-      `Classification: ${classification.scope} (${classification.reason}).`,
-      `Reply as callmemaybe's autonomous AgentMail agent.`,
-      `Stay strictly inside this service scope: ${SUPPORTED_SCOPE}.`,
-      `Be brief, concrete, and useful. If they ask for anything outside scope, say a human will review it.`,
-      `Do not make legal promises, SEO guarantees, custom contract commitments, or unsupported delivery claims.`
-    ].join('\n');
-    const text = await generateText({
-      prompt,
-      systemInstruction: 'You write concise customer-service email replies for a website agency. No markdown.',
-      thinkingLevel: 'low',
-      flash: true
-    });
-    if (text && text.trim().length > 15) return text.trim();
-  } catch (err) {
-    log.warn('agentmail.reply.gemini_fallback', { error: err?.message || String(err) });
   }
 
   return fallbackSupportedReply(classification.scope);
@@ -623,7 +724,7 @@ function matchingScopePatterns(text, scopePatterns) {
     .filter((entry) => entry.matched > 0);
 }
 
-function classificationResult({ kind, scope, scopes, supported, operatorFlag, replyMode, reason, matches }) {
+function classificationResult({ kind, scope, scopes, supported, operatorFlag, replyMode, reason, matches, growthReply = null }) {
   return {
     schemaVersion: CLASSIFICATION_SCHEMA_VERSION,
     kind,
@@ -638,8 +739,65 @@ function classificationResult({ kind, scope, scopes, supported, operatorFlag, re
       unsupported: unique(matches?.unsupported || [])
     },
     supportedScopes: SUPPORTED_SCOPES,
-    unsupportedScopes: UNSUPPORTED_SCOPES
+    unsupportedScopes: UNSUPPORTED_SCOPES,
+    growthReply
   };
+}
+
+function normalizeModelEmailDecision(model, deterministic, { trace } = {}) {
+  const safeBase = safetyFloor(deterministic, model);
+  if (safeBase !== model) {
+    return {
+      ...safeBase,
+      replyText: safeBase.kind === 'opt_out' ? 'Understood. We will stop emailing this thread. Thanks for letting us know.' : safeHandoffResponse(),
+      confidence: model?.confidence ?? deterministic.confidence ?? 0.7,
+      reasoningTraceId: trace?.id || null,
+      reasoningSchemaValid: trace?.valid ?? true,
+      reasoningRepairAttempts: trace?.repairAttempts || 0
+    };
+  }
+
+  const scope = SUPPORTED_SCOPES.includes(model.scope) || model.scope === 'opt-out'
+    ? model.scope
+    : deterministic.scope;
+  const supported = model.kind === 'supported' && SUPPORTED_SCOPES.includes(scope);
+  const operatorFlag = Boolean(model.operatorFlag || model.kind === 'handoff' || !supported);
+  const kind = model.kind === 'opt_out' ? 'opt_out' : operatorFlag ? 'handoff' : 'supported';
+  return {
+    schemaVersion: CLASSIFICATION_SCHEMA_VERSION,
+    kind,
+    scope: kind === 'opt_out' ? 'opt-out' : scope,
+    scopes: unique(model.scopes?.length ? model.scopes : [scope]),
+    supported: kind === 'opt_out' ? true : supported,
+    operatorFlag: kind === 'handoff' || operatorFlag,
+    replyMode: kind === 'opt_out' ? 'opt_out_confirmation' : kind === 'handoff' ? 'safe_handoff' : 'autonomous_reply',
+    reason: model.reason || deterministic.reason,
+    matches: {
+      supported: unique(model.matches?.supported || deterministic.matches?.supported || []),
+      unsupported: unique(model.matches?.unsupported || deterministic.matches?.unsupported || [])
+    },
+    supportedScopes: SUPPORTED_SCOPES,
+    unsupportedScopes: UNSUPPORTED_SCOPES,
+    replyText: cleanReplyText(model.replyText),
+    confidence: model.confidence ?? 0.7,
+    sourceEvidence: model.sourceEvidence || [],
+    reasoningTraceId: trace?.id || null,
+    reasoningSchemaValid: trace?.valid ?? true,
+    reasoningRepairAttempts: trace?.repairAttempts || 0
+  };
+}
+
+function safetyFloor(deterministic, model) {
+  if (deterministic.kind === 'opt_out') return deterministic;
+  if (deterministic.operatorFlag) return deterministic;
+  if (model?.kind === 'opt_out' || model?.kind === 'handoff') return model;
+  return model;
+}
+
+function cleanReplyText(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text || text.length < 15) return null;
+  return text.slice(0, 1200);
 }
 
 function fallbackSupportedReply(scope) {
@@ -673,10 +831,7 @@ function unique(values) {
 }
 
 function canSend(toEmail) {
-  if (!['live', 'demo_live', 'autonomous_live'].includes(env.runMode)) return false;
-  if (!env.live.emails || !env.agentmail.apiKey || !env.agentmail.inboxId) return false;
-  if (env.runMode === 'demo_live' && !env.allowedEmails.includes(toEmail)) return false;
-  return !!toEmail;
+  return canEmail(toEmail) && !!env.agentmail.apiKey && !!env.agentmail.inboxId;
 }
 
 function persistThreadForLead(leadId, threadId, knownLead) {

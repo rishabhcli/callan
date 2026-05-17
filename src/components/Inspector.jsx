@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Transcript from './Transcript.jsx';
 import MemoryDoc from './MemoryDoc.jsx';
+import MemoryConsole from './MemoryConsole.jsx';
+import GrowthConsole from './GrowthConsole.jsx';
+import BuildQAConsole from './BuildQAConsole.jsx';
 import { api } from '../api.js';
 
-const TABS = ['Memory', 'Caller', 'Analyst', 'Mailer', 'Builder'];
+const TABS = ['Memory', 'Caller', 'Moss', 'Analyst', 'Mailer', 'Builder', 'Growth'];
 
 function parseDoc(doc) {
   if (!doc) return null;
@@ -39,7 +42,7 @@ function profileFromDetail(detail) {
   if (leadJson) {
     try { return JSON.parse(leadJson); } catch {}
   }
-  return parseDoc(detail?.memory?.profile?.[0]);
+  return parseDoc(detail?.memory?.business_profile?.[0] || detail?.memory?.profile?.[0]);
 }
 
 function presenceFromEvidence(lead, profile) {
@@ -156,7 +159,7 @@ function safeJson(value) {
 }
 
 function getPostMortem(detail) {
-  return parseDoc(detail?.memory?.post_mortem?.[0]);
+  return parseDoc(detail?.memory?.call_analysis?.[0] || detail?.memory?.post_mortem?.[0]);
 }
 
 function getMailEvents(detail) {
@@ -225,6 +228,7 @@ function mailFlags(events, lead) {
   const flags = [];
   const risk = lead?.risk_status || '';
   if (risk.includes('handoff')) flags.push({ text: 'operator handoff', tone: 'warn' });
+  if (risk.includes('agentmail-spam') || risk.includes('agentmail-blocked') || risk.includes('agentmail-unauthenticated')) flags.push({ text: 'mail flagged', tone: 'bad' });
   if (risk.includes('opt-out')) flags.push({ text: 'opt out', tone: 'bad' });
   if (events.some((event) => event.type === 'handoff_reply')) {
     flags.push({ text: 'handoff reply sent', tone: 'warn' });
@@ -245,6 +249,7 @@ function eventFlags(event) {
   const reason = meta?.classification?.reason || '';
   const flags = [];
   if (event.type === 'customer_reply') flags.push({ text: 'waiting', tone: 'info' });
+  if (event.type === 'customer_reply_flagged') flags.push({ text: 'provider flagged', tone: 'bad' });
   if (event.type === 'invoice_email') flags.push({ text: 'invoice', tone: 'good' });
   if (event.type === 'agent_reply') flags.push({ text: 'auto reply', tone: 'good' });
   if (event.type === 'handoff_reply' || kind === 'handoff') flags.push({ text: 'handoff', tone: 'warn' });
@@ -256,6 +261,20 @@ function eventFlags(event) {
 
 function replyWaitingCount(events) {
   return events.filter((event) => event.direction === 'inbound' && event.type === 'customer_reply').length;
+}
+
+function invoiceProofFromEvents(events) {
+  const event = events.find((row) => row.type === 'invoice_email');
+  const meta = safeJson(event?.metadata_json) || {};
+  const proof = meta.confirmedEmailProof || {};
+  return {
+    paymentId: meta.paymentId || null,
+    invoiceStatus: meta.invoiceStatus || null,
+    invoicePdfUrl: meta.invoicePdfUrl || null,
+    consentEventId: meta.invoiceConsentEventId || null,
+    emailProofSource: proof.source || null,
+    emailProof: proof.evidence || null
+  };
 }
 
 export default function Inspector({
@@ -328,6 +347,7 @@ export default function Inspector({
                 liveCallActive={liveCallActive}
               />
             )}
+            {activeTab === 'Moss' && <MossTab detail={leadDetail} />}
             {activeTab === 'Analyst' && <AnalystTab detail={leadDetail} />}
             {activeTab === 'Mailer'  && <MailerTab detail={leadDetail} />}
             {activeTab === 'Builder' && (
@@ -337,6 +357,13 @@ export default function Inspector({
                 builderInfo={builderInfo}
                 builderAction={builderAction}
                 onRetryBuild={onRetryBuild}
+              />
+            )}
+            {activeTab === 'Growth' && (
+              <GrowthConsole
+                detail={leadDetail}
+                focusedLeadId={focusedLeadId}
+                onLeadChanged={onLeadChanged}
               />
             )}
           </>
@@ -640,7 +667,7 @@ function paymentProofMode(payment) {
   const raw = `${payment.stripe_invoice_id || ''} ${payment.stripe_session_id || ''} ${payment.payment_link_url || ''} ${payment.hosted_invoice_url || ''}`;
   const mode = /mock|demo/i.test(raw) ? 'mock' : 'live';
   if (payment.status === 'paid') return { label: 'paid', tone: 'good', mode };
-  if (payment.status === 'created') return { label: 'invoice sent', tone: 'warn', mode };
+  if (payment.status === 'created' || payment.status === 'open') return { label: 'invoice sent', tone: 'warn', mode };
   return { label: labelize(payment.status || 'invoice'), tone: 'muted', mode };
 }
 
@@ -662,6 +689,8 @@ function MemoryTab({ detail }) {
       <div className="memtab-empty">
         <div className="hd">memory</div>
         <ResearchEvidencePanel detail={detail} />
+        <ReasoningPanel detail={detail} />
+        <MemoryConsole leadId={lead.id} />
         <div className="mono note">// supermemory offline or no docs yet.</div>
       </div>
     );
@@ -673,13 +702,94 @@ function MemoryTab({ detail }) {
         <div className="mono note">containerTag: <span className="accent">{lead.container_tag}</span></div>
       </div>
       <ResearchEvidencePanel detail={detail} />
-      <MemoryDoc kind="profile"     doc={mem.profile?.[0]}     defaultOpen />
+      <ReasoningPanel detail={detail} />
+      <MemoryConsole leadId={lead.id} />
+      <MemoryDoc kind="profile"     doc={mem.business_profile?.[0] || mem.profile?.[0]}     defaultOpen />
       <MemoryDoc kind="pitch"       doc={mem.pitch?.[0]}       />
-      <MemoryDoc kind="call_log"    doc={mem.call_log?.[0]}    />
-      <MemoryDoc kind="post_mortem" doc={mem.post_mortem?.[0]} />
+      <MemoryDoc kind="call_log"    doc={mem.call_transcript?.[0] || mem.call_log?.[0]}    />
+      <MemoryDoc kind="post_mortem" doc={mem.call_analysis?.[0] || mem.post_mortem?.[0]} />
       <MemoryDoc kind="mail_thread" doc={mem.mail_thread?.[0]} />
     </div>
   );
+}
+
+function ReasoningPanel({ detail }) {
+  const traces = (detail?.reasoningTraces || []).slice(0, 8);
+  return (
+    <section className="reasoning-panel">
+      <div className="reasoning-head">
+        <div>
+          <div className="hd">Gemini reasoning</div>
+          <div className="reasoning-sub mono">{traces.length ? `${traces.length} recent structured decisions` : 'no structured decisions yet'}</div>
+        </div>
+        <span className={`reasoning-status reasoning-status-${traces.some((trace) => !trace.valid) ? 'bad' : traces.length ? 'good' : 'muted'}`}>
+          {traces.some((trace) => !trace.valid) ? 'needs review' : traces.length ? 'valid schemas' : 'waiting'}
+        </span>
+      </div>
+      {traces.length ? (
+        <div className="reasoning-list">
+          {traces.map((trace) => (
+            <ReasoningTraceRow key={trace.id} trace={trace} />
+          ))}
+        </div>
+      ) : (
+        <div className="reasoning-empty mono">// pitch, analysis, mail policy, and build brief decisions will appear here.</div>
+      )}
+    </section>
+  );
+}
+
+function ReasoningTraceRow({ trace }) {
+  const output = trace.finalOutput || {};
+  const confidence = output.confidence ?? output.onlinePresenceConfidence ?? output.presenceConfidence ?? null;
+  const evidence = sourceEvidenceFor(output, trace.evidence).slice(0, 3);
+  const summary = reasoningSummary(output);
+  return (
+    <details className={`reasoning-row reasoning-row-${trace.valid ? 'valid' : 'invalid'}`}>
+      <summary>
+        <span className="reasoning-schema mono">{trace.schemaName || trace.kind}</span>
+        <span className={`reasoning-valid reasoning-valid-${trace.valid ? 'yes' : 'no'}`}>{trace.valid ? 'valid' : 'invalid'}</span>
+        <span className="reasoning-meta mono">{confidence == null ? 'conf --' : `conf ${Math.round(confidence * 100)}%`} · repair {trace.repairAttempts || 0}</span>
+      </summary>
+      <div className="reasoning-body">
+        <div className="reasoning-decision">{summary}</div>
+        {trace.validationErrors?.length ? (
+          <div className="reasoning-errors mono">{trace.validationErrors.join(' · ')}</div>
+        ) : null}
+        {evidence.length ? (
+          <div className="reasoning-evidence">
+            {evidence.map((item, index) => (
+              <div key={`${trace.id}:evidence:${index}`} className="reasoning-evidence-item">
+                <span className="mono">{item.source || 'evidence'}</span>
+                <span>{item.quote || item}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
+function reasoningSummary(output = {}) {
+  return output.reason ||
+    output.offerAngle ||
+    output.strategySummary ||
+    output.brief ||
+    output.onlinePresenceSummary ||
+    output.decisionReason ||
+    output.replyText ||
+    output.nextBestAction?.reason ||
+    'Structured decision recorded.';
+}
+
+function sourceEvidenceFor(output = {}, evidence = {}) {
+  if (Array.isArray(output.sourceEvidence)) return output.sourceEvidence;
+  if (Array.isArray(output.evidence)) return output.evidence;
+  if (evidence?.lead?.source_url || evidence?.lead?.website) {
+    return [{ source: evidence.lead.source_url || evidence.lead.website, quote: evidence.lead.business_name || 'lead evidence' }];
+  }
+  return [];
 }
 
 function ResearchEvidencePanel({ detail }) {
@@ -917,8 +1027,125 @@ function CallOutcomePanel({
   );
 }
 
+function MossTab({ detail }) {
+  const moss = detail?.moss;
+  const index = moss?.index;
+  const snippets = moss?.snippets || [];
+  const retrievals = moss?.retrievals || [];
+  const active = snippets.filter((snippet) => snippet.status !== 'dead');
+  const dead = snippets.filter((snippet) => snippet.status === 'dead');
+  const byKind = useMemo(() => {
+    const groups = {};
+    for (const snippet of active) {
+      const kind = snippet.kind || 'snippet';
+      groups[kind] = groups[kind] || [];
+      groups[kind].push(snippet);
+    }
+    for (const rows of Object.values(groups)) {
+      rows.sort((a, b) => (b.help_score - a.help_score) || (b.use_count - a.use_count) || (b.updated_at - a.updated_at));
+    }
+    return groups;
+  }, [active]);
+
+  if (!moss || !index) {
+    return (
+      <div className="empty-inspector">
+        <div className="hd">moss hot context</div>
+        <div className="mono note">// no Moss index yet. Run a call to build the hot path.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="callertab">
+      <div className="callertab-head">
+        <div>
+          <div className="hd">moss hot context</div>
+          <div className="callertab-meta mono">
+            <span>{index.index_name}</span>
+            <span className="dot">·</span>
+            <span>{index.status}</span>
+            <span className="dot">·</span>
+            <span>{index.mode || 'mock'}</span>
+          </div>
+        </div>
+        <span className={`chip chip-${index.status === 'ready' ? 'won' : 'unknown'}`}>
+          {moss.activeCount || 0} active · {moss.deadCount || 0} dead
+        </span>
+      </div>
+
+      <section className="call-outcome-panel">
+        <div className="call-outcome-head">
+          <div>
+            <div className="hd">hot bundle</div>
+            <div className="call-outcome-reason">Lead facts, pitch snippets, objections, compliance, pricing, and customer needs are indexed for the live turn.</div>
+          </div>
+          <span className="confidence confidence-high">no web search</span>
+        </div>
+        <div className="call-outcome-grid">
+          {Object.entries(byKind).slice(0, 6).map(([kind, rows]) => (
+            <div className="outcome-cell" key={kind}>
+              <div className="outcome-key mono">{labelize(kind)}</div>
+              <div className="call-next-list">
+                {rows.slice(0, 3).map((snippet) => (
+                  <span key={snippet.snippet_id} className="lead-badge lead-badge-muted">
+                    {snippet.title || snippet.snippet_id}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="builder-log">
+        <div className="section-head">
+          <span className="hd">query timeline</span>
+          <span className="mono note">{retrievals.length ? `${retrievals.length} retrievals` : 'empty'}</span>
+        </div>
+        <div className="builder-log-body mono">
+          {retrievals.length ? retrievals.slice(0, 12).map((row) => (
+            <div key={row.id} className={`builder-log-row builder-log-${row.outcome === 'error' ? 'failed' : row.result_count ? 'completed' : 'neutral'}`}>
+              <span className="builder-log-time">{formatWhen(row.created_at)}</span>
+              <span className="builder-log-text">
+                {row.intent} · k={row.top_k} · a={Number(row.alpha).toFixed(2)} · {row.latency_ms}ms · {(row.snippetIds || []).join(', ') || 'no hit'}
+              </span>
+            </div>
+          )) : (
+            <div className="builder-log-empty">// live transcript retrievals will appear here.</div>
+          )}
+        </div>
+      </section>
+
+      <section className="build-timeline-panel">
+        <div className="section-head">
+          <span className="hd">snippet use / failure</span>
+          <span className="mono note">{active.length + dead.length} snippets</span>
+        </div>
+        <div className="build-timeline">
+          {[...active, ...dead].slice(0, 18).map((snippet) => (
+            <div key={snippet.id} className="build-timeline-row">
+              <span className={`build-timeline-dot build-timeline-${snippet.status === 'dead' ? 'failed' : snippet.use_count ? 'completed' : 'neutral'}`} />
+              <div className="build-timeline-copy">
+                <div className="build-timeline-main">
+                  <span>{snippet.title || snippet.snippet_id}</span>
+                  <span className="build-timeline-main-meta">
+                    <span className={`timeline-mode timeline-mode-${snippet.status === 'dead' ? 'mock' : 'live'}`}>{snippet.status}</span>
+                    <span className="mono note">used {snippet.use_count} · fail {snippet.failure_count} · score {Number(snippet.help_score || 0).toFixed(1)}</span>
+                  </span>
+                </div>
+                <div className="build-timeline-summary">{snippet.text}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function AnalystTab({ detail }) {
-  const doc = detail?.memory?.post_mortem?.[0];
+  const doc = detail?.memory?.call_analysis?.[0] || detail?.memory?.post_mortem?.[0];
   if (!doc) {
     return (
       <div className="empty-inspector">
@@ -950,6 +1177,7 @@ function MailerTab({ detail }) {
   const questions = useMemo(() => uniqueQuestions(postMortem, mailEvents), [postMortem, mailEvents]);
   const flags = useMemo(() => mailFlags(mailEvents, detail?.lead), [mailEvents, detail]);
   const waitingCount = useMemo(() => replyWaitingCount(mailEvents), [mailEvents]);
+  const invoiceProof = useMemo(() => invoiceProofFromEvents(mailEvents), [mailEvents]);
 
   const [copied, setCopied] = useState(false);
   const copy = () => {
@@ -971,6 +1199,7 @@ function MailerTab({ detail }) {
           questions={questions}
           flags={flags}
           waitingCount={waitingCount}
+          invoiceProof={invoiceProof}
         />
         <ThreadView events={mailEvents} waitingCount={waitingCount} />
       </div>
@@ -987,6 +1216,7 @@ function MailerTab({ detail }) {
         questions={questions}
         flags={flags}
         waitingCount={waitingCount}
+        invoiceProof={invoiceProof}
       />
       <div className="paylink">
         <span className="chip chip-amount">{fmtPaymentAmount(payment.amount_cents)}</span>
@@ -1005,8 +1235,20 @@ function MailerTab({ detail }) {
           <div className="kv-val mono">{payment.stripe_invoice_id || payment.stripe_session_id || payment.id}</div>
         </div>
         <div className="kv-row">
+          <div className="kv-key mono">payment row</div>
+          <div className="kv-val mono">{invoiceProof.paymentId || payment.id}</div>
+        </div>
+        <div className="kv-row">
           <div className="kv-key mono">due</div>
           <div className="kv-val mono">{payment.due_at ? new Date(payment.due_at).toLocaleDateString() : '—'}</div>
+        </div>
+        <div className="kv-row">
+          <div className="kv-key mono">pdf</div>
+          <div className="kv-val mono">
+            {payment.invoice_pdf_url || invoiceProof.invoicePdfUrl ? (
+              <a href={payment.invoice_pdf_url || invoiceProof.invoicePdfUrl} target="_blank" rel="noreferrer">invoice pdf</a>
+            ) : '—'}
+          </div>
         </div>
         <div className="kv-row">
           <div className="kv-key mono">subject</div>
@@ -1024,6 +1266,7 @@ function MailerTab({ detail }) {
           <div className="kv-key mono">status</div>
           <div className="kv-val mono">
             <span className={`chip chip-pay-${payment.status}`}>{payment.status}</span>
+            {invoiceProof.invoiceStatus && invoiceProof.invoiceStatus !== payment.status ? <span className="mono note"> stripe {invoiceProof.invoiceStatus}</span> : null}
           </div>
         </div>
       </div>
@@ -1042,7 +1285,8 @@ function MailStatusPanel({
   invoiceSignal,
   questions,
   flags,
-  waitingCount
+  waitingCount,
+  invoiceProof
 }) {
   return (
     <section className="mail-status-panel">
@@ -1068,6 +1312,11 @@ function MailStatusPanel({
             <span className="mono outcome-email">{invoiceSignal.email}</span>
           </div>
           <div className="outcome-note">{invoiceSignal.source}</div>
+          {invoiceProof?.emailProofSource ? (
+            <div className="outcome-note mono">
+              proof: {invoiceProof.emailProofSource}{invoiceProof.consentEventId ? ` · consent ${invoiceProof.consentEventId}` : ''}
+            </div>
+          ) : null}
         </div>
         <div className="mail-status-cell">
           <div className="outcome-key mono">customer questions</div>
@@ -1131,6 +1380,10 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
     () => mergeBuilderState(detail, builderInfo, focusedLeadId),
     [detail, builderInfo, focusedLeadId]
   );
+  const [selectedTarget, setSelectedTarget] = useState(state.target || 'lovable');
+  useEffect(() => {
+    setSelectedTarget(state.target || 'lovable');
+  }, [focusedLeadId, state.target]);
   const retrying = builderAction?.running && builderAction?.leadId === focusedLeadId;
   const actionError = builderAction?.leadId === focusedLeadId ? builderAction?.error : null;
   const previewUrl = state.liveUrl || state.finalSiteUrl || state.projectUrl;
@@ -1138,6 +1391,7 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
   const isRunning = state.status === 'running';
   const buttonLabel = state.status === 'not_started' ? 'start build' : 'retry build';
   const mode = buildProofMode(state);
+  const browserUse = browserUseStateFromBuild(state);
 
   return (
     <div className="buildertab">
@@ -1149,10 +1403,20 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
         <div className="builder-head-actions">
           <span className={`build-status build-status-${state.status}`}>{labelize(state.status)}</span>
           {state.authNeeded ? <span className="auth-badge mono">auth needed</span> : null}
+          <select
+            className="build-status"
+            value={selectedTarget}
+            disabled={retrying || isRunning}
+            onChange={(e) => setSelectedTarget(e.target.value)}
+            aria-label="Build target"
+          >
+            <option value="lovable">Lovable</option>
+            <option value="v0">v0</option>
+          </select>
           <button
             className="btn btn-mini"
             disabled={!focusedLeadId || retrying || isRunning}
-            onClick={onRetryBuild}
+            onClick={() => onRetryBuild?.({ target: selectedTarget })}
           >
             {retrying ? 'starting...' : buttonLabel}
           </button>
@@ -1160,15 +1424,24 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
       </div>
 
       <div className="builder-state-grid">
+        <BuildStateCell label="target" value={state.target || selectedTarget} tone={state.target === 'v0' ? 'warn' : 'good'} />
         <BuildStateCell label="build id" value={state.latestBuildId || 'none'} />
+        <BuildStateCell label="session id" value={browserUse.sessionId || 'none'} />
+        <BuildStateCell label="model" value={browserUse.model || 'default'} />
+        <BuildStateCell label="steps" value={browserUse.stepCount ?? 0} />
+        <BuildStateCell label="cost" value={`$${browserUse.totalCostUsd || '0'}`} tone={browserUse.costCapped ? 'bad' : 'good'} />
+        <BuildStateCell label="evidence" value={browserUse.evidenceCount ?? 0} />
         <BuildStateCell label="started" value={state.startedAt ? formatWhen(state.startedAt) : '—'} />
         <BuildStateCell label="finished" value={state.finishedAt ? formatWhen(state.finishedAt) : '—'} />
-        <BuildStateCell label="live preview" value={state.liveUrl ? 'ready' : 'waiting'} tone={state.liveUrl ? 'good' : 'muted'} />
+        <BuildStateCell label="Browser Use liveUrl" value={state.target === 'v0' ? 'not used' : state.liveUrl ? 'ready' : 'waiting'} tone={state.liveUrl ? 'good' : 'muted'} />
         <BuildStateCell label="operation" value={mode.mode || 'pending'} tone={mode.tone === 'bad' ? 'bad' : mode.tone === 'good' ? 'good' : mode.tone === 'warn' ? 'warn' : 'muted'} />
       </div>
 
       {actionError ? <div className="builder-error mono">{actionError}</div> : null}
       {state.error ? <div className="builder-error mono">{state.error}</div> : null}
+
+      <BrowserUseBuildPanel state={browserUse} />
+      <BuildQAConsole qa={detail?.builderQa} />
 
       <div className="final-site-row">
         <div className="final-site-label mono">final site URL</div>
@@ -1176,6 +1449,15 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
           <a className="final-site-url mono" href={finalUrl} target="_blank" rel="noreferrer">{finalUrl}</a>
         ) : (
           <span className="final-site-empty mono">not published yet</span>
+        )}
+      </div>
+
+      <div className="final-site-row">
+        <div className="final-site-label mono">submission</div>
+        {state.submissionUrl ? (
+          <a className="final-site-url mono" href={state.submissionUrl} target="_blank" rel="noreferrer">{state.submissionUrl}</a>
+        ) : (
+          <span className="final-site-empty mono">{state.target === 'v0' ? 'v0 API submission' : 'not created yet'}</span>
         )}
       </div>
 
@@ -1195,11 +1477,48 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
 
       {state.brief ? (
         <details className="brief">
-          <summary className="mono">brief sent to lovable</summary>
+          <summary className="mono">prompt preview sent to {state.target || selectedTarget}</summary>
           <pre className="raw mono">{state.brief}</pre>
         </details>
       ) : null}
     </div>
+  );
+}
+
+function BrowserUseBuildPanel({ state }) {
+  return (
+    <section className="browser-build-panel">
+      <div className="browser-build-head">
+        <div>
+          <div className="hd">Browser Use session</div>
+          <div className="browser-build-summary">{state.lastStepSummary || 'No Browser Use step summary recorded yet.'}</div>
+        </div>
+        <div className="browser-build-badges">
+          <span className={`browser-build-badge ${state.mock ? 'browser-build-badge-mock' : 'browser-build-badge-live'}`}>
+            {state.mock ? 'mock' : 'live'}
+          </span>
+          {state.authNeeded ? <span className="browser-build-badge browser-build-badge-bad">auth-needed</span> : null}
+          {state.costCapped ? <span className="browser-build-badge browser-build-badge-bad">cost-capped</span> : null}
+        </div>
+      </div>
+
+      <div className="browser-build-grid">
+        <BuildStateCell label="input tokens" value={state.totalInputTokens ?? 0} />
+        <BuildStateCell label="output tokens" value={state.totalOutputTokens ?? 0} />
+        <BuildStateCell label="llm cost" value={`$${state.llmCostUsd || '0'}`} />
+        <BuildStateCell label="browser cost" value={`$${state.browserCostUsd || '0'}`} />
+        <BuildStateCell label="proxy cost" value={`$${state.proxyCostUsd || '0'}`} />
+        <BuildStateCell label="proxy MB" value={state.proxyUsedMb || '0'} />
+      </div>
+
+      <div className="browser-build-links mono">
+        {state.liveUrl ? <a href={state.liveUrl} target="_blank" rel="noreferrer">liveUrl</a> : <span>liveUrl pending</span>}
+        {state.screenshotUrl ? <a href={state.screenshotUrl} target="_blank" rel="noreferrer">screenshotUrl</a> : <span>screenshot pending</span>}
+        {state.recordingUrls?.length ? <a href={state.recordingUrls[0]} target="_blank" rel="noreferrer">recording</a> : <span>recording pending</span>}
+        {state.agentmailEmail ? <span>{state.agentmailEmail}</span> : null}
+        {state.integrationsUsed?.length ? <span>{state.integrationsUsed.join(', ')}</span> : null}
+      </div>
+    </section>
   );
 }
 
@@ -1254,7 +1573,9 @@ function BuilderTimeline({ items }) {
               </div>
               {item.summary ? <div className="build-timeline-summary">{item.summary}</div> : null}
               {item.projectUrl ? <a className="mono accent" href={item.projectUrl} target="_blank" rel="noreferrer">{item.projectUrl}</a> : null}
+              {item.submissionUrl ? <a className="mono note" href={item.submissionUrl} target="_blank" rel="noreferrer">{item.submissionUrl}</a> : null}
               {item.liveUrl ? <span className="mono note">{item.liveUrl}</span> : null}
+              {item.providerAction ? <span className="mono note">{item.target || 'target'} · {item.providerAction}</span> : null}
             </div>
           </div>
         )) : (
@@ -1277,7 +1598,7 @@ function mergeBuilderState(detail, builderInfo, focusedLeadId) {
   const progressLog = mergeBuilderRows([
     ...(read.progressLog || []).map(normalizeProgressItem),
     ...(local?.progressLog || []),
-    ...timeline.filter((item) => ['builder.progress', 'builder.live_url', 'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error'].includes(item.type))
+    ...timeline.filter((item) => ['builder.submission_created', 'builder.provider_action', 'builder.progress', 'builder.live_url', 'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error'].includes(item.type))
   ]).slice(-12);
   const rawStatus = local?.status && local.status !== 'not_started'
     ? local.status
@@ -1289,6 +1610,28 @@ function mergeBuilderState(detail, builderInfo, focusedLeadId) {
     status,
     authNeeded: status === 'blocked_auth' || read.authNeeded,
     latestBuildId: local?.buildId || read.latestBuildId || latest.id || null,
+    sessionId: local?.sessionId || read.sessionId || latest.browser_session_id || lastValue(timeline, 'sessionId'),
+    model: local?.model || read.model || lastValue(timeline, 'model'),
+    stepCount: local?.stepCount ?? read.stepCount ?? lastNumber(timeline, 'stepCount'),
+    lastStepSummary: local?.lastStepSummary || read.lastStepSummary || lastValue(timeline, 'lastStepSummary') || lastValue(timeline, 'summary'),
+    screenshotUrl: local?.screenshotUrl || read.screenshotUrl || lastValue(timeline, 'screenshotUrl'),
+    recordingUrls: local?.recordingUrls?.length ? local.recordingUrls : read.recordingUrls?.length ? read.recordingUrls : lastArray(timeline, 'recordingUrls'),
+    maxCostUsd: local?.maxCostUsd || read.maxCostUsd || lastValue(timeline, 'maxCostUsd'),
+    totalInputTokens: local?.totalInputTokens ?? read.totalInputTokens ?? lastNumber(timeline, 'totalInputTokens'),
+    totalOutputTokens: local?.totalOutputTokens ?? read.totalOutputTokens ?? lastNumber(timeline, 'totalOutputTokens'),
+    proxyUsedMb: local?.proxyUsedMb || read.proxyUsedMb || lastValue(timeline, 'proxyUsedMb'),
+    llmCostUsd: local?.llmCostUsd || read.llmCostUsd || lastValue(timeline, 'llmCostUsd'),
+    proxyCostUsd: local?.proxyCostUsd || read.proxyCostUsd || lastValue(timeline, 'proxyCostUsd'),
+    browserCostUsd: local?.browserCostUsd || read.browserCostUsd || lastValue(timeline, 'browserCostUsd'),
+    totalCostUsd: local?.totalCostUsd || read.totalCostUsd || lastValue(timeline, 'totalCostUsd'),
+    agentmailEmail: local?.agentmailEmail || read.agentmailEmail || lastValue(timeline, 'agentmailEmail'),
+    integrationsUsed: local?.integrationsUsed?.length ? local.integrationsUsed : read.integrationsUsed?.length ? read.integrationsUsed : lastArray(timeline, 'integrationsUsed'),
+    evidenceCount: local?.evidenceCount ?? read.evidenceCount ?? lastNumber(timeline, 'evidenceCount'),
+    outputSchema: local?.outputSchema || read.outputSchema || lastValue(timeline, 'outputSchema'),
+    target: local?.target || read.target || latest.target || lastValue(timeline, 'target') || 'lovable',
+    submissionUrl: local?.submissionUrl || read.submissionUrl || latest.submission_url || latest.lovable_url || lastValue(timeline, 'submissionUrl'),
+    providerProjectId: local?.providerProjectId || read.providerProjectId || latest.provider_project_id || lastValue(timeline, 'providerProjectId'),
+    providerDeploymentId: local?.providerDeploymentId || read.providerDeploymentId || latest.provider_deployment_id || lastValue(timeline, 'providerDeploymentId'),
     startedAt: read.startedAt || latest.started_at || firstTimelineTs(timeline),
     finishedAt: read.finishedAt || latest.finished_at || terminalTimelineTs(timeline),
     liveUrl: local?.liveUrl || read.liveUrl || latest.live_url || null,
@@ -1308,7 +1651,19 @@ function normalizeProgressItem(item) {
     type: item.type || 'builder.progress',
     label: item.label || 'Progress update',
     status: item.status || (item.type === 'builder.error' ? 'failed' : 'running'),
-    summary: item.summary || item.text || ''
+    summary: item.summary || item.text || '',
+    sessionId: item.sessionId || null,
+    model: item.model || null,
+    stepCount: item.stepCount ?? null,
+    lastStepSummary: item.lastStepSummary || null,
+    screenshotUrl: item.screenshotUrl || null,
+    recordingUrls: item.recordingUrls || [],
+    totalCostUsd: item.totalCostUsd || null,
+    evidenceCount: item.evidenceCount ?? null,
+    target: item.target || null,
+    submissionUrl: item.submissionUrl || null,
+    providerProjectId: item.providerProjectId || null,
+    providerDeploymentId: item.providerDeploymentId || null
   };
 }
 
@@ -1321,7 +1676,13 @@ function timelineFromLatest(latest) {
     label: 'Build requested',
     status: 'running',
     summary: latest.live_url ? 'Build record opened with a live preview.' : 'Build record opened.',
-    buildId: latest.id
+    buildId: latest.id,
+    target: latest.target || null,
+    submissionUrl: latest.submission_url || latest.lovable_url || null,
+    providerProjectId: latest.provider_project_id || null,
+    providerDeploymentId: latest.provider_deployment_id || null,
+    sessionId: latest.browser_session_id || null,
+    liveUrl: latest.live_url || null
   }];
   if (latest.finished_at && latest.status !== 'running') {
     const status = normalizeBuilderStatus(latest.status);
@@ -1333,6 +1694,9 @@ function timelineFromLatest(latest) {
       status,
       summary: latest.error || latest.project_url || '',
       projectUrl: latest.project_url || null,
+      target: latest.target || null,
+      providerProjectId: latest.provider_project_id || null,
+      providerDeploymentId: latest.provider_deployment_id || null,
       buildId: latest.id
     });
   }
@@ -1362,13 +1726,66 @@ function normalizeBuilderStatus(status) {
   return status || 'not_started';
 }
 
+function browserUseStateFromBuild(state) {
+  const maxCost = Number(state.maxCostUsd || 0);
+  const totalCost = Number(state.totalCostUsd || 0);
+  const mock = (state.timeline || []).some((item) => item.mock === true) || String(state.liveUrl || '').startsWith('/api/');
+  return {
+    sessionId: state.sessionId || state.latestBuildId,
+    model: state.model,
+    status: state.status,
+    authNeeded: state.authNeeded || state.status === 'blocked_auth',
+    mock,
+    liveUrl: state.liveUrl,
+    screenshotUrl: state.screenshotUrl,
+    recordingUrls: state.recordingUrls || [],
+    stepCount: state.stepCount ?? 0,
+    lastStepSummary: state.lastStepSummary,
+    maxCostUsd: state.maxCostUsd,
+    costCapped: Boolean(maxCost && totalCost >= maxCost),
+    totalInputTokens: state.totalInputTokens ?? 0,
+    totalOutputTokens: state.totalOutputTokens ?? 0,
+    proxyUsedMb: state.proxyUsedMb || '0',
+    llmCostUsd: state.llmCostUsd || '0',
+    proxyCostUsd: state.proxyCostUsd || '0',
+    browserCostUsd: state.browserCostUsd || '0',
+    totalCostUsd: state.totalCostUsd || '0',
+    agentmailEmail: state.agentmailEmail,
+    integrationsUsed: state.integrationsUsed || [],
+    evidenceCount: state.evidenceCount ?? 0,
+    outputSchema: state.outputSchema
+  };
+}
+
 function firstTimelineTs(timeline) {
   return timeline.length ? timeline[0].ts : null;
 }
 
 function terminalTimelineTs(timeline) {
-  const terminal = [...timeline].reverse().find((item) => ['completed', 'failed', 'blocked_auth'].includes(item.status));
+  const terminal = [...timeline].reverse().find((item) => ['completed', 'failed', 'blocked_auth', 'stopped'].includes(item.status));
   return terminal?.ts || null;
+}
+
+function lastValue(timeline, key) {
+  for (const item of [...timeline].reverse()) {
+    if (item[key]) return item[key];
+  }
+  return null;
+}
+
+function lastNumber(timeline, key) {
+  for (const item of [...timeline].reverse()) {
+    const n = Number(item[key]);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function lastArray(timeline, key) {
+  for (const item of [...timeline].reverse()) {
+    if (Array.isArray(item[key]) && item[key].length) return item[key];
+  }
+  return [];
 }
 
 function builderStatusCopy(status) {
@@ -1377,6 +1794,7 @@ function builderStatusCopy(status) {
     case 'completed': return 'Build completed; final site URL is ready.';
     case 'failed': return 'Build failed; retry keeps the operator in the same flow.';
     case 'blocked_auth': return 'Lovable authentication is blocking the browser task.';
+    case 'stopped': return 'Browser Use session was stopped by the operator.';
     default: return 'No build has started for this lead yet.';
   }
 }

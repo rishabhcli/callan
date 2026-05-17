@@ -1,16 +1,25 @@
 import { emit } from '../sse.js';
 import { runs, leads, calls } from '../db.js';
-import { env } from '../env.js';
+import { env, modeAllowsSideEffect } from '../env.js';
 import { log } from '../logger.js';
 import { addDoc, getLatest, containerTagFor } from '../memory.js';
 import { generateJson } from '../gemini.js';
-import { ensureMossPitchIndex, shouldProvisionMossForCall } from '../providers/moss.js';
+import { ensureLeadHotIndex } from '../moss/hotIndex.js';
 import {
-  SalesPitchGenerationSchema,
+  getComplianceSnippet,
+  getCustomerNeedSnippet,
+  getObjectionSnippet,
+  getPreCallContext,
+  getPricingSnippet
+} from '../moss/retrieval.js';
+import { detectMossRetrievalNeeds } from '../moss/detectors.js';
+import {
   buildPitchResearchContext,
   createFallbackPitch,
   validateGeneratedPitch
 } from '../pitch.js';
+import { generateStructured } from '../reasoning/geminiReasoner.js';
+import { CallScript } from '../reasoning/schemas.js';
 import { callabilityForLead, dncCheck, recordingDisclosure, recordCallDecision, transcriptHasOptOut, recordOptOut } from '../compliance.js';
 import {
   classifyAgentPhoneFailure,
@@ -48,6 +57,8 @@ const MOCK_TRANSCRIPT_SCHEMA = {
   required: ['turns']
 };
 
+const MOCK_TURN_DELAY_MS = Math.max(0, Number(process.env.CALLER_MOCK_TURN_DELAY_MS || 650));
+
 function mask(phone) {
   if (!phone) return null;
   const s = String(phone);
@@ -55,7 +66,7 @@ function mask(phone) {
   return `${s.slice(0, 3)}…${s.slice(-2)}`;
 }
 
-function pitchToSystemPrompt(pitch, lead) {
+function pitchToSystemPrompt(pitch, lead, hotContext = null) {
   const objLines = (pitch.objections || []).map((o) => `- If they say: "${o.objection}" -> respond: ${o.response}`).join('\n');
   const discovery = (pitch.discoveryQuestions || []).map((q, i) => `${i + 1}. ${q}`).join('\n');
   return [
@@ -70,8 +81,9 @@ function pitchToSystemPrompt(pitch, lead) {
     `Email readback rule: ${pitch.emailReadbackInstruction}`,
     `Do not say the invoice is coming until the owner confirms the read-back email. If the readback is wrong, ask them to repeat the address and read it back again.`,
     `Invoice handoff: ${pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.'}`,
+    formatMossPrompt(hotContext),
     `Be warm, brief, and concrete. If the owner says any variant of "stop", "remove me", "do not call", or "take me off", acknowledge politely and end the call.`
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 function mockEmailForProfile(profile) {
@@ -83,18 +95,45 @@ function mockEmailForProfile(profile) {
   return `owner@${name}.com`;
 }
 
-async function provisionMossIndex(containerTag, pitch) {
-  if (!shouldProvisionMossForCall()) {
-    if (env.moss.projectId || env.moss.projectKey) {
-      log.info('moss.index.skipped', { containerTag, reason: 'live call gate disabled' });
-    }
-    return;
-  }
+async function buildMossHotContext({ leadId, lead, profile, pitch, runId }) {
   try {
-    const result = await ensureMossPitchIndex(containerTag, pitch);
-    log.info('moss.index.ready', { containerTag, ...result });
+    const index = await ensureLeadHotIndex(leadId, { lead, profile, pitch, runId });
+    const [preCall, compliance, pricing] = await Promise.all([
+      getPreCallContext(leadId, { runId, source: 'caller_pre_call' }),
+      getComplianceSnippet('recording disclosure and opt-out', { leadId, source: 'caller_pre_call' }),
+      getPricingSnippet(leadId, { source: 'caller_pre_call' })
+    ]);
+    const hotContext = {
+      indexName: index.indexName,
+      preCall,
+      compliance,
+      pricing,
+      snippets: [
+        ...(preCall?.snippets || []),
+        ...(compliance?.snippets || []),
+        ...(pricing?.snippets || [])
+      ]
+    };
+    emit('caller.hot_context', {
+      worker: 'caller',
+      leadId,
+      runId,
+      indexName: index.indexName,
+      snippetIds: hotContext.snippets.map((snippet) => snippet.id),
+      preCallLatencyMs: preCall?.latencyMs || null,
+      noWebSearch: true
+    });
+    return hotContext;
   } catch (err) {
-    log.warn('moss.index.failed', { containerTag, error: err?.message });
+    log.warn('caller.moss.hot_context_failed', { leadId, error: err?.message || String(err) });
+    emit('caller.hot_context_failed', {
+      worker: 'caller',
+      leadId,
+      runId,
+      error: err?.message || String(err),
+      noWebSearch: true
+    });
+    return { error: err?.message || String(err), snippets: [] };
   }
 }
 
@@ -138,20 +177,33 @@ async function generatePitch({ profile, lead, disclosure }) {
   ].join('\n');
 
   try {
-    const raw = await generateJson({
-      schema: SalesPitchGenerationSchema,
+    const { output: raw, trace } = await generateStructured({
+      kind: 'callScript',
+      schema: CallScript,
+      evidence: {
+        lead,
+        profile,
+        researchContext,
+        disclosure
+      },
       prompt,
-      systemInstruction: PITCH_SYSTEM,
+      leadId: lead.id,
+      worker: 'caller',
+      eventId: `pitch:${lead.id}`,
       thinkingLevel: 'medium'
     });
-    return validateGeneratedPitch(raw, { disclosure, profile, lead });
+    const pitch = validateGeneratedPitch(raw, { disclosure, profile, lead });
+    pitch.reasoningTraceId = trace?.id || null;
+    pitch.strategySummary = raw.strategySummary || null;
+    pitch.confidence = raw.confidence ?? null;
+    return pitch;
   } catch (err) {
     log.warn('pitch.generate.fallback', { leadId: lead?.id, error: err?.message || String(err) });
     return createFallbackPitch({ disclosure, profile, lead });
   }
 }
 
-async function synthesizeMockTranscript({ pitch, profile }) {
+async function synthesizeMockTranscript({ pitch, profile, hotContext }) {
   try {
     const invoiceEmail = mockEmailForProfile(profile);
     const prompt = [
@@ -159,6 +211,8 @@ async function synthesizeMockTranscript({ pitch, profile }) {
       `Use this invoice email in the final confirmation sequence: ${invoiceEmail}`,
       `Use this pitch as the agent's playbook:`,
       JSON.stringify(pitch, null, 2),
+      `Use these Moss hot-context snippets when objections/questions appear:`,
+      JSON.stringify(compactMossSnippets(hotContext), null, 2),
       `Generate the full transcript (10-12 turns). Owner agrees by the end. First agent turn should reflect the beginMessage (recording disclosure + greeting).`
     ].join('\n\n');
     const out = await generateJson({
@@ -189,9 +243,9 @@ async function synthesizeMockTranscript({ pitch, profile }) {
   ];
 }
 
-async function runMock({ leadId, lead, pitch, profile, runId, disclosureText }) {
+async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, hotContext }) {
   const callId = `call_${Date.now().toString(36)}`;
-  const turns = await synthesizeMockTranscript({ pitch, profile });
+  const turns = await synthesizeMockTranscript({ pitch, profile, hotContext });
   calls.start({
     id: callId,
     lead_id: leadId,
@@ -204,15 +258,16 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText }) 
 
   const transcript = [];
   for (const turn of turns) {
-    await new Promise((r) => setTimeout(r, 600 + Math.floor(Math.random() * 300)));
+    await new Promise((r) => setTimeout(r, MOCK_TURN_DELAY_MS));
     const ts = Date.now();
     const chunk = { role: turn.role, text: turn.text, ts };
     transcript.push(chunk);
     emit('caller.transcript', { worker: 'caller', leadId, callId, role: chunk.role, text: chunk.text, ts, mock: true });
+    if (chunk.role === 'user') await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: true });
   }
 
   calls.finish(callId, { outcome: 'demo-yes', transcript });
-  await addDoc(containerTagFor(leadId), 'call_log', { turns: transcript }, {
+  await safeAddMemory(containerTagFor(leadId), 'call_log', { turns: transcript }, {
     provider_call_id: null,
     outcome: 'demo-yes',
     mock: true
@@ -235,7 +290,80 @@ function fireAnalyst(leadId, callId) {
   }, 0);
 }
 
-async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId }) {
+async function maybeRetrieveMossForTurn({ leadId, callId, turn, mock }) {
+  const needs = detectMossRetrievalNeeds(turn).slice(0, 3);
+  if (!needs.length) return [];
+  const retrieved = [];
+  for (const need of needs) {
+    try {
+      if (need.kind === 'pricing') {
+        retrieved.push(await getPricingSnippet(leadId, { callId, query: need.query, source: 'transcript_stream' }));
+      } else if (need.kind === 'customer_need') {
+        retrieved.push(await getCustomerNeedSnippet(leadId, need.query, { callId, source: 'transcript_stream' }));
+      } else {
+        retrieved.push(await getObjectionSnippet(leadId, need.query, { callId, source: 'transcript_stream' }));
+      }
+      if (/stop|remove me|take me off|do not call|unsubscribe/i.test(need.query)) {
+        retrieved.push(await getComplianceSnippet('opt out handling', { leadId, callId, source: 'transcript_stream' }));
+      }
+    } catch (err) {
+      log.warn('caller.moss.turn_retrieval_failed', { leadId, callId, kind: need.kind, reason: need.reason, error: err?.message || String(err) });
+    }
+  }
+  emit('caller.moss_context', {
+    worker: 'caller',
+    leadId,
+    callId,
+    mock,
+    turnTs: turn.ts,
+    needs: needs.map((need) => ({ kind: need.kind, reason: need.reason })),
+    snippetIds: retrieved.flatMap((item) => item?.snippetIds || []),
+    noWebSearch: true
+  });
+  return retrieved;
+}
+
+async function safeAddMemory(containerTag, kind, content, metadata) {
+  try {
+    return await addDoc(containerTag, kind, content, metadata);
+  } catch (err) {
+    log.warn('memory.add.skipped', { containerTag, kind, error: err?.message || String(err) });
+    emit('memory.add.skipped', {
+      worker: 'memory',
+      leadId: containerTag.startsWith('biz_') ? containerTag.slice(4) : null,
+      kind,
+      reason: err?.message || String(err)
+    });
+    return null;
+  }
+}
+
+function formatMossPrompt(hotContext) {
+  const snippets = compactMossSnippets(hotContext);
+  if (!snippets.length) return '';
+  return [
+    'Moss hot context for this call. Use these as low-latency retrieval hints; do not invent beyond them:',
+    ...snippets.slice(0, 10).map((snippet) => `- [${snippet.kind || 'snippet'}:${snippet.id}] ${snippet.text}`)
+  ].join('\n');
+}
+
+function compactMossSnippets(hotContext) {
+  const seen = new Set();
+  return (hotContext?.snippets || [])
+    .map((snippet) => ({
+      id: snippet.id,
+      kind: snippet.metadata?.kind || snippet.kind || 'snippet',
+      text: String(snippet.text || '').replace(/\s+/g, ' ').trim().slice(0, 300)
+    }))
+    .filter((snippet) => {
+      if (!snippet.id || !snippet.text || seen.has(snippet.id)) return false;
+      seen.add(snippet.id);
+      return true;
+    })
+    .slice(0, 14);
+}
+
+async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext }) {
   const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
@@ -257,6 +385,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     const chunk = { role, text, ts };
     streamedTurns.push(chunk);
     emit('caller.transcript', { worker: 'caller', leadId, callId, role, text, ts, mock: false, source });
+    if (role === 'user') await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: false });
     if (role === 'user' && transcriptHasOptOut(text)) {
       recordOptOut(normalized);
       optedOut = true;
@@ -278,7 +407,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       beginMessage: pitch.beginMessage,
       systemPrompt: 'You are a friendly cold-call agent for callmemaybe. Per-call system prompts contain the actual pitch, disclosure, opt-out rule, and email readback rule.'
     });
-    const systemPrompt = pitchToSystemPrompt(pitch, lead);
+    const systemPrompt = pitchToSystemPrompt(pitch, lead, hotContext);
     const placed = await placeAgentPhoneCall({
       agentId: agent.id,
       toNumber: normalized,
@@ -343,7 +472,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     const transcriptForStorage = finalTranscript || { turns: streamedTurns, source: 'agentphone-stream-fallback' };
     const outcome = optedOut ? 'opt-out' : 'ended';
     calls.finish(callId, { outcome, transcript: transcriptForStorage });
-    await addDoc(containerTagFor(leadId), 'call_log', transcriptForStorage || { note: 'no transcript' }, {
+    await safeAddMemory(containerTagFor(leadId), 'call_log', transcriptForStorage || { note: 'no transcript' }, {
       provider_call_id: providerCallId,
       outcome,
       stream_turns: streamedTurns.length
@@ -391,7 +520,7 @@ export async function runCaller({ leadId, toPhone }) {
     const disclosure = recordingDisclosure(lead.business_name);
     const pitch = await generatePitch({ profile, lead, disclosure });
 
-    await addDoc(containerTagFor(leadId), 'pitch', pitch, { generatedFor: leadId });
+    await safeAddMemory(containerTagFor(leadId), 'pitch', pitch, { generatedFor: leadId });
     emit('pitch.created', {
       worker: 'caller',
       leadId,
@@ -401,9 +530,9 @@ export async function runCaller({ leadId, toPhone }) {
       objectionCount: (pitch.objections || []).length
     });
 
-    await provisionMossIndex(containerTagFor(leadId), pitch);
+    const hotContext = await buildMossHotContext({ leadId, lead, profile, pitch, runId });
 
-    const live = ['live', 'demo_live', 'autonomous_live'].includes(env.runMode) && env.live.calls;
+    const live = modeAllowsSideEffect('calls') && env.live.calls;
     if (live) {
       const allowed = callabilityForLead({ lead, profile, disclosureText: disclosure, phone: toPhone || lead.phone });
       recordCallDecision({
@@ -430,8 +559,8 @@ export async function runCaller({ leadId, toPhone }) {
       });
     }
     const result = live
-      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId })
-      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId });
+      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext })
+      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext });
 
     runs.finish(runId, { state: 'completed', detail: { ...result, mock: !live } });
     return result;

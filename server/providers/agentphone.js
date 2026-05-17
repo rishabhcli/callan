@@ -1,4 +1,4 @@
-import { env } from '../env.js';
+import { env, modeAllowsSideEffect } from '../env.js';
 import { log } from '../logger.js';
 import { normalizePhone } from '../compliance.js';
 import { fetchJson, normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
@@ -429,7 +429,7 @@ export async function agentPhoneOwnedNumberSmoke({
   const gate = sideEffectGate({
     provider: PROVIDER,
     action: 'owned-number smoke call',
-    enabled: env.live.calls && ['demo_live', 'live'].includes(env.runMode) && normalized && env.allowedPhones.includes(normalized),
+    enabled: env.live.calls && modeAllowsSideEffect('calls') && normalized && env.allowedPhones.includes(normalized),
     details: { mode: env.runMode, phoneAllowed: Boolean(normalized && env.allowedPhones.includes(normalized)) }
   });
   if (!gate.ok) return { provider: PROVIDER, status: 'blocked', detail: smokeDetail({ skipped: gate.reason, extra: gate.details }) };

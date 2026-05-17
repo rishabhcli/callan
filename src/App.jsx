@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import NodeGraph from './components/NodeGraph.jsx';
 import DiscoverForm from './components/DiscoverForm.jsx';
+import BrowserResearchConsole from './components/BrowserResearchConsole.jsx';
 import LeadList from './components/LeadList.jsx';
 import Inspector from './components/Inspector.jsx';
+import BrowserUseConsole from './components/BrowserUseConsole.jsx';
 import { useSSE } from './useSSE.js';
 import { api } from './api.js';
 
@@ -12,7 +14,8 @@ const NODE_TO_TAB = {
   caller: 'Caller',
   analyst: 'Analyst',
   mailer: 'Mailer',
-  builder: 'Builder'
+  builder: 'Builder',
+  browserUse: 'Builder'
 };
 
 const WORKER_FROM_TYPE = (t) => t.split('.')[0];
@@ -49,14 +52,46 @@ const EMPTY_BUILDER_INFO = {
   liveUrl: null,
   projectUrl: null,
   finalSiteUrl: null,
+  target: 'lovable',
+  submissionUrl: null,
+  providerProjectId: null,
+  providerDeploymentId: null,
   brief: null,
   error: null,
+  sessionId: null,
+  model: null,
+  stepCount: null,
+  lastStepSummary: null,
+  screenshotUrl: null,
+  recordingUrls: [],
+  maxCostUsd: null,
+  totalInputTokens: null,
+  totalOutputTokens: null,
+  proxyUsedMb: null,
+  llmCostUsd: null,
+  proxyCostUsd: null,
+  browserCostUsd: null,
+  totalCostUsd: null,
+  agentmailEmail: null,
+  integrationsUsed: [],
+  evidenceCount: null,
+  outputSchema: null,
   progressLog: [],
   timeline: []
 };
 
 function builderStatusForEvent(type) {
-  if (type === 'builder.start' || type === 'builder.live_url' || type === 'builder.progress' || type === 'builder.project_url') return 'running';
+  if (
+    type === 'builder.start' ||
+    type === 'builder.submission_created' ||
+    type === 'builder.live_url' ||
+    type === 'builder.provider_action' ||
+    type === 'builder.hook' ||
+    type === 'builder.qa' ||
+    type === 'builder.revision' ||
+    type === 'builder.progress' ||
+    type === 'builder.project_url'
+  ) return 'running';
   if (type === 'builder.done') return 'completed';
   if (type === 'builder.blocked_auth') return 'blocked_auth';
   if (type === 'builder.error') return 'failed';
@@ -66,7 +101,12 @@ function builderStatusForEvent(type) {
 function builderLabelForEvent(type) {
   switch (type) {
     case 'builder.start': return 'Build requested';
+    case 'builder.submission_created': return 'Target submission created';
     case 'builder.live_url': return 'Live preview ready';
+    case 'builder.provider_action': return 'Provider action';
+    case 'builder.hook': return 'Build hook';
+    case 'builder.qa': return 'Build QA';
+    case 'builder.revision': return 'Revision planned';
     case 'builder.progress': return 'Progress update';
     case 'builder.project_url': return 'Final site URL found';
     case 'builder.blocked_auth': return 'Lovable auth needed';
@@ -88,8 +128,32 @@ function builderEventItem(evt) {
     summary,
     liveUrl: evt.liveUrl || null,
     projectUrl: evt.projectUrl || null,
+    target: evt.target || null,
+    submissionUrl: evt.submissionUrl || null,
+    promptPreview: evt.promptPreview || null,
+    providerAction: evt.providerAction || null,
+    providerProjectId: evt.providerProjectId || null,
+    providerDeploymentId: evt.providerDeploymentId || null,
     buildId: evt.buildId || null,
     runId: evt.runId || null,
+    sessionId: evt.sessionId || null,
+    model: evt.model || null,
+    stepCount: evt.stepCount ?? null,
+    lastStepSummary: evt.lastStepSummary || null,
+    screenshotUrl: evt.screenshotUrl || null,
+    recordingUrls: evt.recordingUrls || [],
+    maxCostUsd: evt.maxCostUsd || null,
+    totalInputTokens: evt.totalInputTokens ?? null,
+    totalOutputTokens: evt.totalOutputTokens ?? null,
+    proxyUsedMb: evt.proxyUsedMb || null,
+    llmCostUsd: evt.llmCostUsd || null,
+    proxyCostUsd: evt.proxyCostUsd || null,
+    browserCostUsd: evt.browserCostUsd || null,
+    totalCostUsd: evt.totalCostUsd || null,
+    agentmailEmail: evt.agentmailEmail || null,
+    integrationsUsed: evt.integrationsUsed || [],
+    evidenceCount: evt.evidenceCount ?? null,
+    outputSchema: evt.outputSchema || null,
     brief: evt.brief || null,
     lovableUrl: evt.lovableUrl || null,
     error: evt.error || null,
@@ -110,7 +174,7 @@ function mergeBuilderEvent(prev, evt) {
     ? { ...EMPTY_BUILDER_INFO, leadId }
     : { ...prev, leadId };
   const timeline = appendBuilderItem(base.timeline, item, 40);
-  const shouldLog = ['builder.live_url', 'builder.progress', 'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error'].includes(evt.type);
+  const shouldLog = ['builder.live_url', 'builder.hook', 'builder.qa', 'builder.revision', 'builder.progress', 'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error'].includes(evt.type);
   const progressLog = shouldLog ? appendBuilderItem(base.progressLog, item, 18) : base.progressLog;
 
   return {
@@ -121,8 +185,30 @@ function mergeBuilderEvent(prev, evt) {
     liveUrl: evt.liveUrl || base.liveUrl,
     projectUrl: evt.projectUrl || base.projectUrl,
     finalSiteUrl: evt.projectUrl || base.finalSiteUrl,
+    target: evt.target || base.target,
+    submissionUrl: evt.submissionUrl || base.submissionUrl,
+    providerProjectId: evt.providerProjectId || base.providerProjectId,
+    providerDeploymentId: evt.providerDeploymentId || base.providerDeploymentId,
     brief: evt.brief || base.brief,
     error: evt.error || (evt.type === 'builder.start' ? null : base.error),
+    sessionId: evt.sessionId || base.sessionId,
+    model: evt.model || base.model,
+    stepCount: evt.stepCount ?? base.stepCount,
+    lastStepSummary: evt.lastStepSummary || base.lastStepSummary,
+    screenshotUrl: evt.screenshotUrl || base.screenshotUrl,
+    recordingUrls: evt.recordingUrls?.length ? evt.recordingUrls : base.recordingUrls,
+    maxCostUsd: evt.maxCostUsd || base.maxCostUsd,
+    totalInputTokens: evt.totalInputTokens ?? base.totalInputTokens,
+    totalOutputTokens: evt.totalOutputTokens ?? base.totalOutputTokens,
+    proxyUsedMb: evt.proxyUsedMb || base.proxyUsedMb,
+    llmCostUsd: evt.llmCostUsd || base.llmCostUsd,
+    proxyCostUsd: evt.proxyCostUsd || base.proxyCostUsd,
+    browserCostUsd: evt.browserCostUsd || base.browserCostUsd,
+    totalCostUsd: evt.totalCostUsd || base.totalCostUsd,
+    agentmailEmail: evt.agentmailEmail || base.agentmailEmail,
+    integrationsUsed: evt.integrationsUsed?.length ? evt.integrationsUsed : base.integrationsUsed,
+    evidenceCount: evt.evidenceCount ?? base.evidenceCount,
+    outputSchema: evt.outputSchema || base.outputSchema,
     progressLog,
     timeline
   };
@@ -288,7 +374,14 @@ export default function App() {
       triggerEdge('analyst-memory');
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
-    if (t === 'mailer.payment_link' || t === 'mailer.invoice_link' || t === 'mailer.email_sent' || t === 'mailer.inbound_message' || t === 'mailer.done') {
+    if (t.startsWith('growth.')) {
+      bumpActivity('analyst');
+      triggerEdge('analyst-memory');
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+      refreshHealth();
+      if (evt.leadId === focusedRef.current && (t === 'growth.plan_generated' || t === 'growth.followup_sent')) setActiveTab('Growth');
+    }
+    if (t === 'mailer.payment_link' || t === 'mailer.invoice_link' || t === 'mailer.invoice_blocked' || t === 'mailer.email_sent' || t === 'mailer.inbound_message' || t === 'mailer.done') {
       triggerEdge('mailer-memory');
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
@@ -312,9 +405,10 @@ export default function App() {
       triggerEdge('builder-memory');
       if (evt.leadId === focusedRef.current) setActiveTab('Builder');
     }
-    if (t === 'builder.progress') {
+    if (t === 'builder.submission_created' || t === 'builder.provider_action' || t === 'builder.hook' || t === 'builder.qa' || t === 'builder.revision' || t === 'builder.progress') {
       setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
       triggerEdge('builder-memory');
+      if (evt.leadId === focusedRef.current) refreshLeadDetail(evt.leadId);
     }
     if (t === 'builder.project_url') {
       setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
@@ -325,10 +419,16 @@ export default function App() {
       if (t === 'builder.blocked_auth') setNodeStates((p) => ({ ...p, builder: 'blocked_auth' }));
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
-    if (t === 'stripe.webhook') {
+    if (t === 'browserUse.session.stopped') {
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
+      setNodeStates((p) => ({ ...p, builder: 'idle' }));
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+      refreshHealth();
+    }
+    if (t === 'stripe.webhook' || t === 'stripe.paid') {
       bumpActivity('mailer');
       triggerEdge('mailer-memory');
-      refreshLeadDetail(focusedRef.current);
+      refreshLeadDetail(evt.leadId || focusedRef.current);
       refreshHealth();
     }
     if (t === 'agentmail.webhook') {
@@ -414,19 +514,31 @@ export default function App() {
     refreshHealth();
   }, [refreshHealth]);
 
+  const pauseAutonomy = useCallback(async () => {
+    const data = await api.pauseOutreach('operator_pause');
+    setOutreach(data);
+    refreshHealth();
+  }, [refreshHealth]);
+
+  const emergencyStop = useCallback(async () => {
+    const data = await api.emergencyStop('operator_emergency_stop');
+    setOutreach(data);
+    refreshHealth();
+  }, [refreshHealth]);
+
   const handleLeadChanged = useCallback((id) => {
     refreshLeads();
     refreshHealth();
     refreshLeadDetail(id || focusedRef.current);
   }, [refreshHealth, refreshLeadDetail, refreshLeads]);
 
-  const retryBuild = useCallback(async () => {
+  const retryBuild = useCallback(async ({ target } = {}) => {
     if (!focusedLeadId) return;
     setBuilderAction({ leadId: focusedLeadId, running: true, error: null });
-    setBuilderInfo((prev) => mergeBuilderEvent(prev, { type: 'builder.start', leadId: focusedLeadId, ts: Date.now() }));
+    setBuilderInfo((prev) => mergeBuilderEvent(prev, { type: 'builder.start', leadId: focusedLeadId, target, ts: Date.now() }));
     setActiveTab('Builder');
     try {
-      await api.build(focusedLeadId);
+      await api.build(focusedLeadId, { target });
       handleLeadChanged(focusedLeadId);
       setBuilderAction({ leadId: focusedLeadId, running: false, error: null });
     } catch (e) {
@@ -473,10 +585,22 @@ export default function App() {
         outreach={outreach}
         onStart={startAutonomy}
         onStop={stopAutonomy}
+        onPause={pauseAutonomy}
+        onEmergencyStop={emergencyStop}
+      />
+
+      <ProductionReadinessPanel
+        health={health}
+        onPause={pauseAutonomy}
+        onEmergencyStop={emergencyStop}
       />
 
       <main className="layout">
         <section className="left-pane">
+          <div className="panel panel-browser-workbench">
+            <BrowserResearchConsole />
+            <BrowserUseConsole onLeadChanged={handleLeadChanged} />
+          </div>
           <div className="panel panel-graph">
             <div className="panel-head">
               <span className="hd">node graph</span>
@@ -633,7 +757,72 @@ function sponsorProofFor(provider, health, readiness) {
   };
 }
 
-function AutonomyStrip({ health, outreach, onStart, onStop }) {
+function ProductionReadinessPanel({ health, onPause, onEmergencyStop }) {
+  const readiness = health?.readiness || {};
+  const providers = readiness.providers || {};
+  const webhooks = readiness.webhooks || {};
+  const sideEffects = readiness.sideEffects || {};
+  const compliance = readiness.compliance || {};
+  const productionBlockers = readiness.productionBlockers || health?.productionBlockers || [];
+  const currentBlockers = readiness.blockers || health?.liveBlockers || [];
+  const providerRows = Object.entries(providers);
+  const configuredProviders = providerRows.filter(([, row]) => row.configured).length;
+  const requiredProviders = providerRows.filter(([, row]) => row.required).length;
+  const webhookRows = Object.entries(webhooks);
+  const configuredWebhooks = webhookRows.filter(([, row]) => row.configured).length;
+  const complianceOk = (compliance.gates || []).every((gate) => gate.ok);
+  const smokeOk = providerRows.filter(([, row]) => row.smokeStatus === 'ok').length;
+  const sideEffectRows = Object.entries(sideEffects);
+  const mode = readiness.mode || health?.mode || 'init';
+  const checklist = [
+    ['modes', (readiness.validModes || []).includes('production_live'), mode],
+    ['providers', requiredProviders === 0 ? configuredProviders > 0 : configuredProviders >= requiredProviders, `${configuredProviders}/${requiredProviders || providerRows.length}`],
+    ['webhooks', webhookRows.length > 0 && configuredWebhooks === webhookRows.length, `${configuredWebhooks}/${webhookRows.length}`],
+    ['smoke', smokeOk > 0 && productionBlockers.every((b) => !/smoke has not passed/.test(b)), `${smokeOk}/${providerRows.length}`],
+    ['compliance', complianceOk, `${(compliance.gates || []).filter((g) => g.ok).length}/${(compliance.gates || []).length}`],
+    ['side effects', currentBlockers.length === 0, `${sideEffectRows.filter(([, row]) => row.allowed).length}/${sideEffectRows.length}`]
+  ];
+
+  return (
+    <section className="production-panel">
+      <div className="production-checklist">
+        <div className="production-head">
+          <span className="hd">production readiness</span>
+          <span className={`production-live-state ${readiness.canGoLive ? 'production-live-ok' : 'production-live-blocked'}`}>
+            {readiness.canGoLive ? 'production live ready' : 'cannot go live'}
+          </span>
+        </div>
+        <div className="check-grid">
+          {checklist.map(([name, ok, detail]) => (
+            <div key={name} className={`check-item ${ok ? 'check-ok' : 'check-blocked'}`}>
+              <span className="check-mark">{ok ? 'OK' : 'NO'}</span>
+              <span className="check-name">{name}</span>
+              <span className="check-detail mono">{detail}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="cannot-panel">
+        <div className="cannot-head">
+          <span className="hd">cannot go live because</span>
+          <span className="cannot-count mono">{productionBlockers.length}</span>
+        </div>
+        <div className="cannot-list">
+          {(productionBlockers.length ? productionBlockers : ['no production blockers']).slice(0, 7).map((blocker) => (
+            <span key={blocker} className={`cannot-item mono ${productionBlockers.length ? '' : 'cannot-clear'}`}>{blocker}</span>
+          ))}
+        </div>
+      </div>
+      <div className="emergency-controls">
+        <span className="hd">emergency</span>
+        <button className="btn btn-mini" onClick={onPause}>pause</button>
+        <button className="btn btn-mini btn-danger" onClick={onEmergencyStop}>stop</button>
+      </div>
+    </section>
+  );
+}
+
+function AutonomyStrip({ health, outreach, onStart, onStop, onPause, onEmergencyStop }) {
   const readiness = outreach?.readiness || health?.readiness || {};
   const q = readiness.outreach || {};
   const blockers = readiness.blockers || [];
@@ -665,9 +854,10 @@ function AutonomyStrip({ health, outreach, onStart, onStop }) {
             ))}
           </span>
         ) : <span className="auto-ready mono">ready</span>}
-        <button className="btn btn-mini" onClick={outreach?.running ? onStop : onStart}>
+        <button className="btn btn-mini" onClick={outreach?.running ? onPause : onStart}>
           {outreach?.running ? 'pause' : 'start'}
         </button>
+        <button className="btn btn-mini btn-danger" onClick={onEmergencyStop}>stop</button>
       </div>
     </section>
   );

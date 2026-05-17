@@ -2,13 +2,14 @@ import { BrowserUse } from 'browser-use-sdk/v3';
 import { emit } from '../sse.js';
 import { leads, runs } from '../db.js';
 import { log } from '../logger.js';
-import { env } from '../env.js';
+import { canStartBrowserSession, env } from '../env.js';
 import { generateJson } from '../gemini.js';
 import { addDoc, containerTagFor } from '../memory.js';
 import { BusinessProfileSchema, CandidateListSchema } from '../types.js';
 import { queueLeadForOutreach } from '../outreach.js';
 import { scoreOnlinePresence } from '../presenceScorer.js';
 import { enrichBusinessProfile } from '../profileEnrichment.js';
+import { browserResearchLiveEnabled, discoverBrowserUseResearchProfiles } from '../research/browserUseSwarm.js';
 
 const MOCK_SYSTEM = 'You invent plausible small-business records for hackathon demos. Match the requested niche and city exactly. Never repeat names. Evaluate online presence strength honestly. Include services, provenance, presence evidence, reasons, confidence, and a null notWorthCallingReason unless presence is strong. Do not invent external URLs or contact emails; use null for external URL/email fields in mock data. Output ONLY JSON matching the provided schema.';
 const NORMALIZE_SYSTEM = 'Normalize raw research into a BusinessProfile. Evaluate whether the business has no, weak, mixed, or strong online presence. Capture what the business does, what it likely needs, public phone/address provenance, website/social/listing evidence, business hours, services, reasons, a 0-1 confidence score, and explicit notWorthCallingReason when strong enough to block outreach. Never invent a website URL or contact email; only include URLs/emails visible in the provided source text. Output ONLY JSON matching the provided schema.';
@@ -210,7 +211,7 @@ export async function runScraper({ niche, city, count = 4 }) {
 }
 
 function pickMode() {
-  if (['live', 'autonomous_live'].includes(env.runMode) && env.browserUse.apiKey) return 'live';
+  if (['autonomous_live', 'production_live'].includes(env.runMode) && canStartBrowserSession() && browserResearchLiveEnabled()) return 'live';
   return 'mock';
 }
 
@@ -296,6 +297,26 @@ async function discoverLive({ niche, city, count, runId }) {
   let client = null;
   let session = null;
   let browserCandidates = [];
+
+  try {
+    const swarm = await discoverBrowserUseResearchProfiles({ niche, city, count, runId, mode: 'live' });
+    mergeDiscoveryReports(report, swarm);
+    if (report.profiles.length) {
+      emit('scraper.candidates.done', {
+        worker: 'scraper',
+        runId,
+        found: report.profiles.length,
+        source: 'browser-use-swarm',
+        browserUseCount: report.profiles.length,
+        directoryCount: 0
+      });
+      return report;
+    }
+    addFallback(report, 'legacy-browser-use-search', 'Browser Use swarm returned no callable profiles.');
+  } catch (err) {
+    recordProviderFailure(report, 'browser-use-swarm', err, 'research_swarm');
+    addFallback(report, 'legacy-browser-use-search', `Browser Use swarm failed: ${err?.message || String(err)}`);
+  }
 
   try {
     client = new BrowserUse({

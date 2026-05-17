@@ -73,32 +73,39 @@ export async function smokeSupermemoryAddListSearch() {
   const mailMarker = `sm_mail_${stamp}`;
   const otherMarker = `sm_other_${stamp}`;
 
-  const addedProfile = await addDoc(tagA, 'profile', {
+  const addedProfile = await addDoc(tagA, 'business_profile', {
     businessName: 'Smoke Check A',
     city: 'Smoke City',
     niche: 'local services',
     whatTheyDo: `Supermemory smoke profile marker ${profileMarker}`
   }, {
     profileSource: 'provided',
+    sourceId: `profile_${stamp}_a`,
+    sourceEvent: 'provider_smoke.business_profile',
     allowGeneratedUrls: true
-  });
-  const addedMail = await addDoc(tagA, 'mail_thread', { subject: 'Smoke thread', body: mailMarker });
-  await addDoc(tagB, 'profile', {
+  }, { throwOnFailure: true });
+  const addedMail = await addDoc(tagA, 'mail_thread', { subject: 'Smoke thread', body: mailMarker }, {
+    sourceId: `mail_${stamp}_a`,
+    sourceEvent: 'provider_smoke.mail_thread'
+  }, { throwOnFailure: true });
+  await addDoc(tagB, 'business_profile', {
     businessName: 'Smoke Check B',
     city: 'Smoke City',
     niche: 'local services',
     whatTheyDo: `Supermemory smoke isolation marker ${otherMarker}`
   }, {
     profileSource: 'provided',
+    sourceId: `profile_${stamp}_b`,
+    sourceEvent: 'provider_smoke.business_profile',
     allowGeneratedUrls: true
-  });
+  }, { throwOnFailure: true });
 
   const listed = await listKinds(tagA);
-  const profileHits = await searchUntilHit(tagA, profileMarker, { kind: 'profile' });
+  const profileHits = await searchUntilHit(tagA, profileMarker, { kind: 'business_profile' });
   const mailHits = await searchUntilHit(tagA, mailMarker, { kind: 'mail_thread' });
   const bleedHits = explicitMarkerHits(await search(tagA, otherMarker, { limit: 3 }), otherMarker);
 
-  if (!listed.profile.length) throw new Error('supermemory smoke list did not return profile');
+  if (!listed.business_profile.length) throw new Error('supermemory smoke list did not return business_profile');
   if (!listed.mail_thread.length) throw new Error('supermemory smoke list did not return mail_thread');
   if (!profileHits.length) throw new Error('supermemory smoke search did not return profile marker');
   if (!mailHits.length) throw new Error('supermemory smoke search did not return mail_thread marker');
@@ -113,7 +120,7 @@ export async function smokeSupermemoryAddListSearch() {
       extra: {
         tag: tagA,
         added: [addedProfile?.id, addedMail?.id].filter(Boolean),
-        listedProfiles: listed.profile.length,
+        listedProfiles: listed.business_profile.length,
         listedMailThreads: listed.mail_thread.length,
         profileHits: profileHits.length,
         mailThreadHits: mailHits.length,
