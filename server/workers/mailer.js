@@ -1,13 +1,33 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { emit } from '../sse.js';
 import { runs, payments, leads, contactEvents } from '../db.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
 import { addDoc, containerTagFor, getLatest } from '../memory.js';
 import { generateText } from '../gemini.js';
+import { agentMailWebhookEventId, isInboundAgentMailWebhook, normalizeAgentMailWebhook } from '../webhooks/agentmail.js';
+import { classifyMessage } from './mailReply.js';
+import { createHostedInvoice } from '../providers/stripe.js';
+import {
+  createMockAgentMailSendResult,
+  normalizeAgentMailMessage,
+  replyAgentMailMessage,
+  sendAgentMailMessage
+} from '../providers/agentmail.js';
+
+export { runAgentMailLiveSendSmoke } from '../providers/agentmail.js';
 
 const ICS_DT_FMT = (d) =>
   `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+const SUPPORTED_REPLY_SCOPE = [
+  'invoice questions',
+  'scheduling',
+  'website brief and customer needs',
+  'website revisions',
+  'pricing',
+  'build progress',
+  'opt-out or unsubscribe'
+].join(', ');
 
 function pad(n) {
   return String(n).padStart(2, '0');
@@ -116,49 +136,12 @@ async function writeRecap({ businessName, profile, postMortem }) {
 }
 
 async function createStripeInvoice({ leadId, businessName, toEmail, idempotencyKey }) {
-  const { default: Stripe } = await import('stripe');
-  const stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2026-02-25.clover' });
-  const customer = await stripe.customers.create({
-    email: toEmail,
-    name: businessName,
-    metadata: { leadId }
-  }, {
-    idempotencyKey: `${idempotencyKey}:customer`
-  });
-  await stripe.invoiceItems.create({
-    customer: customer.id,
-    amount: env.stripe.priceCents,
-    currency: 'usd',
-    description: `${env.stripe.productName} for ${businessName}`,
-    metadata: { leadId }
-  }, {
-    idempotencyKey: `${idempotencyKey}:item`
-  });
-  const invoice = await stripe.invoices.create({
-    customer: customer.id,
-    collection_method: 'send_invoice',
-    days_until_due: 7,
-    auto_advance: false,
-    metadata: { leadId }
-  }, {
-    idempotencyKey: `${idempotencyKey}:invoice`
-  });
-  const finalized = await stripe.invoices.finalizeInvoice(invoice.id, {}, {
-    idempotencyKey: `${idempotencyKey}:finalize`
-  });
-  return {
-    id: finalized.id,
-    customerId: customer.id,
-    url: finalized.hosted_invoice_url || finalized.invoice_pdf,
-    dueAt: finalized.due_date ? finalized.due_date * 1000 : null
-  };
+  return createHostedInvoice({ leadId, businessName, toEmail, idempotencyKey });
 }
 
-async function sendAgentMail({ toEmail, subject, text, html, icsBase64 }) {
-  const { AgentMailClient } = await import('agentmail');
-  const mail = new AgentMailClient({ apiKey: env.agentmail.apiKey });
-  const res = await mail.inboxes.messages.send(env.agentmail.inboxId, {
-    to: [toEmail],
+async function sendInvoiceAgentMail({ toEmail, subject, text, html, icsBase64 }) {
+  return sendAgentMailMessage({
+    toEmail,
     subject,
     text,
     html,
@@ -169,9 +152,7 @@ async function sendAgentMail({ toEmail, subject, text, html, icsBase64 }) {
         contentType: 'text/calendar'
       }
     ]
-  });
-  const message = res?.message || res;
-  return message?.threadId || message?.thread_id || message?.id || `am-${Date.now().toString(36)}`;
+  }, { timeoutSeconds: 15, maxRetries: 2 });
 }
 
 export async function runMailer({ leadId, toEmail }) {
@@ -208,10 +189,17 @@ export async function runMailer({ leadId, toEmail }) {
       log.info('mailer.invoice_mock', { leadId });
     } else {
       invoice = await createStripeInvoice({ leadId, businessName, toEmail, idempotencyKey });
+      log.info('mailer.invoice_created', {
+        leadId,
+        invoiceId: invoice.id,
+        customerId: invoice.customerId,
+        customerReused: invoice.customerReused,
+        customerReuseReason: invoice.customerReuseReason
+      });
     }
 
     if (!existingPayment) {
-      payments.insert({
+      const savedPayment = payments.insertOrGetByIdempotency({
         id: `pay_${randomBytes(6).toString('hex')}`,
         lead_id: leadId,
         stripe_session_id: invoice.id,
@@ -224,6 +212,16 @@ export async function runMailer({ leadId, toEmail }) {
         due_at: invoice.dueAt,
         idempotency_key: idempotencyKey
       });
+      if (!savedPayment.inserted && savedPayment.row) {
+        invoice = {
+          ...invoice,
+          id: savedPayment.row.stripe_invoice_id || savedPayment.row.stripe_session_id || invoice.id,
+          customerId: savedPayment.row.stripe_customer_id || invoice.customerId,
+          url: savedPayment.row.hosted_invoice_url || savedPayment.row.payment_link_url || invoice.url,
+          dueAt: savedPayment.row.due_at || invoice.dueAt
+        };
+        log.info('mailer.invoice_idempotent_race_reuse', { leadId, paymentId: savedPayment.row.id });
+      }
     }
     emit('mailer.invoice_link', {
       worker: 'mailer',
@@ -257,16 +255,25 @@ export async function runMailer({ leadId, toEmail }) {
       `Follow-up meeting: ${meetingUrl} (calendar invite attached)`,
       `Reply to this email anytime — the agent will use this AgentMail thread to answer questions and keep the build moving.`
     ].join('\n');
-    const bodyHtml = `<p>${recap.replace(/\n+/g, '</p><p>')}</p><p><a href="${invoice.url}">Open invoice</a></p><p>Follow-up meeting: <a href="${meetingUrl}">${meetingUrl}</a> (calendar invite attached)</p><p>Reply to this email anytime — the agent will use this AgentMail thread to answer questions and keep the build moving.</p>`;
+    const invoiceHref = escapeHtml(invoice.url);
+    const meetingHref = escapeHtml(meetingUrl);
+    const bodyHtml = [
+      htmlParagraphs(recap),
+      `<p><a href="${invoiceHref}">Open invoice</a></p>`,
+      `<p>Follow-up meeting: <a href="${meetingHref}">${meetingHref}</a> (calendar invite attached)</p>`,
+      '<p>Reply to this email anytime — the agent will use this AgentMail thread to answer questions and keep the build moving.</p>'
+    ].join('');
 
-    let threadId;
-    let mock = false;
+    let sendResult;
     if (shouldMockEmail(toEmail)) {
-      mock = true;
-      threadId = `mock-thread-${randomBytes(6).toString('hex')}`;
+      sendResult = createMockAgentMailSendResult({
+        threadId: `mock-thread-${randomBytes(6).toString('hex')}`,
+        messageId: `mock-agentmail-message-${randomBytes(6).toString('hex')}`,
+        subject
+      });
       log.info('mailer.email_mock', { leadId, toMasked: maskEmail(toEmail) });
     } else {
-      threadId = await sendAgentMail({
+      sendResult = await sendInvoiceAgentMail({
         toEmail,
         subject,
         text: bodyText,
@@ -274,21 +281,25 @@ export async function runMailer({ leadId, toEmail }) {
         icsBase64
       });
     }
+    const threadId = sendResult.threadId;
 
     contactEvents.add({
       lead_id: leadId,
       type: 'invoice_email',
       direction: 'outbound',
       channel: 'agentmail',
-      provider_id: threadId,
+      provider_id: sendResult.providerId,
       thread_id: threadId,
       subject,
       body: bodyText,
       metadata: {
         toMasked: maskEmail(toEmail),
+        messageId: sendResult.messageId,
         invoiceId: invoice.id,
         invoiceUrl: invoice.url,
-        mockEmail: mock,
+        stripeCustomerId: invoice.customerId,
+        stripeCustomerReused: invoice.customerReused,
+        mockEmail: sendResult.mock,
         mockInvoice: shouldMockInvoices()
       }
     });
@@ -297,11 +308,12 @@ export async function runMailer({ leadId, toEmail }) {
       await addDoc(tag, 'mail_thread', {
         direction: 'outbound',
         threadId,
+        messageId: sendResult.messageId,
         subject,
         body: bodyText,
         invoiceUrl: invoice.url,
         at: new Date().toISOString()
-      }, { kind: 'invoice_email', mockEmail: mock });
+      }, { kind: 'invoice_email', mockEmail: sendResult.mock });
     } catch (err) {
       log.warn('mailer.memory.add_failed', { leadId, error: err?.message || String(err) });
     }
@@ -311,9 +323,10 @@ export async function runMailer({ leadId, toEmail }) {
       leadId,
       runId,
       threadId,
+      messageId: sendResult.messageId,
       subject,
       toMasked: maskEmail(toEmail),
-      mock
+      mock: sendResult.mock
     });
 
     leads.update(leadId, {
@@ -328,17 +341,364 @@ export async function runMailer({ leadId, toEmail }) {
       paymentLinkUrl: invoice.url,
       stripeInvoiceId: invoice.id,
       threadId,
-      mockEmail: mock,
+      messageId: sendResult.messageId,
+      mockEmail: sendResult.mock,
       mockInvoice: shouldMockInvoices()
     };
     runs.finish(runId, { state: 'completed', detail });
     emit('mailer.done', { worker: 'mailer', leadId, runId, invoiceUrl: invoice.url, paymentLinkUrl: invoice.url, threadId });
 
-    return { invoiceUrl: invoice.url, threadId };
+    return { invoiceUrl: invoice.url, threadId, messageId: sendResult.messageId };
   } catch (err) {
     runs.finish(runId, { state: 'failed', error: err.message });
     emit('mailer.error', { worker: 'mailer', leadId, runId, error: err.message });
     log.error('mailer.failed', { leadId, runId, err: err.message });
     throw err;
   }
+}
+
+export async function handleAgentMailInbound(input = {}, options = {}) {
+  const body = input.body || input;
+  let msg = input.normalized || normalizeAgentMailWebhook(body);
+  const eventId = input.eventId || options.eventId || agentMailWebhookEventId(input.req || options.req, body, msg);
+
+  if (!isInboundAgentMailWebhook(body, msg)) {
+    return { ignored: true, reason: 'not_inbound', eventId, msg };
+  }
+
+  msg = await hydrateInboundAgentMailMessage(msg);
+  if (isSelfAgentMailAddress(msg.fromEmail)) {
+    return { ignored: true, reason: 'self_message', eventId, msg };
+  }
+
+  const lead = findLeadForAgentMail(msg, body);
+  const leadId = lead?.id || body.leadId || body.lead_id || null;
+  const classification = classifyAgentMailReply({ subject: msg.subject, text: msg.text });
+  const inboundEvent = addContactEventOnce({
+    id: contactEventId('in', eventId, msg),
+    lead_id: leadId,
+    type: 'customer_reply',
+    direction: 'inbound',
+    channel: 'agentmail',
+    provider_id: msg.messageId,
+    thread_id: msg.threadId,
+    subject: msg.subject,
+    body: msg.text || msg.preview || '',
+    metadata: {
+      eventId,
+      inboxId: msg.inboxId,
+      fromMasked: maskEmail(msg.fromEmail),
+      textSource: msg.textSource,
+      fetched: !!msg.fetched,
+      fetchError: msg.fetchError || null,
+      classification
+    }
+  });
+
+  if (!inboundEvent.inserted) {
+    log.info('agentmail.inbound_duplicate_contact_event', { eventId, contactEventId: inboundEvent.id, threadId: msg.threadId });
+    return { ignored: true, duplicate: true, eventId, leadId, msg };
+  }
+
+  if (leadId) {
+    await writeMailMemory(leadId, 'inbound', msg, { eventId, classification });
+    if (classification.kind === 'opt_out') {
+      leads.update(leadId, {
+        risk_status: 'email-opt-out',
+        next_action: 'do_not_email'
+      });
+    } else if (classification.operatorFlag) {
+      leads.update(leadId, {
+        risk_status: 'operator-handoff',
+        next_action: 'operator_review_mail'
+      });
+    }
+  }
+
+  emit('mailer.inbound_message', {
+    worker: 'mailer',
+    leadId,
+    threadId: msg.threadId,
+    messageId: msg.messageId,
+    fromMasked: maskEmail(msg.fromEmail),
+    subject: msg.subject,
+    classification: classification.kind,
+    classificationScope: classification.scope,
+    supported: classification.supported,
+    operatorFlag: classification.operatorFlag,
+    policy: classification,
+    preview: (msg.text || msg.preview || '').slice(0, 240)
+  });
+
+  const history = leadId ? recentAgentMailEvents(leadId) : [];
+  const replyText = await draftAgentMailReply({ lead, msg, classification, history });
+  const sendResult = await sendAgentMailAutoReply({ msg, text: replyText, eventId });
+  const replySubject = `Re: ${stripRe(msg.subject)}`;
+
+  const outboundEvent = addContactEventOnce({
+    id: contactEventId('out', eventId, msg),
+    lead_id: leadId,
+    type: classification.operatorFlag ? 'handoff_reply' : 'agent_reply',
+    direction: 'outbound',
+    channel: 'agentmail',
+    provider_id: sendResult.providerId,
+    thread_id: sendResult.threadId || msg.threadId,
+    subject: replySubject,
+    body: replyText,
+    metadata: {
+      eventId,
+      inboxId: sendResult.inboxId || msg.inboxId,
+      messageId: sendResult.messageId,
+      inReplyTo: msg.messageId,
+      toMasked: maskEmail(msg.fromEmail),
+      mock: sendResult.mock,
+      classification
+    }
+  });
+
+  if (leadId) {
+    await writeMailMemory(leadId, 'outbound', {
+      ...msg,
+      threadId: sendResult.threadId || msg.threadId,
+      messageId: sendResult.messageId,
+      subject: replySubject,
+      text: replyText
+    }, { eventId, classification, mock: sendResult.mock });
+  }
+
+  emit('mailer.auto_reply', {
+    worker: 'mailer',
+    leadId,
+    threadId: sendResult.threadId || msg.threadId,
+    messageId: sendResult.messageId || sendResult.providerId,
+    subject: replySubject,
+    classification: classification.kind,
+    classificationScope: classification.scope,
+    supported: classification.supported,
+    operatorFlag: classification.operatorFlag,
+    policy: classification,
+    mock: sendResult.mock
+  });
+
+  return {
+    ignored: false,
+    eventId,
+    leadId,
+    inboundContactEventId: inboundEvent.id,
+    outboundContactEventId: outboundEvent.id,
+    replyText,
+    classification,
+    sendResult
+  };
+}
+
+function classifyAgentMailReply(input) {
+  return classifyMessage(input);
+}
+
+async function hydrateInboundAgentMailMessage(msg) {
+  if (!shouldFetchAgentMailMessage(msg)) return msg;
+  if (!env.agentmail.apiKey || !msg.inboxId || !msg.messageId) {
+    return { ...msg, fetchSkipped: 'missing_agentmail_config_or_message_id' };
+  }
+
+  try {
+    const { AgentMailClient } = await import('agentmail');
+    const mail = new AgentMailClient({ apiKey: env.agentmail.apiKey });
+    const fetched = await mail.inboxes.messages.get(msg.inboxId, msg.messageId, {
+      timeoutInSeconds: 12,
+      maxRetries: 2
+    });
+    const providerMsg = normalizeAgentMailMessage(fetched, msg);
+    const webhookMsg = normalizeAgentMailWebhook({
+      event_type: msg.eventType,
+      event_id: msg.eventId,
+      message: fetched
+    });
+    return mergeAgentMailMessage(msg, providerMsg, webhookMsg, { fetched: true });
+  } catch (err) {
+    log.warn('agentmail.inbound_fetch_failed', {
+      inboxId: msg.inboxId,
+      messageId: msg.messageId,
+      error: err?.message || String(err)
+    });
+    return { ...msg, fetchError: err?.message || String(err) };
+  }
+}
+
+function shouldFetchAgentMailMessage(msg) {
+  if (!msg.messageId) return false;
+  if (!msg.text || msg.textSource === 'preview' || msg.textSource === 'empty') return true;
+  return !msg.threadId || !msg.fromEmail || !msg.subject;
+}
+
+function mergeAgentMailMessage(...parts) {
+  const merged = {};
+  for (const part of parts) {
+    for (const [key, value] of Object.entries(part || {})) {
+      if (value === undefined || value === null || value === '') continue;
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function findLeadForAgentMail(msg, body = {}) {
+  if (msg.threadId) {
+    const byThread = contactEvents.findLeadByThread(msg.threadId);
+    if (byThread) return byThread;
+  }
+  const leadId = body.leadId || body.lead_id || body.data?.leadId || body.data?.lead_id;
+  return leadId ? leads.get(leadId) : null;
+}
+
+function recentAgentMailEvents(leadId) {
+  return contactEvents.listByLead(leadId, { limit: 8 })
+    .slice()
+    .reverse()
+    .filter((event) => event.channel === 'agentmail')
+    .map((event) => ({
+      direction: event.direction,
+      type: event.type,
+      subject: event.subject,
+      body: event.body
+    }));
+}
+
+async function draftAgentMailReply({ lead, msg, classification, history }) {
+  if (classification.kind === 'opt_out') {
+    return 'Understood. We will stop emailing this thread. Thanks for letting us know.';
+  }
+  if (classification.operatorFlag) {
+    return 'Thanks for asking. I can only handle invoice questions, scheduling, website briefs, revisions, pricing, build progress, and opt-outs in this automated thread. I have flagged the operator and paused the automated handling so a human can review this safely.';
+  }
+
+  try {
+    if (!env.gemini.apiKey) throw new Error('GEMINI_API_KEY missing');
+    const prompt = [
+      `Business: ${lead?.business_name || 'unknown small business'}`,
+      `Customer email subject: ${msg.subject}`,
+      `Customer message:`,
+      msg.text || msg.preview || '(empty)',
+      '',
+      `Policy classification: ${classification.scope} (${classification.reason}).`,
+      history?.length ? `Recent AgentMail context:\n${formatAgentMailHistory(history)}` : '',
+      '',
+      `Reply as callmemaybe's autonomous AgentMail agent.`,
+      `Stay strictly inside this service scope: ${SUPPORTED_REPLY_SCOPE}.`,
+      `Be brief, concrete, and useful. If they ask for anything outside scope, say a human will review it.`,
+      `Do not make legal promises, SEO guarantees, custom contract commitments, or unsupported delivery claims.`,
+      `No markdown. No subject line.`
+    ].filter(Boolean).join('\n');
+    const text = await generateText({
+      prompt,
+      systemInstruction: 'You write concise customer-service email replies for a small-business website agency. No markdown.',
+      thinkingLevel: 'low',
+      flash: true
+    });
+    if (text && text.trim().length > 15) return text.trim();
+  } catch (err) {
+    log.warn('agentmail.reply.gemini_fallback', { error: err?.message || String(err) });
+  }
+
+  return 'Thanks for the note. The invoice, scheduling, website brief, revisions, pricing, and build progress can all be handled right here in this thread. Send any details you want reflected on the site and I will keep the build moving.';
+}
+
+async function sendAgentMailAutoReply({ msg, text, eventId }) {
+  const subject = `Re: ${stripRe(msg.subject)}`;
+  if (!msg.fromEmail || shouldMockEmail(msg.fromEmail)) {
+    return createMockAgentMailSendResult({
+      threadId: msg.threadId || `mock-thread-${safeId(eventId)}`,
+      messageId: `mock-agentmail-reply-${safeId(eventId)}`,
+      subject
+    });
+  }
+
+  return replyAgentMailMessage({
+    inboxId: msg.inboxId || env.agentmail.inboxId,
+    messageId: msg.messageId,
+    toEmail: msg.fromEmail,
+    subject,
+    text,
+    html: htmlParagraphs(text)
+  }, { timeoutSeconds: 15, maxRetries: 2 });
+}
+
+function addContactEventOnce(event) {
+  try {
+    return { id: contactEvents.add(event), inserted: true };
+  } catch (err) {
+    if (isDuplicateContactEvent(err)) return { id: event.id, inserted: false };
+    throw err;
+  }
+}
+
+function isDuplicateContactEvent(err) {
+  return err?.code?.startsWith('SQLITE_CONSTRAINT') || /UNIQUE constraint failed: contact_events\.id/i.test(err?.message || '');
+}
+
+function contactEventId(direction, eventId, msg) {
+  return `agentmail_${direction}_${safeId(eventId || msg.messageId || stableHash(msg))}`;
+}
+
+function safeId(value) {
+  return String(value || 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96) || 'unknown';
+}
+
+function stableHash(value) {
+  return createHash('sha256').update(stableStringify(value)).digest('hex').slice(0, 24);
+}
+
+function stableStringify(value) {
+  if (value === undefined) return 'undefined';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+}
+
+function formatAgentMailHistory(history = []) {
+  return history.map((event) => {
+    const body = String(event.body || '').replace(/\s+/g, ' ').slice(0, 280);
+    return `${event.direction || 'unknown'} ${event.type || 'message'}: ${body}`;
+  }).join('\n');
+}
+
+async function writeMailMemory(leadId, direction, msg, metadata = {}) {
+  try {
+    await addDoc(containerTagFor(leadId), 'mail_thread', {
+      direction,
+      threadId: msg.threadId,
+      messageId: msg.messageId,
+      subject: msg.subject,
+      body: msg.text,
+      at: new Date().toISOString()
+    }, metadata);
+  } catch (err) {
+    log.warn('agentmail.memory.add_failed', { leadId, direction, error: err?.message || String(err) });
+  }
+}
+
+function stripRe(subject = '') {
+  return String(subject || '').replace(/^re:\s*/i, '') || 'callmemaybe';
+}
+
+function isSelfAgentMailAddress(email) {
+  const self = `${env.agentmail.displayName || 'callmemaybe'}@agentmail.to`.toLowerCase();
+  return String(email || '').toLowerCase() === self;
+}
+
+function htmlParagraphs(text) {
+  return `<p>${escapeHtml(text).replace(/\n+/g, '</p><p>')}</p>`;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }

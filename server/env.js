@@ -20,6 +20,17 @@ export const env = {
     payments: bool(process.env.LIVE_PAYMENTS),
     builds: bool(process.env.LIVE_BUILDS)
   },
+  smoke: {
+    gemini: bool(process.env.SMOKE_GEMINI),
+    supermemoryWrite: bool(process.env.SMOKE_SUPERMEMORY_WRITE),
+    mossIndex: bool(process.env.SMOKE_MOSS_INDEX),
+    liveCall: bool(process.env.SMOKE_LIVE_CALL),
+    agentmailSend: bool(process.env.SMOKE_AGENTMAIL_SEND),
+    stripeInvoice: bool(process.env.SMOKE_STRIPE_INVOICE),
+    browserUse: bool(process.env.SMOKE_BROWSER_USE),
+    testPhone: process.env.SMOKE_TEST_PHONE || '',
+    testEmail: process.env.SMOKE_TEST_EMAIL || ''
+  },
   allowedPhones: list(process.env.ALLOWED_TARGET_PHONES),
   allowedEmails: list(process.env.ALLOWED_TARGET_EMAILS),
   outreach: {
@@ -37,7 +48,7 @@ export const env = {
     date: process.env.HACKATHON_DATE || '2026-05-17',
     location: process.env.HACKATHON_LOCATION || 'Y Combinator, San Francisco',
     url: process.env.HACKATHON_URL || 'https://events.ycombinator.com/CallMyAgentHackathon',
-    sponsors: list(process.env.HACKATHON_SPONSORS || 'Google DeepMind,Stripe,Moss,Browser Use,AgentMail,Supermemory,Sponge')
+    sponsors: list(process.env.HACKATHON_SPONSORS || 'Google DeepMind,AgentPhone,AgentMail,Supermemory,Moss,Browser Use,Lovable,Stripe')
   },
 
   gemini: {

@@ -3,123 +3,133 @@
 
 import { env } from '../server/env.js';
 import { providerSmoke } from '../server/db.js';
-import { generateText } from '../server/gemini.js';
-import { addDoc, containerTagFor, listKinds, search } from '../server/memory.js';
+import { smokeDetail } from '../server/providers/core.js';
+import { smokeGeminiGenerate } from '../server/providers/gemini.js';
+import { smokeMossIndex } from '../server/providers/moss.js';
+import { smokeSupermemoryAddListSearch } from '../server/providers/supermemory.js';
+import { createStripeSmokeInvoice } from '../server/providers/stripe.js';
+import { agentPhoneOwnedNumberSmoke } from '../server/providers/agentphone.js';
+import { runAgentMailLiveSendSmoke } from '../server/providers/agentmail.js';
+import { BrowserUseLovableAdapter } from '../server/providers/browserUse.js';
 
-const bool = (v) => v === 'true' || v === '1' || v === 'yes';
 const dry = (provider, configured, detail = {}) => {
-  providerSmoke.set(provider, configured ? 'configured' : 'missing', { dryRun: true, ...detail });
-  return { provider, status: configured ? 'configured' : 'missing', detail: { dryRun: true, ...detail } };
+  const status = configured ? 'configured' : 'missing';
+  const fullDetail = smokeDetail({ dryRun: true, extra: detail });
+  providerSmoke.set(provider, status, fullDetail);
+  return { provider, status, detail: fullDetail };
+};
+
+const liveResult = (provider, status, detail = {}) => {
+  const fullDetail = smokeDetail({ dryRun: false, live: true, extra: detail });
+  providerSmoke.set(provider, status, fullDetail);
+  return { provider, status, detail: fullDetail };
+};
+
+const failed = (provider, err) => {
+  const detail = smokeDetail({ dryRun: false, extra: { error: err?.message || String(err) } });
+  providerSmoke.set(provider, 'failed', detail);
+  return { provider, status: 'failed', detail };
 };
 
 async function smokeGemini() {
-  if (!env.gemini.apiKey) return dry('gemini', false);
-  try {
-    const text = await generateText({ prompt: 'Reply with exactly OK.', thinkingLevel: 'minimal', flash: true });
-    providerSmoke.set('gemini', 'ok', { model: env.gemini.modelFlash, sample: String(text || '').slice(0, 20) });
-    return { provider: 'gemini', status: 'ok' };
-  } catch (err) {
-    providerSmoke.set('gemini', 'failed', { error: err?.message || String(err) });
-    return { provider: 'gemini', status: 'failed', detail: err?.message || String(err) };
-  }
+  return adapterSmoke('gemini', smokeGeminiGenerate);
 }
 
 async function smokeSupermemory() {
-  if (!env.supermemory.apiKey) return dry('supermemory', false);
-  try {
-    const stamp = Date.now().toString(36);
-    const tag = containerTagFor(`smoke_${stamp}`);
-    await addDoc(tag, 'profile', { businessName: 'Smoke Check', marker: `marker_${stamp}` });
-    await new Promise((r) => setTimeout(r, 2000));
-    const listed = await listKinds(tag);
-    const hits = await search(tag, `marker_${stamp}`, { limit: 3 });
-    providerSmoke.set('supermemory', 'ok', { tag, listedProfiles: listed.profile.length, hits: hits.length });
-    return { provider: 'supermemory', status: 'ok', detail: { listedProfiles: listed.profile.length, hits: hits.length } };
-  } catch (err) {
-    providerSmoke.set('supermemory', 'failed', { error: err?.message || String(err) });
-    return { provider: 'supermemory', status: 'failed', detail: err?.message || String(err) };
-  }
+  return adapterSmoke('supermemory', smokeSupermemoryAddListSearch);
 }
 
 async function smokeStripe() {
   if (!env.stripe.secretKey) return dry('stripe', false);
-  if (!bool(process.env.SMOKE_STRIPE_INVOICE)) {
+  if (!env.smoke.stripeInvoice) {
     return dry('stripe', true, { skipped: 'set SMOKE_STRIPE_INVOICE=true to create a test hosted invoice' });
   }
   try {
-    const { default: Stripe } = await import('stripe');
-    const stripe = new Stripe(env.stripe.secretKey, { apiVersion: '2026-02-25.clover' });
-    const customer = await stripe.customers.create({
-      email: process.env.SMOKE_TEST_EMAIL || 'smoke@example.com',
-      name: 'callmemaybe smoke test',
-      metadata: { smoke: 'true' }
-    }, { idempotencyKey: `smoke_customer_${Date.now().toString(36)}` });
-    providerSmoke.set('stripe', 'ok', { customerId: customer.id });
-    return { provider: 'stripe', status: 'ok', detail: { customerId: customer.id } };
+    const invoice = await createStripeSmokeInvoice();
+    return liveResult('stripe', 'ok', {
+      customerId: invoice.customerId,
+      invoiceId: invoice.id,
+      hostedInvoiceUrl: invoice.hostedInvoiceUrl,
+      customerReused: invoice.customerReused
+    });
   } catch (err) {
-    providerSmoke.set('stripe', 'failed', { error: err?.message || String(err) });
-    return { provider: 'stripe', status: 'failed', detail: err?.message || String(err) };
+    return failed('stripe', err);
   }
 }
 
 async function smokeAgentMail() {
   const configured = !!env.agentmail.apiKey && !!env.agentmail.inboxId;
   if (!configured) return dry('agentmail', false);
-  if (!bool(process.env.SMOKE_AGENTMAIL_SEND)) {
+  if (!env.smoke.agentmailSend) {
     return dry('agentmail', true, { skipped: 'set SMOKE_AGENTMAIL_SEND=true and SMOKE_TEST_EMAIL to send a test message' });
   }
   try {
-    const { AgentMailClient } = await import('agentmail');
-    const mail = new AgentMailClient({ apiKey: env.agentmail.apiKey });
-    const res = await mail.inboxes.messages.send(env.agentmail.inboxId, {
-      to: [process.env.SMOKE_TEST_EMAIL],
-      subject: 'callmemaybe AgentMail smoke',
-      text: 'AgentMail smoke test from callmemaybe.'
-    });
-    providerSmoke.set('agentmail', 'ok', { messageId: res?.message?.id || res?.id || null });
-    return { provider: 'agentmail', status: 'ok' };
+    const result = await runAgentMailLiveSendSmoke();
+    if (result.status !== 'ok') return dry('agentmail', true, result);
+    return liveResult('agentmail', 'ok', result);
   } catch (err) {
-    providerSmoke.set('agentmail', 'failed', { error: err?.message || String(err) });
-    return { provider: 'agentmail', status: 'failed', detail: err?.message || String(err) };
+    return failed('agentmail', err);
   }
 }
 
 async function smokeBrowserUse() {
   if (!env.browserUse.apiKey) return dry('browserUse', false);
-  if (!bool(process.env.SMOKE_BROWSER_USE)) {
+  if (!env.smoke.browserUse) {
     return dry('browserUse', true, { skipped: 'set SMOKE_BROWSER_USE=true to create a Browser Use session' });
   }
   try {
-    const { BrowserUse } = await import('browser-use-sdk/v3');
-    const client = new BrowserUse({ apiKey: env.browserUse.apiKey });
-    const session = await client.sessions.create({ keepAlive: false });
-    providerSmoke.set('browserUse', 'ok', { sessionId: session.id, liveUrl: session.liveUrl || null });
-    try { await client.sessions.stop(session.id); } catch {}
-    return { provider: 'browserUse', status: 'ok', detail: { liveUrl: session.liveUrl || null } };
+    const adapter = new BrowserUseLovableAdapter({
+      apiKey: env.browserUse.apiKey,
+      baseUrl: env.browserUse.baseUrl
+    });
+    const session = await adapter.createSession({ keepAlive: false });
+    try { await adapter.stopSession(session.sessionId); } catch {}
+    return liveResult('browserUse', 'ok', { sessionId: session.sessionId, liveUrl: session.liveUrl || null });
   } catch (err) {
-    providerSmoke.set('browserUse', 'failed', { error: err?.message || String(err) });
-    return { provider: 'browserUse', status: 'failed', detail: err?.message || String(err) };
+    return failed('browserUse', err);
   }
+}
+
+async function smokeLovable() {
+  if (!env.browserUse.apiKey) return dry('lovable', false, { dependency: 'browserUse' });
+  return dry('lovable', true, {
+    dependency: 'browserUse',
+    skipped: 'Lovable build-with-URL is verified through Browser Use sessions; set SMOKE_BROWSER_USE=true to create a session and exercise the handoff',
+    buildWithUrl: 'https://lovable.dev/?prompt=<encoded>',
+    projectUrlExtraction: '.lovable.app'
+  });
 }
 
 async function smokeAgentPhone() {
   const configured = !!env.agentphone.apiKey;
   if (!configured) return dry('agentphone', false);
-  if (!bool(process.env.SMOKE_LIVE_CALL)) {
+  if (!env.smoke.liveCall) {
     return dry('agentphone', true, { skipped: 'set SMOKE_LIVE_CALL=true and SMOKE_TEST_PHONE to place one owned-number call' });
   }
-  const phone = process.env.SMOKE_TEST_PHONE;
-  if (!phone || !env.allowedPhones.includes(phone)) {
-    providerSmoke.set('agentphone', 'blocked', { reason: 'SMOKE_TEST_PHONE must be in ALLOWED_TARGET_PHONES' });
-    return { provider: 'agentphone', status: 'blocked' };
+  try {
+    const result = await agentPhoneOwnedNumberSmoke({ phone: env.smoke.testPhone });
+    if (result.status !== 'ok') {
+      providerSmoke.set('agentphone', result.status, result.detail || {});
+      return { provider: 'agentphone', status: result.status, detail: result.detail };
+    }
+    return liveResult('agentphone', 'ok', result.detail || result);
+  } catch (err) {
+    return failed('agentphone', err);
   }
-  providerSmoke.set('agentphone', 'configured', { skipped: 'live call smoke is intentionally delegated to the app call path' });
-  return { provider: 'agentphone', status: 'configured' };
 }
 
 async function smokeMoss() {
-  const configured = !!env.moss.projectId && !!env.moss.projectKey;
-  return dry('moss', configured, configured ? { role: 'in-call retrieval; quota-safe dry check' } : {});
+  return adapterSmoke('moss', smokeMossIndex);
+}
+
+async function adapterSmoke(provider, fn) {
+  try {
+    const result = await fn();
+    providerSmoke.set(provider, result.status, result.detail || {});
+    return { provider, status: result.status, detail: result.detail };
+  } catch (err) {
+    return failed(provider, err);
+  }
 }
 
 async function main() {
@@ -130,6 +140,7 @@ async function main() {
     await smokeAgentMail(),
     await smokeStripe(),
     await smokeBrowserUse(),
+    await smokeLovable(),
     await smokeMoss()
   ];
   console.log('\n=== PROVIDER SMOKE RESULTS ===\n');

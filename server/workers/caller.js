@@ -3,15 +3,30 @@ import { runs, leads, calls } from '../db.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
 import { addDoc, getLatest, containerTagFor } from '../memory.js';
-import { generateJson, generateText } from '../gemini.js';
-import { SalesPitchSchema } from '../types.js';
+import { generateJson } from '../gemini.js';
+import { ensureMossPitchIndex, shouldProvisionMossForCall } from '../providers/moss.js';
+import {
+  SalesPitchGenerationSchema,
+  buildPitchResearchContext,
+  createFallbackPitch,
+  validateGeneratedPitch
+} from '../pitch.js';
 import { callabilityForLead, dncCheck, recordingDisclosure, recordCallDecision, transcriptHasOptOut, recordOptOut } from '../compliance.js';
+import {
+  classifyAgentPhoneFailure,
+  endAgentPhoneCall,
+  ensureAgentPhoneAgent,
+  fetchAgentPhoneFinalTranscript,
+  normalizeAgentPhoneTranscript,
+  placeAgentPhoneCall,
+  streamAgentPhoneTranscript,
+  verifyAgentPhoneVoice,
+  waitForAgentPhoneFinalTranscript
+} from '../providers/agentphone.js';
 
-const _agentIdCache = new Map();
+const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human. Output only JSON that matches the supplied schema exactly.`;
 
-const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human.`;
-
-const MOCK_TRANSCRIPT_SYSTEM = `You are simulating a realistic cold sales call transcript for demo purposes. Output a believable agent<->owner exchange. The agent represents callmemaybe (sells small-business websites for a $500 flat fee). Make the owner skeptical for a few turns, then convinced. End with the agent asking for the best email, the owner spelling it, the agent reading it back, the owner confirming, and the agent saying the invoice will arrive from AgentMail and they can reply there with questions. 10 to 12 total turns, alternating roles, starting with the agent.`;
+const MOCK_TRANSCRIPT_SYSTEM = `You are simulating a realistic cold sales call transcript for demo purposes. Output a believable agent<->owner exchange. The agent represents callmemaybe (sells small-business websites for a $500 flat fee). Start with the pitch beginMessage exactly, including the recording disclosure. Make the owner skeptical for a few turns, then convinced. End with the agent asking for the best email, the owner spelling it, the agent reading it back, the owner confirming, and the agent saying the invoice will arrive from AgentMail and they can reply there with questions. 10 to 12 total turns, alternating roles, starting with the agent.`;
 
 const MOCK_TRANSCRIPT_SCHEMA = {
   type: 'object',
@@ -41,17 +56,19 @@ function mask(phone) {
 }
 
 function pitchToSystemPrompt(pitch, lead) {
-  const objLines = (pitch.objections || []).map((o) => `- If they say: "${o.objection}" → respond: ${o.response}`).join('\n');
+  const objLines = (pitch.objections || []).map((o) => `- If they say: "${o.objection}" -> respond: ${o.response}`).join('\n');
   const discovery = (pitch.discoveryQuestions || []).map((q, i) => `${i + 1}. ${q}`).join('\n');
   return [
     `You are a sales agent for callmemaybe calling ${lead.business_name || 'a local business'} (${lead.niche || 'small business'}).`,
-    `Opening line: ${pitch.openingLine}`,
+    `First spoken message / provider fallback: ${pitch.beginMessage}`,
+    `After the disclosure-first greeting, use this opening line only if it fits naturally: ${pitch.openingLine}`,
     `Value proposition: ${pitch.valueProp}`,
     `Discovery questions to weave in naturally:\n${discovery}`,
     `Objection handling:\n${objLines}`,
     `Close: ${pitch.close}`,
-    `If they give positive intent, ask for the best invoice email exactly like this: ${pitch.emailAsk || 'What is the best email for the invoice?'}`,
-    `After they say an email, read it back slowly and ask them to confirm it before ending the call.`,
+    `If they give positive intent, ask for the best invoice email exactly like this: ${pitch.emailAsk}`,
+    `Email readback rule: ${pitch.emailReadbackInstruction}`,
+    `Do not say the invoice is coming until the owner confirms the read-back email. If the readback is wrong, ask them to repeat the address and read it back again.`,
     `Invoice handoff: ${pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.'}`,
     `Be warm, brief, and concrete. If the owner says any variant of "stop", "remove me", "do not call", or "take me off", acknowledge politely and end the call.`
   ].join('\n\n');
@@ -67,109 +84,18 @@ function mockEmailForProfile(profile) {
 }
 
 async function provisionMossIndex(containerTag, pitch) {
-  if (!env.moss.projectId || !env.moss.projectKey) return;
+  if (!shouldProvisionMossForCall()) {
+    if (env.moss.projectId || env.moss.projectKey) {
+      log.info('moss.index.skipped', { containerTag, reason: 'live call gate disabled' });
+    }
+    return;
+  }
   try {
-    const { MossClient } = await import('@moss-dev/moss');
-    const moss = new MossClient(env.moss.projectId, env.moss.projectKey);
-    const docs = [
-      { id: 'opening', text: pitch.openingLine },
-      { id: 'value-prop', text: pitch.valueProp },
-      { id: 'close', text: pitch.close },
-      { id: 'email-ask', text: pitch.emailAsk || 'Ask for invoice email and confirm it.' },
-      { id: 'invoice-close', text: pitch.invoiceClose || 'AgentMail sends the invoice and handles replies.' },
-      ...(pitch.discoveryQuestions || []).map((q, i) => ({ id: `discovery-${i}`, text: q })),
-      ...(pitch.objections || []).map((o, i) => ({ id: `objection-${i}`, text: `${o.objection} :: ${o.response}` }))
-    ];
-    await moss.createIndex(containerTag, docs);
-    log.info('moss.index.created', { containerTag, docCount: docs.length });
+    const result = await ensureMossPitchIndex(containerTag, pitch);
+    log.info('moss.index.ready', { containerTag, ...result });
   } catch (err) {
     log.warn('moss.index.failed', { containerTag, error: err?.message });
   }
-}
-
-async function ensureAgentPersona({ voice }) {
-  if (env.agentphone.agentId) return env.agentphone.agentId;
-  const cacheKey = env.agentphone.apiKey;
-  if (_agentIdCache.has(cacheKey)) return _agentIdCache.get(cacheKey);
-
-  const res = await fetch(`${env.agentphone.baseUrl}/agents`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.agentphone.apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      name: 'callmemaybe-agent-v1',
-      voiceMode: 'hosted',
-      systemPrompt: 'You are a friendly cold-call agent for callmemaybe. Per-call systemPrompt overrides this.',
-      beginMessage: 'Hello.',
-      voice
-    })
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`agentphone.createAgent ${res.status}: ${body.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (!json?.id) throw new Error('agentphone.createAgent returned no id');
-  _agentIdCache.set(cacheKey, json.id);
-  return json.id;
-}
-
-async function placeCall({ agentId, toNumber, systemPrompt }) {
-  const res = await fetch(`${env.agentphone.baseUrl}/calls`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.agentphone.apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ agentId, toNumber, systemPrompt })
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`agentphone.placeCall ${res.status}: ${body.slice(0, 200)}`);
-  }
-  return res.json();
-}
-
-async function* sseLines(stream) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) !== -1) {
-        const raw = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const dataLines = raw.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart());
-        if (!dataLines.length) continue;
-        const payload = dataLines.join('\n');
-        if (payload === '[DONE]') return;
-        try {
-          yield JSON.parse(payload);
-        } catch {
-          yield { text: payload };
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock?.();
-  }
-}
-
-async function fetchFinalTranscript(providerCallId) {
-  const res = await fetch(`${env.agentphone.baseUrl}/calls/${providerCallId}/transcript`, {
-    headers: { 'Authorization': `Bearer ${env.agentphone.apiKey}` }
-  });
-  if (!res.ok) {
-    log.warn('agentphone.finalTranscript.failed', { status: res.status });
-    return null;
-  }
-  return res.json();
 }
 
 async function loadProfile(leadId, lead) {
@@ -196,28 +122,33 @@ async function loadProfile(leadId, lead) {
 }
 
 async function generatePitch({ profile, lead, disclosure }) {
+  const researchContext = buildPitchResearchContext({ profile, lead });
   const prompt = [
-    `Business profile:\n${JSON.stringify(profile, null, 2)}`,
+    `Lead and research context. Use only this data; do not invent owner names, services, locations, or website facts:\n${JSON.stringify(researchContext, null, 2)}`,
     '',
     `We sell: a flat $500 single-page website built in front of the customer while they watch. Hosted on lovable.app. Ready same day.`,
     `Research frame: callmemaybe first audits whether the business has a strong online presence. If it is weak/mixed, the call describes the gap, what the business does, what customers need to know, and why a clear owned page helps.`,
-    `Tone: warm, specific, never pushy. Use one concrete signal from the profile in the opening line.`,
-    `If the owner agrees, the agent must ask for the best email, read it back, ask for confirmation, then say an AgentMail invoice is coming and replies to that email go back to the agent for questions.`,
+    `Tone: warm, specific, never pushy. Use at least one concrete signal from the research in the opening line and one online-presence gap in the value proposition.`,
+    `Discovery questions: produce exactly 3 natural questions about customer needs, current acquisition channels, and what the owner most wants customers to notice.`,
+    `Objection handling: include practical responses for at least price, already-has-website, send-info, busy, and not-interested if possible.`,
+    `Email flow: if the owner agrees, the agent must ask for the best invoice email, read it back exactly, ask for confirmation, then say an AgentMail invoice is coming and replies to that email go back to the agent for questions.`,
+    `Schema: return every required field and no extra fields. The emailReadbackInstruction field must explicitly require reading the email back and confirming it.`,
     `IMPORTANT — beginMessage MUST start with EXACTLY this recording disclosure (verbatim, no edits), then a single space, then a one-sentence personal greeting:`,
     `"${disclosure}"`
   ].join('\n');
 
-  const pitch = await generateJson({
-    schema: SalesPitchSchema,
-    prompt,
-    systemInstruction: PITCH_SYSTEM,
-    thinkingLevel: 'medium'
-  });
-
-  if (!pitch.beginMessage?.toLowerCase().includes('recorded')) {
-    pitch.beginMessage = `${disclosure} ${pitch.beginMessage || pitch.openingLine}`;
+  try {
+    const raw = await generateJson({
+      schema: SalesPitchGenerationSchema,
+      prompt,
+      systemInstruction: PITCH_SYSTEM,
+      thinkingLevel: 'medium'
+    });
+    return validateGeneratedPitch(raw, { disclosure, profile, lead });
+  } catch (err) {
+    log.warn('pitch.generate.fallback', { leadId: lead?.id, error: err?.message || String(err) });
+    return createFallbackPitch({ disclosure, profile, lead });
   }
-  return pitch;
 }
 
 async function synthesizeMockTranscript({ pitch, profile }) {
@@ -296,58 +227,155 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText }) 
   return { callId };
 }
 
+function fireAnalyst(leadId, callId) {
+  setTimeout(() => {
+    import('./analyst.js').then(({ runAnalyst }) => runAnalyst({ leadId, callId })).catch((err) => {
+      log.warn('analyst.fire.failed', { leadId, callId, error: err?.message });
+    });
+  }, 0);
+}
+
 async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId }) {
-  const dnc = dncCheck(toPhone, { lead, profile, disclosureText, skipAttemptLimit: true });
+  const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
 
-  const agentId = await ensureAgentPersona({ voice: env.agentphone.defaultVoice });
-  const systemPrompt = pitchToSystemPrompt(pitch, lead);
-  const placed = await placeCall({ agentId, toNumber: normalized, systemPrompt });
-  const providerCallId = placed.id;
-  const callId = `call_${Date.now().toString(36)}`;
-  calls.start({
-    id: callId,
-    lead_id: leadId,
-    to_phone: normalized,
-    provider_call_id: providerCallId,
-    disclosure_text: disclosureText,
-    decision_reason: dnc.reason || 'live call allowed'
-  });
-  emit('caller.placed', { worker: 'caller', leadId, runId, callId, providerCallId, toPhone: mask(normalized), mock: false });
-
-  const streamRes = await fetch(`${env.agentphone.baseUrl}/calls/${providerCallId}/transcript/stream`, {
-    headers: { 'Authorization': `Bearer ${env.agentphone.apiKey}`, 'Accept': 'text/event-stream' }
-  });
-  if (!streamRes.ok || !streamRes.body) {
-    throw new Error(`agentphone.stream ${streamRes.status}`);
-  }
-
+  let callId = null;
+  let providerCallId = null;
+  const streamedTurns = [];
+  const seenTurns = new Set();
   let optedOut = false;
-  for await (const chunk of sseLines(streamRes.body)) {
-    const role = chunk.role === 'agent' || chunk.role === 'user' ? chunk.role : 'agent';
-    const text = chunk.text || chunk.transcript || '';
-    if (!text) continue;
-    const ts = chunk.ts || Date.now();
-    emit('caller.transcript', { worker: 'caller', leadId, callId, role, text, ts, mock: false });
+
+  const emitTurn = async (turn, source = 'stream') => {
+    const role = turn.role === 'user' ? 'user' : 'agent';
+    const text = String(turn.text || '').trim();
+    if (!text) return;
+    const key = `${role}:${text}`;
+    if (seenTurns.has(key)) return;
+    seenTurns.add(key);
+    const ts = turn.ts || Date.now();
+    const chunk = { role, text, ts };
+    streamedTurns.push(chunk);
+    emit('caller.transcript', { worker: 'caller', leadId, callId, role, text, ts, mock: false, source });
     if (role === 'user' && transcriptHasOptOut(text)) {
       recordOptOut(normalized);
       optedOut = true;
       leads.update(leadId, { outreach_status: 'blocked', risk_status: 'opt-out', next_action: 'do_not_call' });
       log.warn('caller.optout', { leadId, callId });
-      break;
+      emit('caller.optout', { worker: 'caller', leadId, callId, providerCallId, mock: false });
+      try {
+        await endAgentPhoneCall(providerCallId);
+      } catch (err) {
+        log.warn('agentphone.optout.end_failed', { leadId, callId, providerCallId, error: err?.message || String(err) });
+      }
     }
-  }
+  };
 
-  const finalTranscript = await fetchFinalTranscript(providerCallId);
-  const outcome = optedOut ? 'opt-out' : 'ended';
-  calls.finish(callId, { outcome, transcript: finalTranscript });
-  await addDoc(containerTagFor(leadId), 'call_log', finalTranscript || { note: 'no transcript' }, {
-    provider_call_id: providerCallId,
-    outcome
-  });
-  emit('caller.done', { worker: 'caller', leadId, runId, callId, outcome, providerCallId, mock: false });
-  return { callId, providerCallId };
+  try {
+    const voice = await verifyAgentPhoneVoice(env.agentphone.defaultVoice);
+    const agent = await ensureAgentPhoneAgent({
+      voice: voice.id,
+      beginMessage: pitch.beginMessage,
+      systemPrompt: 'You are a friendly cold-call agent for callmemaybe. Per-call system prompts contain the actual pitch, disclosure, opt-out rule, and email readback rule.'
+    });
+    const systemPrompt = pitchToSystemPrompt(pitch, lead);
+    const placed = await placeAgentPhoneCall({
+      agentId: agent.id,
+      toNumber: normalized,
+      systemPrompt,
+      initialGreeting: pitch.beginMessage,
+      voice: voice.id
+    });
+    providerCallId = placed.id;
+    callId = `call_${Date.now().toString(36)}`;
+    calls.start({
+      id: callId,
+      lead_id: leadId,
+      to_phone: normalized,
+      provider_call_id: providerCallId,
+      disclosure_text: disclosureText,
+      decision_reason: dnc.reason || 'live call allowed'
+    });
+    emit('caller.placed', {
+      worker: 'caller',
+      leadId,
+      runId,
+      callId,
+      providerCallId,
+      agentId: agent.id,
+      voice: voice.id,
+      toPhone: mask(normalized),
+      mock: false
+    });
+
+    try {
+      await streamAgentPhoneTranscript(providerCallId, {
+        onTurn: (turn) => emitTurn(turn, 'stream')
+      });
+    } catch (err) {
+      const failure = classifyAgentPhoneFailure(err);
+      log.warn('agentphone.stream.fallback', { leadId, callId, providerCallId, category: failure.category, error: err?.message || String(err) });
+      emit('caller.transcript_fallback', { worker: 'caller', leadId, callId, providerCallId, reason: failure.category, mock: false });
+      const fallback = await waitForAgentPhoneFinalTranscript(providerCallId, { timeoutMs: 3 * 60 * 1000, intervalMs: 5000 });
+      for (const turn of normalizeAgentPhoneTranscript(fallback.transcript)) {
+        await emitTurn(turn, 'final-poll');
+      }
+    }
+
+    let finalTranscript = null;
+    try {
+      finalTranscript = await fetchAgentPhoneFinalTranscript(providerCallId);
+    } catch (err) {
+      log.warn('agentphone.finalTranscript.failed', { leadId, callId, providerCallId, error: err?.message || String(err) });
+    }
+    if (!finalTranscript) {
+      const fallback = await waitForAgentPhoneFinalTranscript(providerCallId, { timeoutMs: 30 * 1000, intervalMs: 5000 });
+      finalTranscript = fallback.transcript;
+    }
+
+    const finalTurns = normalizeAgentPhoneTranscript(finalTranscript);
+    if (!optedOut && transcriptHasOptOut(finalTurns)) {
+      recordOptOut(normalized);
+      optedOut = true;
+      leads.update(leadId, { outreach_status: 'blocked', risk_status: 'opt-out', next_action: 'do_not_call' });
+    }
+
+    const transcriptForStorage = finalTranscript || { turns: streamedTurns, source: 'agentphone-stream-fallback' };
+    const outcome = optedOut ? 'opt-out' : 'ended';
+    calls.finish(callId, { outcome, transcript: transcriptForStorage });
+    await addDoc(containerTagFor(leadId), 'call_log', transcriptForStorage || { note: 'no transcript' }, {
+      provider_call_id: providerCallId,
+      outcome,
+      stream_turns: streamedTurns.length
+    });
+    if (!optedOut) leads.update(leadId, { outreach_status: 'called', next_action: 'analyze_call' });
+    emit('caller.done', { worker: 'caller', leadId, runId, callId, outcome, providerCallId, mock: false });
+    fireAnalyst(leadId, callId);
+    return { callId, providerCallId };
+  } catch (err) {
+    const failure = classifyAgentPhoneFailure(err);
+    if (callId) {
+      calls.finish(callId, {
+        outcome: failure.outcome,
+        transcript: streamedTurns.length ? { turns: streamedTurns, error: failure.reason } : { error: failure.reason }
+      });
+    }
+    leads.update(leadId, failure.retryable
+      ? { outreach_status: 'retry', risk_status: failure.category, next_action: 'retry_call' }
+      : { outreach_status: 'blocked', risk_status: failure.category, next_action: 'operator_review_call' });
+    emit('caller.call_failed', {
+      worker: 'caller',
+      leadId,
+      runId,
+      callId,
+      providerCallId,
+      outcome: failure.outcome,
+      category: failure.category,
+      retryable: failure.retryable,
+      mock: false
+    });
+    throw err;
+  }
 }
 
 export async function runCaller({ leadId, toPhone }) {

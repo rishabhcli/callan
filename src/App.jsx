@@ -31,14 +31,102 @@ const MAX_TRANSCRIPT = 200;
 const COUNTER_WINDOW_MS = 60000;
 
 const PROVIDER_BADGES = [
-  { key: 'gemini', label: 'GD', title: 'Google DeepMind / Gemini' },
-  { key: 'supermemory', label: 'SUP', title: 'Supermemory' },
-  { key: 'moss', label: 'MOS', title: 'Moss' },
-  { key: 'agentphone', label: 'PHO', title: 'AgentPhone' },
-  { key: 'browserUse', label: 'BRO', title: 'Browser Use' },
-  { key: 'agentmail', label: 'AML', title: 'AgentMail' },
-  { key: 'stripe', label: 'STR', title: 'Stripe invoices' }
+  { key: 'gemini', label: 'GD', name: 'Google DeepMind', capability: 'reasoning', title: 'Google DeepMind / Gemini' },
+  { key: 'supermemory', label: 'SUP', name: 'Supermemory', capability: 'lead memory', title: 'Supermemory' },
+  { key: 'moss', label: 'MOS', name: 'Moss', capability: 'call index', title: 'Moss' },
+  { key: 'agentphone', label: 'PHO', name: 'AgentPhone', capability: 'calls', liveKey: 'calls', title: 'AgentPhone' },
+  { key: 'browserUse', label: 'BRO', name: 'Browser Use', capability: 'build session', liveKey: 'builds', title: 'Browser Use' },
+  { key: 'lovable', label: 'LOV', name: 'Lovable', capability: 'site build', liveKey: 'builds', title: 'Lovable build-with-URL' },
+  { key: 'agentmail', label: 'AML', name: 'AgentMail', capability: 'mail thread', liveKey: 'emails', title: 'AgentMail' },
+  { key: 'stripe', label: 'STR', name: 'Stripe', capability: 'invoice paid', liveKey: 'payments', title: 'Stripe invoices' }
 ];
+
+const EMPTY_BUILDER_INFO = {
+  leadId: null,
+  buildId: null,
+  runId: null,
+  status: 'not_started',
+  liveUrl: null,
+  projectUrl: null,
+  finalSiteUrl: null,
+  brief: null,
+  error: null,
+  progressLog: [],
+  timeline: []
+};
+
+function builderStatusForEvent(type) {
+  if (type === 'builder.start' || type === 'builder.live_url' || type === 'builder.progress' || type === 'builder.project_url') return 'running';
+  if (type === 'builder.done') return 'completed';
+  if (type === 'builder.blocked_auth') return 'blocked_auth';
+  if (type === 'builder.error') return 'failed';
+  return null;
+}
+
+function builderLabelForEvent(type) {
+  switch (type) {
+    case 'builder.start': return 'Build requested';
+    case 'builder.live_url': return 'Live preview ready';
+    case 'builder.progress': return 'Progress update';
+    case 'builder.project_url': return 'Final site URL found';
+    case 'builder.blocked_auth': return 'Lovable auth needed';
+    case 'builder.done': return 'Build completed';
+    case 'builder.error': return 'Build failed';
+    default: return type;
+  }
+}
+
+function builderEventItem(evt) {
+  const ts = evt.ts || Date.now();
+  const summary = evt.summary || evt.note || evt.error || evt.projectUrl || evt.liveUrl || '';
+  return {
+    id: `${evt.type}:${ts}:${evt.buildId || evt.runId || summary}`,
+    ts,
+    type: evt.type,
+    label: builderLabelForEvent(evt.type),
+    status: builderStatusForEvent(evt.type),
+    summary,
+    liveUrl: evt.liveUrl || null,
+    projectUrl: evt.projectUrl || null,
+    buildId: evt.buildId || null,
+    runId: evt.runId || null,
+    brief: evt.brief || null,
+    lovableUrl: evt.lovableUrl || null,
+    error: evt.error || null,
+    mock: !!evt.mock
+  };
+}
+
+function appendBuilderItem(list, item, limit = 24) {
+  const existing = list || [];
+  if (existing.some((row) => row.id === item.id)) return existing;
+  return [...existing, item].slice(-limit);
+}
+
+function mergeBuilderEvent(prev, evt) {
+  const item = builderEventItem(evt);
+  const leadId = evt.leadId || prev.leadId;
+  const base = evt.type === 'builder.start' || (leadId && prev.leadId !== leadId)
+    ? { ...EMPTY_BUILDER_INFO, leadId }
+    : { ...prev, leadId };
+  const timeline = appendBuilderItem(base.timeline, item, 40);
+  const shouldLog = ['builder.live_url', 'builder.progress', 'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error'].includes(evt.type);
+  const progressLog = shouldLog ? appendBuilderItem(base.progressLog, item, 18) : base.progressLog;
+
+  return {
+    ...base,
+    buildId: evt.buildId || base.buildId,
+    runId: evt.runId || base.runId,
+    status: builderStatusForEvent(evt.type) || base.status,
+    liveUrl: evt.liveUrl || base.liveUrl,
+    projectUrl: evt.projectUrl || base.projectUrl,
+    finalSiteUrl: evt.projectUrl || base.finalSiteUrl,
+    brief: evt.brief || base.brief,
+    error: evt.error || (evt.type === 'builder.start' ? null : base.error),
+    progressLog,
+    timeline
+  };
+}
 
 export default function App() {
   const [health, setHealth] = useState(null);
@@ -63,7 +151,8 @@ export default function App() {
   const [liveCallId, setLiveCallId] = useState(null);
   const [liveLeadId, setLiveLeadId] = useState(null);
   const [liveCallActive, setLiveCallActive] = useState(false);
-  const [builderInfo, setBuilderInfo] = useState({ leadId: null, liveUrl: null, projectUrl: null, brief: null });
+  const [builderInfo, setBuilderInfo] = useState(EMPTY_BUILDER_INFO);
+  const [builderAction, setBuilderAction] = useState({ leadId: null, running: false, error: null });
 
   const focusedRef = useRef(focusedLeadId);
   focusedRef.current = focusedLeadId;
@@ -213,27 +302,39 @@ export default function App() {
       refreshHealth();
       if (evt.leadId === focusedRef.current) refreshLeadDetail(evt.leadId);
     }
+    if (t === 'builder.start') {
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
+      if (evt.leadId === focusedRef.current) setActiveTab('Builder');
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+    }
     if (t === 'builder.live_url') {
-      setBuilderInfo({
-        leadId: evt.leadId,
-        liveUrl: evt.liveUrl,
-        projectUrl: null,
-        brief: evt.brief
-      });
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
       triggerEdge('builder-memory');
       if (evt.leadId === focusedRef.current) setActiveTab('Builder');
     }
+    if (t === 'builder.progress') {
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
+      triggerEdge('builder-memory');
+    }
     if (t === 'builder.project_url') {
-      setBuilderInfo((prev) => ({ ...prev, projectUrl: evt.projectUrl }));
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
       triggerEdge('builder-memory');
     }
     if (t === 'builder.blocked_auth' || t === 'builder.done' || t === 'builder.error') {
+      setBuilderInfo((prev) => mergeBuilderEvent(prev, evt));
+      if (t === 'builder.blocked_auth') setNodeStates((p) => ({ ...p, builder: 'blocked_auth' }));
       refreshLeadDetail(evt.leadId || focusedRef.current);
     }
     if (t === 'stripe.webhook') {
       bumpActivity('mailer');
       triggerEdge('mailer-memory');
       refreshLeadDetail(focusedRef.current);
+      refreshHealth();
+    }
+    if (t === 'agentmail.webhook') {
+      bumpActivity('mailer');
+      triggerEdge('mailer-memory');
+      refreshLeadDetail(evt.leadId || focusedRef.current);
       refreshHealth();
     }
   }, [bumpActivity, triggerEdge, refreshLeads, refreshLeadDetail, refreshHealth, liveLeadId]);
@@ -263,6 +364,30 @@ export default function App() {
     return out;
   }, [activity]);
 
+  const queueCounts = useMemo(() => {
+    const fallback = leads.reduce((acc, lead) => {
+      const outreachStatus = lead.outreach_status || 'not_queued';
+      const status = lead.status || 'discovered';
+      if (outreachStatus === 'queued' || outreachStatus === 'retry') acc.queued += 1;
+      if (outreachStatus === 'calling') acc.calling += 1;
+      if (outreachStatus === 'blocked') acc.blocked += 1;
+      if (status === 'awaiting_payment') acc.awaitingPayment += 1;
+      if (status === 'paid') acc.paid += 1;
+      if (status === 'shipped') acc.shipped += 1;
+      return acc;
+    }, { queued: 0, calling: 0, blocked: 0, awaitingPayment: 0, paid: 0, shipped: 0, repliesWaiting: 0 });
+    const q = outreach?.readiness?.outreach || health?.readiness?.outreach || health?.quotas || {};
+    return {
+      queued: q.queued ?? fallback.queued,
+      calling: q.calling ?? fallback.calling,
+      blocked: q.blocked ?? fallback.blocked,
+      awaitingPayment: q.awaitingPayment ?? fallback.awaitingPayment,
+      paid: q.paid ?? fallback.paid,
+      shipped: q.shipped ?? fallback.shipped,
+      repliesWaiting: q.repliesWaiting ?? fallback.repliesWaiting
+    };
+  }, [health, leads, outreach]);
+
   const handleNodeSelect = useCallback((nodeId) => {
     setFocusedNodeId(nodeId);
     const tab = NODE_TO_TAB[nodeId];
@@ -288,6 +413,26 @@ export default function App() {
     setOutreach(data);
     refreshHealth();
   }, [refreshHealth]);
+
+  const handleLeadChanged = useCallback((id) => {
+    refreshLeads();
+    refreshHealth();
+    refreshLeadDetail(id || focusedRef.current);
+  }, [refreshHealth, refreshLeadDetail, refreshLeads]);
+
+  const retryBuild = useCallback(async () => {
+    if (!focusedLeadId) return;
+    setBuilderAction({ leadId: focusedLeadId, running: true, error: null });
+    setBuilderInfo((prev) => mergeBuilderEvent(prev, { type: 'builder.start', leadId: focusedLeadId, ts: Date.now() }));
+    setActiveTab('Builder');
+    try {
+      await api.build(focusedLeadId);
+      handleLeadChanged(focusedLeadId);
+      setBuilderAction({ leadId: focusedLeadId, running: false, error: null });
+    } catch (e) {
+      setBuilderAction({ leadId: focusedLeadId, running: false, error: e.message });
+    }
+  }, [focusedLeadId, handleLeadChanged]);
 
   return (
     <div className="app">
@@ -321,6 +466,8 @@ export default function App() {
         </div>
       </header>
 
+      <SponsorStrip health={health} />
+
       <AutonomyStrip
         health={health}
         outreach={outreach}
@@ -349,8 +496,10 @@ export default function App() {
                 <div key={i} className="event-row">
                   <span className="event-ts">{new Date(e._ts).toLocaleTimeString()}</span>
                   <span className="event-type">{e.type}</span>
+                  {typeof e.mock === 'boolean' ? <span className={`event-mode event-mode-${e.mock ? 'mock' : 'live'}`}>{e.mock ? 'mock' : 'live'}</span> : null}
                   {e.providerType ? <span className="event-extra">· {e.providerType}</span> : null}
                   {e.businessName ? <span className="event-extra">· {e.businessName}</span> : null}
+                  {e.reason ? <span className="event-extra">· {e.reasonText || e.reason}</span> : null}
                   {e.outcome ? <span className="event-extra">· {e.outcome}</span> : null}
                   {e.error ? <span className="event-extra event-err">· {e.error}</span> : null}
                 </div>
@@ -361,8 +510,10 @@ export default function App() {
             <DiscoverForm />
             <LeadList
               leads={leads}
+              queueCounts={queueCounts}
               focusedLeadId={focusedLeadId}
               onFocus={handleLeadFocus}
+              onChanged={handleLeadChanged}
             />
           </div>
         </section>
@@ -377,6 +528,13 @@ export default function App() {
               liveCallId={liveCallId}
               liveCallActive={liveCallActive}
               builderInfo={builderInfo}
+              builderAction={builderAction}
+              health={health}
+              onRetryBuild={retryBuild}
+              outreach={outreach}
+              onStartAutonomy={startAutonomy}
+              onStopAutonomy={stopAutonomy}
+              onLeadChanged={handleLeadChanged}
             />
           </div>
         </section>
@@ -393,6 +551,88 @@ export default function App() {
   );
 }
 
+function SponsorStrip({ health }) {
+  const readiness = health?.readiness || {};
+  const providerReadiness = health?.providerReadiness || readiness.providers || {};
+  const blockers = health?.liveBlockers || readiness.blockers || [];
+  const mode = readiness.mode || health?.mode || 'init';
+  const ready = !!health && blockers.length === 0 && readiness.ready !== false;
+
+  return (
+    <section className="sponsor-strip">
+      <div className="sponsor-summary">
+        <span className="hd">sponsor proof</span>
+        <span className={`sponsor-mode sponsor-mode-${mode}`}>{mode}</span>
+        <span className={`sponsor-ready ${!health ? 'sponsor-ready-loading' : ready ? 'sponsor-ready-ok' : 'sponsor-ready-blocked'}`}>
+          {!health ? 'checking' : ready ? 'ready' : `${blockers.length} blocker${blockers.length === 1 ? '' : 's'}`}
+        </span>
+      </div>
+      <div className="sponsor-grid">
+        {PROVIDER_BADGES.map((provider) => {
+          const proof = sponsorProofFor(provider, health, providerReadiness[provider.key]);
+          return (
+            <div key={provider.key} className={`sponsor-card sponsor-card-${proof.tone}`} title={proof.title}>
+              <span className="sponsor-code mono">{provider.label}</span>
+              <span className="sponsor-name">{provider.name}</span>
+              <span className="sponsor-cap mono">{provider.capability}</span>
+              <span className={`sponsor-status sponsor-status-${proof.tone}`}>{proof.label}</span>
+            </div>
+          );
+        })}
+      </div>
+      {blockers.length ? (
+        <div className="sponsor-blockers">
+          {blockers.slice(0, 4).map((blocker) => (
+            <span key={blocker} className="sponsor-blocker mono">{blocker}</span>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function sponsorProofFor(provider, health, readiness) {
+  if (!health) {
+    return {
+      tone: 'dry',
+      label: 'checking',
+      title: `${provider.name} status is loading`
+    };
+  }
+  const configured = readiness?.configured ?? health?.providers?.[provider.key] ?? false;
+  const smoke = readiness?.smoke;
+  const mode = health?.mode || health?.readiness?.mode || 'mock';
+  const liveEnabled = provider.liveKey ? !!health?.live?.[provider.liveKey] : mode !== 'mock';
+  const smokeText = smoke?.status ? `smoke ${smoke.status}` : null;
+
+  if (!configured) {
+    return {
+      tone: readiness?.required ? 'missing' : 'dry',
+      label: readiness?.required ? 'missing' : 'optional',
+      title: readiness?.lastError || `${provider.name} is not configured`
+    };
+  }
+  if (mode === 'mock') {
+    return {
+      tone: 'mock',
+      label: smokeText || 'mock safe',
+      title: `${provider.name} configured; app is running in mock mode`
+    };
+  }
+  if (liveEnabled || smoke?.live) {
+    return {
+      tone: 'live',
+      label: smokeText || 'live enabled',
+      title: `${provider.name} is configured for live sponsor operation`
+    };
+  }
+  return {
+    tone: 'dry',
+    label: smokeText || 'configured',
+    title: `${provider.name} configured without live side effects`
+  };
+}
+
 function AutonomyStrip({ health, outreach, onStart, onStop }) {
   const readiness = outreach?.readiness || health?.readiness || {};
   const q = readiness.outreach || {};
@@ -407,14 +647,24 @@ function AutonomyStrip({ health, outreach, onStart, onStop }) {
         </span>
         <span className="auto-stat mono">mode {mode}</span>
         <span className="auto-stat mono">queue {q.queued ?? 0}</span>
+        <span className="auto-stat mono">calling {q.calling ?? 0}</span>
         <span className="auto-stat mono">blocked {q.blocked ?? 0}</span>
+        <span className="auto-stat mono">awaiting pay {q.awaitingPayment ?? 0}</span>
+        <span className="auto-stat mono">paid {q.paid ?? 0}</span>
+        <span className="auto-stat mono">shipped {q.shipped ?? 0}</span>
         <span className="auto-stat mono">calls today {q.todaysCalls ?? 0}</span>
         <span className="auto-stat mono">opt-outs {q.optOuts ?? 0}</span>
         <span className="auto-stat mono">mail replies {q.repliesWaiting ?? 0}</span>
       </div>
       <div className="auto-side">
         {active ? <span className="auto-active mono">active: {active.businessName}</span> : null}
-        {blockers.length ? <span className="auto-blocker mono">{blockers[0]}</span> : <span className="auto-ready mono">ready</span>}
+        {blockers.length ? (
+          <span className="auto-blockers" title={blockers.join('\n')}>
+            {blockers.slice(0, 3).map((blocker) => (
+              <span key={blocker} className="auto-blocker mono">{blocker}</span>
+            ))}
+          </span>
+        ) : <span className="auto-ready mono">ready</span>}
         <button className="btn btn-mini" onClick={outreach?.running ? onStop : onStart}>
           {outreach?.running ? 'pause' : 'start'}
         </button>

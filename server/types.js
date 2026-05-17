@@ -1,5 +1,43 @@
 import { z } from 'zod';
 
+export const ProfileFieldProvenance = z.object({
+  value: z.string().nullable(),
+  source: z.enum(['source_text', 'candidate', 'provided', 'model', 'mock', 'repair', 'none']),
+  sourceUrl: z.string().nullable(),
+  evidence: z.string().nullable()
+});
+
+export const ProfileProvenance = z.object({
+  profileSource: z.enum(['live_browser', 'gemini_mock', 'provided', 'memory_write', 'memory_repair', 'unknown']),
+  sourceUrl: z.string().nullable(),
+  yelpUrl: z.string().nullable(),
+  capturedAt: z.string().nullable(),
+  phone: ProfileFieldProvenance,
+  address: ProfileFieldProvenance
+});
+
+export const OnlinePresenceEvidence = z.object({
+  website: z.object({
+    found: z.boolean(),
+    url: z.string().nullable(),
+    evidence: z.array(z.string()).max(5)
+  }),
+  social: z.object({
+    found: z.boolean(),
+    platforms: z.array(z.string()).max(8),
+    urls: z.array(z.string()).max(8),
+    evidence: z.array(z.string()).max(5)
+  }),
+  listings: z.object({
+    found: z.boolean(),
+    platforms: z.array(z.string()).max(8),
+    urls: z.array(z.string()).max(8),
+    evidence: z.array(z.string()).max(5)
+  }),
+  gaps: z.array(z.string()).max(8),
+  positiveSignals: z.array(z.string()).max(8)
+});
+
 export const BusinessProfile = z.object({
   businessName: z.string(),
   phone: z.string().nullable(),
@@ -9,16 +47,36 @@ export const BusinessProfile = z.object({
   hasWebsite: z.boolean(),
   websiteUrl: z.string().nullable(),
   onlinePresenceStrength: z.enum(['none', 'weak', 'mixed', 'strong']),
+  presenceConfidence: z.number().optional(),
   onlinePresenceSummary: z.string(),
+  onlinePresenceEvidence: OnlinePresenceEvidence,
+  onlinePresenceReasons: z.array(z.string()).max(8),
+  onlinePresenceConfidence: z.number(),
+  notWorthCallingReason: z.string().nullable(),
+  callRecommendation: z.object({
+    shouldCall: z.boolean(),
+    notWorthCalling: z.boolean(),
+    whyCall: z.string().nullable(),
+    whyNotCall: z.string().nullable()
+  }).optional(),
   ownerHypothesis: z.string().nullable(),
   customerPersona: z.string().nullable(),
   hours: z.string().nullable(),
+  services: z.array(z.string()).max(8),
   whatTheyDo: z.string(),
   needs: z.array(z.string()).max(6),
   signals: z.array(z.string()).max(8),
   bestContactEmail: z.string().nullable(),
   yelpUrl: z.string().nullable(),
-  sourceUrl: z.string().nullable()
+  sourceUrl: z.string().nullable(),
+  sourceUrls: z.array(z.string()).max(10).optional(),
+  sourceProvenance: z.object({
+    phone: z.string().nullable(),
+    address: z.string().nullable(),
+    website: z.string().nullable(),
+    profile: z.string()
+  }).optional(),
+  provenance: ProfileProvenance
 });
 export const BusinessProfileSchema = jsonSchema(BusinessProfile);
 

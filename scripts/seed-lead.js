@@ -9,8 +9,8 @@ import { addDoc, containerTagFor } from '../server/memory.js';
 import { emit } from '../server/sse.js';
 import { queueLeadForOutreach } from '../server/outreach.js';
 
-const leadId = `lead_seed${Date.now().toString(36)}`;
-const containerTag = containerTagFor(leadId);
+const requestedLeadId = `lead_seed${Date.now().toString(36)}`;
+const requestedContainerTag = containerTagFor(requestedLeadId);
 
 const profile = {
   businessName: "Tony's North Beach Barbershop",
@@ -33,9 +33,9 @@ const profile = {
   sourceUrl: null
 };
 
-leads.insert({
-  id: leadId,
-  container_tag: containerTag,
+const insertResult = leads.insert({
+  id: requestedLeadId,
+  container_tag: requestedContainerTag,
   business_name: profile.businessName,
   phone: profile.phone,
   address: profile.address,
@@ -52,6 +52,10 @@ leads.insert({
   source_url: profile.sourceUrl || profile.yelpUrl || null
 });
 
+const lead = insertResult.lead;
+const leadId = lead.id;
+const containerTag = lead.container_tag;
+
 await addDoc(containerTag, 'profile', profile, {
   businessName: profile.businessName,
   niche: profile.niche,
@@ -60,10 +64,27 @@ await addDoc(containerTag, 'profile', profile, {
 
 const outreach = queueLeadForOutreach({ leadId, profile });
 
+if (insertResult.duplicate) {
+  emit('lead.duplicate', {
+    worker: 'scraper',
+    leadId,
+    attemptedLeadId: insertResult.attemptedId,
+    duplicateReasons: insertResult.duplicateReasons,
+    businessName: profile.businessName,
+    phone: profile.phone,
+    niche: profile.niche,
+    city: profile.city,
+    seeded: true
+  });
+}
+
 emit('lead.created', {
   worker: 'scraper',
   leadId,
   containerTag,
+  duplicate: insertResult.duplicate,
+  duplicateReasons: insertResult.duplicateReasons,
+  attemptedLeadId: insertResult.attemptedId,
   businessName: profile.businessName,
   phone: profile.phone,
   niche: profile.niche,

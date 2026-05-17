@@ -2,6 +2,152 @@
 
 You are taking over this repository. Read this entire document before you touch a file. Your job is **not** to incrementally patch the existing `Dial-to-Deploy` codebase — that codebase is a bloated mockup with 34 ceremonial "stages," fake artifact types, and dead abstractions. Your job is to **rebuild it from the ground up** into a small, working, end-to-end agentic service that places a real outbound call, sells a website, takes payment, builds the site, and delivers it — and does it in a way YC judges can see live on a screen.
 
+## Current Sponsor Demo Runbook
+
+This section is the operator-facing source for the current demo implementation. Use it when explaining the sponsor coverage to a YC judge: the app is a service agency, not an agent marketplace, and each sponsor has one visible job.
+
+### Judge-facing outcome
+
+The demo should make one loop obvious:
+
+`weak lead -> customer memory -> sales call -> post-call analysis -> AgentMail invoice thread -> Stripe paid event -> Browser Use drives Lovable build`
+
+The customer buys a website. The operator sees the agentic supply chain. The sponsors are not interchangeable adapters; they are deliberately different parts of the service.
+
+### Sponsor differences to say out loud
+
+- **Gemini / Google DeepMind:** the reasoning layer. It scores weak online presence, writes the pitch, extracts the confirmed invoice email, writes the post-mortem, drafts AgentMail replies, and creates the Lovable brief. It does not call, email, browse, remember, or charge.
+- **Supermemory:** the durable per-customer memory layer. It stores profile, pitch, call logs, mail thread context, build brief, and post-mortem documents under one `containerTag` per lead. It is not the in-call hot path.
+- **Moss:** the live-call retrieval layer. It indexes the per-business pitch and objection snippets so the voice turn can retrieve context quickly. It is not a web search product and not the durable store.
+- **Browser Use:** the browser operator. It researches leads and later opens/drives the Lovable flow. It is not the builder; it is the controlled browser doing the work.
+- **Lovable:** the customer-visible website builder. Browser Use launches Lovable and surfaces a `liveUrl` so the customer and judge can watch the site build.
+- **AgentPhone:** the outbound voice layer. It places calls and provides transcript data. The app still owns allow-lists, recording disclosure, quiet hours, DNC, and opt-out behavior.
+- **AgentMail:** the post-call customer thread. It sends the invoice recap and meeting handoff, then keeps replies/questions attached to the lead.
+- **Stripe:** the payment state. It creates hosted invoices and turns `invoice.paid` into the builder trigger.
+
+### Exact npm scripts
+
+The current `package.json` exposes these commands:
+
+```sh
+npm run dev              # local Express API plus Vite operator console
+npm run server           # Express API only
+npm run demo:e2e         # full mocked lifecycle with API/static verification
+npm run build            # Vite production build
+npm run start            # NODE_ENV=production server entrypoint
+npm run check            # node --check over server/ and scripts/
+npm run check:presence   # online-presence scoring regression check
+npm run check:dedupe     # lead dedupe/history regression check
+npm run check:autonomy   # outreach/compliance/payment recovery regression check
+npm run smoke:providers  # provider readiness and opt-in live smoke checks
+```
+
+The fastest judge-safe proof is:
+
+```sh
+npm run demo:e2e -- --data-dir .data/demo --reset-demo-data
+DATA_DIR=.data/demo npm run dev
+```
+
+Useful mock-demo variants:
+
+```sh
+npm run demo:e2e
+npm run demo:e2e -- --no-build
+npm run demo:e2e -- --no-verify-ui
+npm run demo:e2e -- --allow-live-env --verbose
+```
+
+Important: `npm run demo:e2e` forces `RUN_MODE=mock`, blanks provider keys inside the demo process, and disables live calls, emails, payments, builds, and autonomous outreach. `--allow-live-env` preserves env vars for verification reads; it does not turn the seeded lifecycle into a live provider run.
+
+### Live env toggles
+
+Default local posture:
+
+```sh
+RUN_MODE=mock
+LIVE_CALLS=false
+LIVE_EMAILS=false
+LIVE_PAYMENTS=false
+LIVE_BUILDS=false
+AUTONOMOUS_OUTREACH_ENABLED=false
+```
+
+Owned-target live demo posture:
+
+```sh
+RUN_MODE=demo_live
+ALLOWED_TARGET_PHONES=+15555550100
+ALLOWED_TARGET_EMAILS=operator@example.com
+LIVE_CALLS=true
+LIVE_EMAILS=true
+LIVE_PAYMENTS=true
+LIVE_BUILDS=true
+```
+
+Autonomous outreach posture, for controlled experiments only:
+
+```sh
+RUN_MODE=autonomous_live
+AUTONOMOUS_OUTREACH_ENABLED=true
+OUTREACH_INTERVAL_MS=15000
+OUTREACH_BATCH_SIZE=1
+MAX_ATTEMPTS_PER_PHONE=1
+QUIET_HOURS_START=20
+QUIET_HOURS_END=9
+OUTREACH_TIMEZONE=America/Los_Angeles
+```
+
+Provider configuration env:
+
+```sh
+GEMINI_API_KEY=
+GEMINI_MODEL_PRO=gemini-3.1-pro-preview
+GEMINI_MODEL_FLASH=gemini-3-flash-preview
+SUPERMEMORY_API_KEY=
+MOSS_PROJECT_ID=
+MOSS_PROJECT_KEY=
+MOSS_BASE_URL=https://service.usemoss.dev/v1
+BROWSER_USE_API_KEY=
+BROWSER_USE_BASE_URL=https://api.browser-use.com/api/v3
+AGENTPHONE_API_KEY=
+AGENTPHONE_BASE_URL=https://api.agentphone.ai/v1
+AGENTPHONE_AGENT_ID=
+AGENTPHONE_DEFAULT_VOICE=Polly.Joanna
+AGENTPHONE_WEBHOOK_SECRET=
+AGENTPHONE_FROM_NUMBER=
+AGENTMAIL_API_KEY=
+AGENTMAIL_INBOX_ID=
+AGENTMAIL_DISPLAY_NAME=callmemaybe
+AGENTMAIL_WEBHOOK_SECRET=
+STRIPE_SECRET_KEY=
+STRIPE_PUBLISHABLE_KEY=
+STRIPE_WEBHOOK_SECRET=
+STRIPE_PRICE_USD_CENTS=50000
+STRIPE_PRODUCT_NAME="Website by callmemaybe"
+STRIPE_SUCCESS_URL=http://localhost:8787/success
+STRIPE_CANCEL_URL=http://localhost:8787/cancel
+```
+
+Lovable has no direct `LOVABLE_*` env in this repo. Live Lovable work happens through Browser Use and an authenticated Lovable browser session.
+
+### Provider smoke commands
+
+`npm run smoke:providers` is dry by default. Turn on one provider smoke at a time when you intend side effects:
+
+```sh
+npm run smoke:providers
+SMOKE_GEMINI=true npm run smoke:providers
+SMOKE_SUPERMEMORY_WRITE=true npm run smoke:providers
+SMOKE_MOSS_INDEX=true npm run smoke:providers
+SMOKE_BROWSER_USE=true npm run smoke:providers
+SMOKE_AGENTMAIL_SEND=true SMOKE_TEST_EMAIL=operator@example.com npm run smoke:providers
+SMOKE_STRIPE_INVOICE=true SMOKE_TEST_EMAIL=operator@example.com SMOKE_STRIPE_PRICE_CENTS=100 npm run smoke:providers
+SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+15555550100 npm run smoke:providers
+```
+
+For a live judge/operator dry-run, run the mocked demo first, then run exactly one live smoke for the sponsor you want to prove. Do not jump straight to `autonomous_live`.
+
 You have explicit authority to **delete anything in this repo that does not serve the mission below**. Do not preserve code "just in case." Do not keep abstractions you have not personally re-derived from the new requirements. If a file is not on the keep-list at the end of this document, it is a deletion candidate and you should justify *keeping* it, not deleting it.
 
 ---
