@@ -19,8 +19,18 @@ export const env = {
   allowedPhones: list(process.env.ALLOWED_TARGET_PHONES),
   allowedEmails: list(process.env.ALLOWED_TARGET_EMAILS),
 
+  hackathon: {
+    name: process.env.HACKATHON_NAME || 'Call My Agent Hackathon',
+    date: process.env.HACKATHON_DATE || '2026-05-17',
+    location: process.env.HACKATHON_LOCATION || 'Y Combinator, San Francisco',
+    url: process.env.HACKATHON_URL || 'https://events.ycombinator.com/CallMyAgentHackathon',
+    sponsors: list(process.env.HACKATHON_SPONSORS)
+  },
+
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
+    projectName: process.env.GEMINI_PROJECT_NAME || '',
+    projectNumber: process.env.GEMINI_PROJECT_NUMBER || '',
     modelPro: process.env.GEMINI_MODEL_PRO || 'gemini-3.1-pro-preview',
     modelFlash: process.env.GEMINI_MODEL_FLASH || 'gemini-3-flash-preview'
   },
@@ -52,12 +62,15 @@ export const env = {
   agentmail: {
     apiKey: process.env.AGENTMAIL_API_KEY || '',
     inboxId: process.env.AGENTMAIL_INBOX_ID || '',
-    displayName: process.env.AGENTMAIL_DISPLAY_NAME || 'callmemaybe'
+    displayName: process.env.AGENTMAIL_DISPLAY_NAME || 'callmemaybe',
+    webhookSecret: process.env.AGENTMAIL_WEBHOOK_SECRET || ''
   },
 
   stripe: {
     secretKey: process.env.STRIPE_SECRET_KEY || '',
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    startupBenefitsUrl: process.env.STRIPE_STARTUP_BENEFITS_URL || '',
     priceCents: Number(process.env.STRIPE_PRICE_USD_CENTS || 50000),
     productName: process.env.STRIPE_PRODUCT_NAME || 'Website by callmemaybe',
     successUrl: process.env.STRIPE_SUCCESS_URL || 'http://localhost:8787/success',

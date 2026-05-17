@@ -1,0 +1,37 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+
+# local data
+.data/
+*.db
+*.db-shm
+*.db-wal
+
+# environment + secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# test artifacts
+.playwright-mcp/
+callan-step*.png

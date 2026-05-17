@@ -47,7 +47,8 @@ app.get('/api/health', (_req, res) => {
       browserUse: !!env.browserUse.apiKey,
       agentmail: !!env.agentmail.apiKey,
       stripe: !!env.stripe.secretKey
-    }
+    },
+    hackathon: env.hackathon
   });
 });
 
