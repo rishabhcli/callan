@@ -158,11 +158,21 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
   // Mark BEFORE the await so concurrent transcript events don't double-fire.
   sentByCallId.add(callRow.id);
 
-  // Email-callback calls get a TRANSCRIPT-AWARE invoice instead of the generic
-  // callmemaybe follow-up body. Gemini extracts business name / what they sell /
-  // location / call recap from the actual conversation and weaves them into a
-  // proper invoice email with a real Stripe link.
-  if (callRow.decision_reason === 'agentphone_email_callback') {
+  // Decide whether to send a CONTEXTUAL invoice (Stripe checkout + meeting
+  // invite + Gemini recap) vs the generic callmemaybe follow-up body.
+  //   - Email-callback calls always use the contextual invoice (the whole
+  //     point of the callback was to send an invoice).
+  //   - Inbound calls use the contextual invoice WHEN the caller mentioned
+  //     "invoice", "the $500", or an explicit ask for the build (vs a vague
+  //     "send me info"). This is the bug the previous Floral Beauties call
+  //     hit — caller asked for the invoice, we sent the generic followup.
+  const transcriptText = (Array.isArray(transcript) ? transcript : [])
+    .map((t) => (t && typeof t.text === 'string' ? t.text : ''))
+    .join(' ');
+  const wantsInvoice = /\b(invoice|the\s+\$?500|the\s+five[\s-]?hundred|the\s+build|the\s+website\s+build|the\s+deal|the\s+offer)\b/i.test(transcriptText);
+  const useContextualInvoice = callRow.decision_reason === 'agentphone_email_callback' || wantsInvoice;
+
+  if (useContextualInvoice) {
     try {
       const result = await sendCallbackInvoiceEmail({
         recipient: email,
@@ -172,7 +182,8 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
       });
       log.info('callback.invoice.sent', {
         callId: callRow.id, toEmail: email,
-        businessName: result?.context?.businessName || null
+        businessName: result?.context?.businessName || null,
+        path: callRow.decision_reason === 'agentphone_email_callback' ? 'email_callback' : 'inbound_invoice_intent'
       });
       return { email, ...result };
     } catch (err) {

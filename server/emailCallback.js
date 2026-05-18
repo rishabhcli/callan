@@ -372,16 +372,22 @@ export async function extractInvoiceContextFromTranscript({ transcript, leadId =
     .map((t) => `${t.role === 'agent' ? 'Callan' : 'Caller'}: ${t.text}`)
     .join('\n');
   const prompt = [
-    `You are Callan, callmemaybe's voice operator. You just got off the call below with a small-business owner and you are writing the invoice follow-up email.`,
+    `You are Callan, callmemaybe's voice operator. You just got off the call below with a small-business owner and you are writing the invoice follow-up email. The owner wants to see RICH detail in the email — not a 3-bullet summary. Pull every concrete fact the caller actually said.`,
     ``,
     `Extract the following from the transcript (if not mentioned, use null):`,
     `- businessName: the business name they confirmed`,
-    `- whatTheySell: a short phrase, what the business sells/does`,
+    `- ownerFirstName: the owner's first name if they introduced themselves`,
+    `- whatTheySell: a short phrase, what the business sells/does (be specific — products, sourcing, niche)`,
     `- city: city or neighborhood mentioned`,
     `- address: street address if confirmed`,
     `- displayPhone: phone number they want shown on the site, in pretty (415) 555-1212 format`,
     `- visitorAction: the single next-action the site is built around (book / call / get a quote / shop / order / etc.)`,
-    `- recapBullets: array of THREE short strings (~14 words each), each a specific thing that was discussed or agreed to. Reference real moments — what they said, what you agreed, the price, the timing. Do NOT invent.`,
+    `- meetingTime: any specific meeting day & time the caller agreed to ("Tuesday at 2 PM", "tomorrow 10am"), as a short string. Null if no time was locked.`,
+    `- discussionPoints: array of 5–7 short bullets (~18 words each) of SPECIFIC things actually discussed on the call. Cover: who they are + what they sell, their current channels / gaps, the offer (price, scope, timing), any pain points, any commitments made by either side, and what they emphasized. Quote phrasing where helpful. Do NOT invent — only what was said.`,
+    `- meetingAgenda: array of 3–5 short bullets of what to cover at the upcoming meeting (based on what they said they want). Concrete: "walk through wedding deposit form", "review draft of hero section", etc. Null if no meeting agenda is implied.`,
+    `- callerQuote: ONE direct, short quote from the caller that captures the spirit of why they want this site (≤ 20 words, exact words from transcript). Null if no quote is strong enough.`,
+    `- nextSteps: array of 2–3 short bullets describing what happens after they pay (e.g., "Stripe checkout → build kicks off → live link in your inbox within minutes").`,
+    `- recapBullets: array of THREE short strings (~14 words each) — the 3 most important moments. (Backwards-compat with old email template.)`,
     ``,
     `Return ONLY a JSON object with those keys. No prose, no markdown fences.`,
     ``,
@@ -421,52 +427,81 @@ export function buildCallbackInvoiceEmail({ recipient, context, stripeUrl }) {
     timeZone: 'America/Los_Angeles', timeZoneName: 'short'
   });
   const business = context?.businessName?.trim();
+  const ownerFirst = context?.ownerFirstName?.trim();
   const what = context?.whatTheySell?.trim();
   const city = context?.city?.trim();
   const addr = context?.address?.trim();
   const displayPhone = context?.displayPhone?.trim();
   const action = context?.visitorAction?.trim();
-  const bullets = Array.isArray(context?.recapBullets) && context.recapBullets.length
-    ? context.recapBullets.filter((b) => typeof b === 'string' && b.trim()).slice(0, 4)
+  const callerQuote = context?.callerQuote?.trim();
+  const callerMeetingTime = context?.meetingTime?.trim();
+  const finalMeetingTime = callerMeetingTime || meetingTime; // prefer what they actually agreed to on the call
+
+  const discussionPoints = Array.isArray(context?.discussionPoints) && context.discussionPoints.length
+    ? context.discussionPoints.filter((b) => typeof b === 'string' && b.trim()).slice(0, 7)
+    : (Array.isArray(context?.recapBullets) ? context.recapBullets.filter((b) => typeof b === 'string' && b.trim()).slice(0, 5) : []);
+  const meetingAgenda = Array.isArray(context?.meetingAgenda) && context.meetingAgenda.length
+    ? context.meetingAgenda.filter((b) => typeof b === 'string' && b.trim()).slice(0, 5)
     : [];
+  const nextSteps = Array.isArray(context?.nextSteps) && context.nextSteps.length
+    ? context.nextSteps.filter((b) => typeof b === 'string' && b.trim()).slice(0, 3)
+    : [
+        'Pay the $500 Stripe Checkout below.',
+        'Build kicks off the moment payment clears — you\'ll get a live Browser Use link to watch.',
+        'Walkthrough call locked at the time below — reply to confirm.'
+      ];
 
   const lineItem = business
     ? `One-page custom site for ${business}${what ? ` (${what})` : ''}`
     : 'One-page custom callmemaybe website';
   const subject = business
-    ? `${business} — your callmemaybe invoice ($500)`
-    : 'Your callmemaybe invoice — $500';
+    ? `${business} — your callmemaybe invoice ($500) + meeting notes`
+    : 'Your callmemaybe invoice — $500 + meeting notes';
 
+  const greetName = ownerFirst || business || 'Hey';
   const intro = business
-    ? `Good chat just now. Here's the invoice for ${business}'s same-day site.`
-    : `Following up on our call. Here's the invoice we just walked through.`;
+    ? `Good chat just now${ownerFirst ? `, ${ownerFirst}` : ''}. Below is the full recap from our call, your invoice, and what we'll cover at ${finalMeetingTime}.`
+    : `Following up on our call. Below is the full recap, your invoice, and what we'll cover at ${finalMeetingTime}.`;
 
   const detailLines = [
     business ? `Business: ${business}` : null,
+    ownerFirst ? `Owner: ${ownerFirst}` : null,
     what ? `What you sell: ${what}` : null,
     action ? `Site focused on: ${action}` : null,
-    displayPhone ? `Phone to display: ${displayPhone}` : null,
-    [addr, city].filter(Boolean).join(', ') || null
+    displayPhone ? `Phone to display on the site: ${displayPhone}` : null,
+    [addr, city].filter(Boolean).join(', ') || null,
+    finalMeetingTime ? `Walkthrough meeting: ${finalMeetingTime}` : null
   ].filter(Boolean);
   const detailsBlock = detailLines.length ? detailLines.map((l) => `  • ${l}`).join('\n') : '';
 
-  const recapBlock = bullets.length
-    ? '\nFrom the call:\n' + bullets.map((b) => `  • ${b.replace(/^\s*[•\-·]\s*/, '').trim()}`).join('\n') + '\n'
+  const discussionBlock = discussionPoints.length
+    ? '\nWhat we discussed on the call:\n' + discussionPoints.map((b) => `  • ${b.replace(/^\s*[•\-·]\s*/, '').trim()}`).join('\n') + '\n'
+    : '';
+  const agendaBlock = meetingAgenda.length
+    ? `\nMeeting agenda — ${finalMeetingTime}:\n` + meetingAgenda.map((b) => `  • ${b.replace(/^\s*[•\-·]\s*/, '').trim()}`).join('\n') + '\n'
+    : '';
+  const quoteBlock = callerQuote
+    ? `\nYou said: "${callerQuote.replace(/^"|"$/g, '')}"\nThat's what we're building toward.\n`
+    : '';
+  const nextStepsBlock = nextSteps.length
+    ? '\nNext steps after you pay:\n' + nextSteps.map((b) => `  ${nextSteps.indexOf(b) + 1}. ${b.replace(/^\s*[•\-·\d.]\s*/, '').trim()}`).join('\n') + '\n'
     : '';
 
   const text = [
-    business ? `${business} —` : 'Hey —',
+    business ? `${greetName} —` : 'Hey —',
     '',
     intro,
     '',
     detailsBlock || null,
     detailsBlock ? '' : null,
-    recapBlock || null,
+    discussionBlock || null,
+    quoteBlock || null,
+    agendaBlock || null,
     `${lineItem} — $500 flat. Mobile-first. Stripe Checkout wired up. Built same day. If we don't ship, the call doesn't bill — risk's on me.`,
     '',
     `Pay $500 on Stripe → ${checkoutUrl}`,
-    `Walkthrough I held: ${meetingTime} (invite attached).`,
-    '',
+    `Walkthrough invite attached for ${finalMeetingTime}.`,
+    nextStepsBlock || null,
     `Reply with anything you want changed on the brief and I'll fold it in before the build kicks off.`,
     '',
     `— Callan`,
@@ -474,18 +509,29 @@ export function buildCallbackInvoiceEmail({ recipient, context, stripeUrl }) {
   ].filter((l) => l !== null).join('\n');
 
   const detailsHtml = detailLines.length
-    ? `<table style="width:100%;border-collapse:collapse;margin:0 0 14px;font-size:13.5px;color:#444">${detailLines.map((l) => `<tr><td style="padding:3px 0">${escapeHtml(l)}</td></tr>`).join('')}</table>`
+    ? `<table style="width:100%;border-collapse:collapse;margin:0 0 18px;font-size:13.5px;color:#444">${detailLines.map((l) => `<tr><td style="padding:4px 0">${escapeHtml(l)}</td></tr>`).join('')}</table>`
     : '';
-  const recapHtml = bullets.length
-    ? `<p style="margin:0 0 6px;font-size:13.5px;color:#444"><strong>From the call:</strong></p><ul style="padding-left:20px;margin:0 0 18px;font-size:13.5px;color:#444">${bullets.map((b) => `<li style="margin:4px 0;line-height:1.5">${escapeHtml(b.replace(/^\s*[•\-·]\s*/, '').trim())}</li>`).join('')}</ul>`
+  const discussionHtml = discussionPoints.length
+    ? `<p style="margin:0 0 6px;font-size:14px;color:#1a1a1a"><strong>What we discussed on the call:</strong></p><ul style="padding-left:20px;margin:0 0 18px;font-size:13.5px;color:#444">${discussionPoints.map((b) => `<li style="margin:5px 0;line-height:1.5">${escapeHtml(b.replace(/^\s*[•\-·]\s*/, '').trim())}</li>`).join('')}</ul>`
+    : '';
+  const quoteHtml = callerQuote
+    ? `<blockquote style="margin:0 0 18px;padding:10px 14px;background:#FBF4E0;border-left:3px solid #D8973C;border-radius:4px;font-size:14px;font-style:italic;color:#5a3a14">"${escapeHtml(callerQuote.replace(/^"|"$/g, ''))}" — that's what we're building toward.</blockquote>`
+    : '';
+  const agendaHtml = meetingAgenda.length
+    ? `<p style="margin:0 0 6px;font-size:14px;color:#1a1a1a"><strong>Meeting agenda — ${escapeHtml(finalMeetingTime)}:</strong></p><ul style="padding-left:20px;margin:0 0 18px;font-size:13.5px;color:#444">${meetingAgenda.map((b) => `<li style="margin:5px 0;line-height:1.5">${escapeHtml(b.replace(/^\s*[•\-·]\s*/, '').trim())}</li>`).join('')}</ul>`
+    : '';
+  const nextStepsHtml = nextSteps.length
+    ? `<p style="margin:0 0 6px;font-size:14px;color:#1a1a1a"><strong>Next steps after you pay:</strong></p><ol style="padding-left:20px;margin:0 0 18px;font-size:13.5px;color:#444">${nextSteps.map((b) => `<li style="margin:5px 0;line-height:1.5">${escapeHtml(b.replace(/^\s*[•\-·\d.]\s*/, '').trim())}</li>`).join('')}</ol>`
     : '';
 
   const html = [
-    '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:560px;color:#1a1a1a;line-height:1.55">',
-    `<p style="margin:0 0 14px"><strong>${escapeHtml(business || 'Hey')}</strong> —</p>`,
+    '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:580px;color:#1a1a1a;line-height:1.55">',
+    `<p style="margin:0 0 14px"><strong>${escapeHtml(greetName)}</strong> —</p>`,
     `<p style="margin:0 0 14px">${escapeHtml(intro)}</p>`,
     detailsHtml,
-    recapHtml,
+    discussionHtml,
+    quoteHtml,
+    agendaHtml,
     '<table style="width:100%;border-collapse:collapse;margin:0 0 18px;font-size:14px">',
     `<tr><td style="padding:10px 0;border-bottom:1px solid #eee">${escapeHtml(lineItem)}</td><td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right"><strong>$500</strong></td></tr>`,
     '<tr><td style="padding:10px 0"><em>Mobile-first · Stripe Checkout · same-day build · refund if we don\'t ship</em></td><td></td></tr>',
@@ -493,7 +539,8 @@ export function buildCallbackInvoiceEmail({ recipient, context, stripeUrl }) {
     '</table>',
     `<p style="margin:0 0 18px"><a href="${escapeHtml(checkoutUrl)}" style="display:inline-block;padding:11px 20px;background:#AD2831;color:#F3E6BD;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">Pay $500 on Stripe → start the build</a></p>`,
     `<p style="margin:0 0 6px;color:#666;font-size:13px">Direct link: <a href="${escapeHtml(checkoutUrl)}" style="color:#AD2831">${escapeHtml(checkoutUrl)}</a></p>`,
-    `<p style="margin:14px 0">Walkthrough I held: <strong>${escapeHtml(meetingTime)}</strong> — invite attached.</p>`,
+    `<p style="margin:14px 0">Walkthrough invite attached for <strong>${escapeHtml(finalMeetingTime)}</strong>.</p>`,
+    nextStepsHtml,
     '<p style="margin:18px 0 0;padding:12px 14px;background:#FBF4E0;border-left:3px solid #D8973C;border-radius:4px;font-size:14px">Reply with anything you want changed on the brief and I\'ll fold it in before the build kicks off.</p>',
     '<p style="margin:22px 0 0">— Callan<br/><span style="color:#666;font-size:13px">callmemaybe · voice operator · reply to this thread anytime</span></p>',
     '</div>'
@@ -543,15 +590,30 @@ export async function sendCallbackInvoiceEmail({ recipient, transcript, stripeUr
   // off when this customer pays. Replaces the old static Payment Link path
   // (which had no lead linkage and silently broke the post-payment flow).
   let checkoutUrl = stripeUrl || null;
-  if (!checkoutUrl && leadId) {
-    checkoutUrl = await mintCheckoutSession({ leadId, callId, recipient, context }).catch((err) => {
-      log.warn('email_callback.checkout_mint_failed', { callId, leadId, error: err?.message || String(err) });
-      return null;
-    });
+  if (!checkoutUrl) {
+    // Resolve a usable leadId: caller-supplied, or fall back to the call row's
+    // lead_id. Operator-driven backfills sometimes forget to pass it; we don't
+    // want to silently ship the placeholder URL.
+    let resolvedLeadId = leadId;
+    if (!resolvedLeadId && callId) {
+      try {
+        const { db } = await import('./db.js');
+        const row = db.prepare('SELECT lead_id FROM calls WHERE provider_call_id = ? OR id = ? ORDER BY started_at DESC LIMIT 1').get(callId, callId);
+        if (row?.lead_id) resolvedLeadId = row.lead_id;
+      } catch { /* ignore — fall through */ }
+    }
+    if (resolvedLeadId) {
+      checkoutUrl = await mintCheckoutSession({ leadId: resolvedLeadId, callId, recipient, context }).catch((err) => {
+        log.warn('email_callback.checkout_mint_failed', { callId, leadId: resolvedLeadId, error: err?.message || String(err) });
+        return null;
+      });
+    } else {
+      log.warn('email_callback.no_lead_for_checkout', { callId, recipient, hint: 'pass leadId or use a callId tied to a calls row' });
+    }
   }
   if (!checkoutUrl) {
-    // Fallback only — should be rare. Lets the email still go out with a
-    // generic placeholder rather than failing the whole send.
+    // Last-resort fallback. Should be unreachable in normal operation.
+    log.warn('email_callback.using_placeholder_checkout_url', { callId, recipient });
     checkoutUrl = 'https://buy.callmemaybe.dev/website-500';
   }
 

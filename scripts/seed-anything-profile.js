@@ -24,7 +24,6 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { BrowserUse } from 'browser-use-sdk/v3';
 
@@ -90,8 +89,45 @@ async function main() {
   console.log('  3) Approve the MFA prompt on your iPhone / trusted device.');
   console.log('  4) Wait until you see the anything.com dashboard.');
   console.log('');
-  console.log('  Then come back here and press Enter to lock in the profile.');
-  await waitForEnter();
+  console.log('  This script will auto-detect success and finish on its own.');
+  console.log('  Polling Browser Use for DASHBOARD_REACHED…');
+
+  const TIMEOUT_MS = 12 * 60 * 1000; // 12 minutes — enough for Apple MFA fumbling
+  const POLL_MS = 5000;
+  const started = Date.now();
+  let dashboardReached = false;
+  while (Date.now() - started < TIMEOUT_MS) {
+    await sleep(POLL_MS);
+    let snapshot;
+    try {
+      snapshot = await client.sessions.get(sessionId);
+    } catch (err) {
+      console.warn('  poll failed:', err?.message || String(err));
+      continue;
+    }
+    const status = snapshot?.status || snapshot?.agentStatus || snapshot?.session?.status || '';
+    const haystack = JSON.stringify(snapshot || '');
+    if (/\bDASHBOARD_REACHED\b/.test(haystack)) {
+      dashboardReached = true;
+      console.log(`  ✓ agent reported DASHBOARD_REACHED — Apple session is live`);
+      break;
+    }
+    if (['completed', 'finished', 'done', 'stopped', 'failed'].includes(String(status).toLowerCase())) {
+      console.log(`  session reached terminal status="${status}" without DASHBOARD_REACHED — checking final output…`);
+      const finalText = JSON.stringify(snapshot?.output || snapshot?.result || snapshot || '');
+      if (/\bDASHBOARD_REACHED\b/.test(finalText)) {
+        dashboardReached = true;
+      }
+      break;
+    }
+    const elapsedSec = Math.round((Date.now() - started) / 1000);
+    process.stdout.write(`  waiting… ${elapsedSec}s\r`);
+  }
+  console.log('');
+  if (!dashboardReached) {
+    console.warn('  ⚠ timed out waiting for DASHBOARD_REACHED. Profile cookies may still be saved');
+    console.warn('    if you actually signed in — running the smoke test next is the truth check.');
+  }
 
   banner('STEP 4: persist profile (stop session, cookies auto-save)');
   try {
@@ -113,12 +149,7 @@ async function main() {
   console.log('reuse the Apple session cookie, and skip the MFA prompt entirely.');
 }
 
-function waitForEnter() {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question('  → press Enter when signed in: ', () => { rl.close(); resolve(); });
-  });
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function updateEnvKey(key, value) {
   const safeValue = String(value);
