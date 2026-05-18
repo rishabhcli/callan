@@ -1,4 +1,4 @@
-# callmemaybe
+# callan
 
 Agentic cold-calling web agency demo for YC judges and operators. The customer sees a service business: we find a weak-presence local business, call it, sell a website, invoice it, and start the build. The agent stack is internal; the operator console makes each step visible.
 
