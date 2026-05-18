@@ -816,6 +816,39 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req
   res.json(result);
 });
 
+// --- per-customer share link (browser-use live preview) ---
+// Token is the opaque lead.id (already unguessable in this demo). When we move
+// to multi-tenant production, replace this with a signed JWT carrying lead+build+exp.
+app.get('/api/share/build/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+  const lead = leads.get(token);
+  if (!lead) return res.status(404).json({ error: 'not found' });
+  const buildRows = builds.listByLead(lead.id) || [];
+  const latest = buildRows[0] || null;
+  const builderEvents = eventStore.listByLead(lead.id, { worker: 'builder', limit: 60 });
+  res.json({
+    business: {
+      name: lead.business_name || null,
+      niche: lead.niche || null,
+      city: lead.city || null
+    },
+    build: latest ? {
+      id: latest.id,
+      status: latest.status,
+      sessionId: latest.browser_session_id || null,
+      liveUrl: latest.live_url || null,
+      projectUrl: latest.project_url || null,
+      updatedAt: latest.updated_at || null
+    } : null,
+    timeline: builderEvents.map((e) => ({
+      ts: e.ts || e.created_at,
+      type: e.type || e.event_type,
+      summary: e.summary || e.note || null
+    }))
+  });
+});
+
 app.use(express.static('dist'));
 app.get('*', (_req, res) => {
   res.sendFile(`${process.cwd()}/dist/index.html`, (err) => {

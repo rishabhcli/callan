@@ -160,6 +160,31 @@ export async function getAgentPhoneAgent(agentId, { config = env.agentphone } = 
   });
 }
 
+export async function updateAgentPhoneAgent(agentId, patch = {}, { config = env.agentphone } = {}) {
+  requireAgentPhone(config);
+  if (!agentId) throw new Error('updateAgentPhoneAgent requires agentId');
+  const allowedKeys = [
+    'name', 'description', 'voiceMode', 'enableMessaging', 'modelTier',
+    'systemPrompt', 'beginMessage', 'voice', 'transferNumber',
+    'voicemailMessage', 'sttMode', 'ambientSound', 'denoisingMode', 'maxSilenceMs'
+  ];
+  const body = {};
+  for (const key of allowedKeys) {
+    if (patch[key] !== undefined) body[key] = patch[key];
+  }
+  const result = await agentPhoneJson('updateAgent', `/agents/${encodeURIComponent(agentId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body)
+  }, {
+    config,
+    timeoutMs: 15000,
+    retries: 1
+  });
+  // bust agent cache so the next outbound call refetches the new prompt
+  _agentCache.clear();
+  return result;
+}
+
 export async function placeAgentPhoneCall({
   agentId,
   toNumber,

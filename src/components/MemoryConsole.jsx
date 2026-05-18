@@ -188,25 +188,17 @@ export default function MemoryConsole({ leadId }) {
   const totals = observability?.totals || {};
 
   return (
-    <section className="memory-console">
-      <div className="research-panel">
-        <div className="research-head">
-          <div>
-            <div className="hd">memory observability</div>
-            <div className="research-title">
-              {totals.documents || 0} docs · {totals.searches || 0} searches · {totals.unresolvedFailures || 0} unresolved failures
-            </div>
-          </div>
-          <button className="btn btn-mini" onClick={refresh} disabled={busy === 'refresh'}>refresh</button>
-        </div>
-        <div className="research-grid">
-          <Metric label="provider" value={observability?.provider?.mode || 'checking'} />
-          <Metric label="isolation ok" value={`${totals.isolation?.ok || 0}/${totals.isolation?.total || 0}`} />
-          <Metric label="write queue" value={queueSummary(totals.queue)} />
-          <Metric label="retryable" value={totals.retryableFailures || 0} />
-        </div>
-        {error ? <div className="research-stop"><div className="research-stop-title">memory error</div><div className="research-stop-copy">{error}</div></div> : null}
+    <section className="memory-console memory-console-overhaul">
+      <div className="memory-obs-strip mono">
+        <span><span className="memory-obs-key">provider</span> <span className="memory-obs-val">{observability?.provider?.mode || 'checking'}</span></span>
+        <span><span className="memory-obs-key">docs</span> <span className="memory-obs-val">{totals.documents || 0}</span></span>
+        <span><span className="memory-obs-key">searches</span> <span className="memory-obs-val">{totals.searches || 0}</span></span>
+        <span><span className="memory-obs-key">isolation</span> <span className="memory-obs-val">{totals.isolation?.ok || 0}/{totals.isolation?.total || 0}</span></span>
+        <span><span className="memory-obs-key">queue</span> <span className="memory-obs-val">{queueSummary(totals.queue)}</span></span>
+        <span><span className="memory-obs-key">retryable</span> <span className="memory-obs-val">{totals.retryableFailures || 0}</span></span>
+        <button className="btn btn-mini" onClick={refresh} disabled={busy === 'refresh'} style={{ marginLeft: 'auto' }}>refresh</button>
       </div>
+      {error ? <div className="research-stop"><div className="research-stop-title">memory error</div><div className="research-stop-copy">{error}</div></div> : null}
 
       <div className="memcard open">
         <div className="memcard-head">
@@ -234,46 +226,46 @@ export default function MemoryConsole({ leadId }) {
                 <span className="mono">{business.unresolvedFailureCount || 0}</span>
               </div>
             ))}
+            {!businesses.length ? <div className="mono note">// no business containers yet — click Start research now</div> : null}
           </div>
         </div>
       </div>
 
       {selectedBusiness ? (
-        <div className="research-panel">
-          <div className="research-head">
-            <div>
-              <div className="hd">per-lead memory ledger</div>
-              <div className="research-title">{selectedBusiness.businessName}</div>
-            </div>
+        <div className="memcard open">
+          <div className="memcard-head">
+            <span className="mono memcard-key">per-lead ledger</span>
+            <span className="mono memcard-tag">{selectedBusiness.businessName}</span>
             <span className={`chip ${ledger?.isolation?.ok ? 'chip-presence-strong' : 'chip-pay-failed'}`}>
               {ledger?.containerTag || selectedBusiness.containerTag}
             </span>
           </div>
-          <div className="memory-table memory-table-ledger" style={styles.table}>
-            <div className="memory-row memory-row-head mono" style={{ ...styles.ledgerRow, ...styles.headRow }}>
-              <span>kind</span><span>customId</span><span>status</span><span>source event</span><span>updated</span>
-            </div>
-            {docs.map((doc) => (
-              <div key={doc.custom_id} className="memory-row" style={styles.ledgerRow}>
-                <span>{labelize(doc.kind)}</span>
-                <span className="mono">{short(doc.custom_id, 44)}</span>
-                <span className={`chip ${doc.write_status === 'failed' ? 'chip-pay-failed' : doc.write_status === 'queued' ? 'chip-pay-created' : 'chip-presence-strong'}`}>{doc.write_status}</span>
-                <span className="mono">{short(doc.source_event, 34)}</span>
-                <span className="mono">{time(doc.updated_at)}</span>
+          <div className="memcard-body">
+            <div className="memory-table memory-table-ledger" style={styles.table}>
+              <div className="memory-row memory-row-head mono" style={{ ...styles.ledgerRow, ...styles.headRow }}>
+                <span>kind</span><span>customId</span><span>status</span><span>source event</span><span>updated</span>
               </div>
-            ))}
-            {!docs.length ? <div className="mono note">// no mirrored memory documents yet.</div> : null}
+              {docs.map((doc) => (
+                <div key={doc.custom_id} className="memory-row" style={styles.ledgerRow}>
+                  <span>{labelize(doc.kind)}</span>
+                  <span className="mono">{short(doc.custom_id, 44)}</span>
+                  <span className={`chip ${doc.write_status === 'failed' ? 'chip-pay-failed' : doc.write_status === 'queued' ? 'chip-pay-created' : 'chip-presence-strong'}`}>{doc.write_status}</span>
+                  <span className="mono">{short(doc.source_event, 34)}</span>
+                  <span className="mono">{time(doc.updated_at)}</span>
+                </div>
+              ))}
+              {!docs.length ? <div className="mono note">// no mirrored memory documents yet.</div> : null}
+            </div>
           </div>
         </div>
       ) : null}
 
-      <div className="memcard open">
-        <div className="memcard-head">
-          <span className="mono memcard-key">search retrieval</span>
-          <span className="memcard-tag mono">{searches.length} logged</span>
-          <span />
-        </div>
-        <div className="memcard-body">
+      <details className="memory-more">
+        <summary>
+          <span>search retrieval · {searches.length} logged</span>
+          <span className="memory-more-toggle" />
+        </summary>
+        <div className="memory-more-body">
           <form className="memory-search-form" onSubmit={runSearch} style={styles.searchForm}>
             <input
               className="input mono"
@@ -302,17 +294,19 @@ export default function MemoryConsole({ leadId }) {
             {!hits.length ? <div className="mono note">// run a scoped retrieval query to see hits.</div> : null}
           </div>
         </div>
-      </div>
+      </details>
 
-      <div className="memcard open">
-        <div className="memcard-head">
-          <span className="mono memcard-key">failed writes</span>
-          <span className="memcard-tag mono">{failedWrites.length} unresolved</span>
-          <button className="btn btn-mini" onClick={retryFailed} disabled={!failedWrites.length || busy === 'retry'}>
-            {busy === 'retry' ? 'retrying' : 'retry'}
-          </button>
-        </div>
-        <div className="memcard-body">
+      <details className="memory-more" {...(failedWrites.length ? { open: true } : {})}>
+        <summary>
+          <span>failed writes · {failedWrites.length} unresolved</span>
+          <span className="memory-more-toggle" />
+        </summary>
+        <div className="memory-more-body">
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+            <button className="btn btn-mini" onClick={retryFailed} disabled={!failedWrites.length || busy === 'retry'}>
+              {busy === 'retry' ? 'retrying' : 'retry all'}
+            </button>
+          </div>
           <div className="memory-failure-list" style={styles.failureList}>
             {failedWrites.slice(0, 12).map((failure) => (
               <div key={failure.id} className="memory-failure" style={styles.hit}>
@@ -327,7 +321,7 @@ export default function MemoryConsole({ leadId }) {
             {!failedWrites.length ? <div className="mono note">// no failed Supermemory writes waiting for retry.</div> : null}
           </div>
         </div>
-      </div>
+      </details>
     </section>
   );
 }

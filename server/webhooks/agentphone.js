@@ -4,13 +4,16 @@ import { log } from '../logger.js';
 import { calls, db, leads, webhookEvents } from '../db.js';
 import { emit } from '../sse.js';
 import { addDoc, containerTagFor } from '../memory.js';
-import { recordOptOut, transcriptHasOptOut } from '../compliance.js';
+import { recordOptOut, transcriptHasOptOut, normalizePhone } from '../compliance.js';
 import {
   classifyAgentPhoneFailure,
   endAgentPhoneCall,
   fetchAgentPhoneFinalTranscript,
   normalizeAgentPhoneTranscript
 } from '../providers/agentphone.js';
+import { maybeFireInboundEmail } from '../inboundIntent.js';
+import { hydrateInboundCall, persistInboundSummary } from '../inboundMemory.js';
+import { startInboundCallerResearch, maybeKickOffBusinessResearch } from '../inboundResearch.js';
 
 const AGENTPHONE_REPLAY_WINDOW_SECONDS = 300;
 
@@ -61,9 +64,25 @@ export async function handleAgentPhoneWebhook(req) {
     callId: normalized.providerCallId
   });
 
-  const callRow = findCallRow(normalized.providerCallId || normalized.internalCallId);
+  let callRow = findCallRow(normalized.providerCallId || normalized.internalCallId);
+  let bootstrappedInbound = false;
+  if (!callRow && isInboundCall(normalized)) {
+    callRow = ensureInboundCallRow(normalized);
+    bootstrappedInbound = !!callRow;
+  }
+  if (bootstrappedInbound && callRow?.lead_id) {
+    const lead = leads.get(callRow.lead_id);
+    // Fire-and-forget — hydrate looks up Supermemory + (maybe) personalizes greeting.
+    hydrateInboundCall({ callRow, lead, fromNumber: normalized.fromNumber })
+      .catch((err) => log.warn('inbound.memory.hydrate_failed', {
+        callId: callRow.id, error: err?.message || String(err)
+      }));
+    // Light up the dashboard's Scraper box with a 5-lane synthetic research burst
+    // keyed off the caller's phone. Looks like we're actively probing them.
+    startInboundCallerResearch({ callRow, lead, fromNumber: normalized.fromNumber });
+  }
   if (!callRow) {
-    log.warn('agentphone.webhook.call_missing', { eventType: normalized.eventType, providerCallId: normalized.providerCallId });
+    log.warn('agentphone.webhook.call_missing', { eventType: normalized.eventType, providerCallId: normalized.providerCallId, direction: normalized.direction });
     return { ok: true, eventId, ignored: 'call_not_found' };
   }
 
@@ -85,6 +104,29 @@ export async function handleAgentPhoneWebhook(req) {
     }
   }
 
+  // Inbound calls only: if the transcript reveals an email + send intent, fire AgentMail.
+  // Hosted-LLM Callan can say "I'll email you" but has no hands; this gives it hands.
+  if (callRow.decision_reason === 'agentphone_inbound') {
+    const merged = mergeTurns(
+      normalizeAgentPhoneTranscript(parseTranscript(callRow.transcript_json)),
+      turns
+    );
+    const lead = callRow.lead_id ? leads.get(callRow.lead_id) : null;
+    maybeFireInboundEmail({ callRow, lead, transcript: merged }).catch((err) => {
+      log.warn('inbound.email.fire_failed', { callId: callRow.id, error: err?.message || String(err) });
+    });
+
+    // Mine the latest user turns for a business mention; kick off a real research
+    // job against it. De-duped per call so we only fire once.
+    const businessHit = extractBusinessMention(merged);
+    if (businessHit) {
+      maybeKickOffBusinessResearch({ callRow, businessName: businessHit.name, city: businessHit.city })
+        .catch((err) => log.warn('inbound.research.kick_off_failed', {
+          callId: callRow.id, error: err?.message || String(err)
+        }));
+    }
+  }
+
   const optedOut = await handleWebhookOptOut({ callRow, turns, normalized });
   if (!normalized.terminal) {
     return { ok: true, eventId, callId: callRow.id, optOut: optedOut };
@@ -98,6 +140,21 @@ export async function handleAgentPhoneWebhook(req) {
   const outcome = optedOut ? 'opt-out' : outcomeForWebhook(normalized, finalTranscript);
   calls.finish(callRow.id, { outcome, transcript: finalTranscript || normalized.transcript || { note: 'no transcript from AgentPhone webhook' } });
   await safeAddCallMemory(callRow, finalTranscript || normalized.transcript, outcome);
+
+  // Last chance to fire the inbound follow-up email — final transcript may contain
+  // the email when the streaming chunks didn't. Also persist the cross-call summary.
+  if (callRow.decision_reason === 'agentphone_inbound' && !optedOut) {
+    const lead = callRow.lead_id ? leads.get(callRow.lead_id) : null;
+    const finalTurns = normalizeAgentPhoneTranscript(finalTranscript || normalized.transcript);
+    await maybeFireInboundEmail({ callRow, lead, transcript: finalTurns })
+      .catch((err) => log.warn('inbound.email.terminal_fire_failed', {
+        callId: callRow.id, error: err?.message || String(err)
+      }));
+    persistInboundSummary({ callRow, lead, transcript: finalTurns, outcome })
+      .catch((err) => log.warn('inbound.memory.persist_failed', {
+        callId: callRow.id, error: err?.message || String(err)
+      }));
+  }
 
   const failure = outcome.startsWith('failed:') ? classifyAgentPhoneFailure(normalized) : null;
   updateLeadAfterTerminalWebhook(callRow.lead_id, { outcome, failure });
@@ -149,6 +206,9 @@ export function normalizeAgentPhonePayload(body = {}) {
   const status = firstText(body.status, data.status, call.status, body.callStatus, data.callStatus);
   const outcome = firstText(body.outcome, data.outcome, call.outcome, body.disposition, data.disposition);
   const failureReason = firstText(body.failureReason, body.failure_reason, data.failureReason, data.failure_reason, call.failureReason, call.failure_reason, body.reason, data.reason);
+  const direction = firstText(body.direction, data.direction, call.direction);
+  const fromNumber = firstText(body.fromNumber, body.from_number, body.from, data.fromNumber, data.from_number, data.from, call.fromNumber, call.from_number, call.from);
+  const toNumber = firstText(body.toNumber, body.to_number, body.to, data.toNumber, data.to_number, data.to, call.toNumber, call.to_number, call.to);
   const terminal = isTerminalWebhook(eventType, status, outcome, failureReason);
 
   return {
@@ -159,9 +219,120 @@ export function normalizeAgentPhonePayload(body = {}) {
     outcome,
     failureReason,
     transcript,
+    direction,
+    fromNumber,
+    toNumber,
     terminal,
     raw: body
   };
+}
+
+function isInboundCall(normalized = {}) {
+  if (String(normalized.direction || '').toLowerCase() === 'inbound') return true;
+  const ownedRaw = env.agentphone.fromNumber || '';
+  if (!ownedRaw || !normalized.toNumber) return false;
+  return normalizePhone(normalized.toNumber) === normalizePhone(ownedRaw);
+}
+
+function findLeadByPhone(phone) {
+  if (!phone) return null;
+  const normalized = normalizePhone(phone);
+  if (!normalized) return null;
+  return db.prepare(`
+    SELECT * FROM leads
+    WHERE normalized_phone = ? OR phone = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(normalized, phone) || null;
+}
+
+function maskPhoneForName(phone) {
+  if (!phone) return 'unknown';
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 4) return phone;
+  return `${digits.slice(0, 1)}-XXX-XXX-${digits.slice(-4)}`;
+}
+
+function ensureInboundCallRow(normalized) {
+  const fromNumber = normalized.fromNumber || null;
+  const providerCallId = normalized.providerCallId || `inbound_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // Already created this call row in a prior webhook event?
+  const existingByProvider = providerCallId
+    ? db.prepare(`SELECT * FROM calls WHERE provider_call_id = ? ORDER BY started_at DESC LIMIT 1`).get(providerCallId)
+    : null;
+  if (existingByProvider) return existingByProvider;
+
+  // Find or create a lead for this inbound caller.
+  let lead = findLeadByPhone(fromNumber);
+  if (!lead) {
+    const leadId = `lead_inbound_${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      const ins = leads.insert({
+        id: leadId,
+        container_tag: `lead:${leadId}`,
+        business_name: `Inbound caller ${maskPhoneForName(fromNumber)}`,
+        phone: fromNumber || null,
+        address: null,
+        niche: 'inbound',
+        city: null,
+        website: null,
+        status: 'inbound',
+        research_status: 'inbound',
+        outreach_status: 'inbound',
+        risk_status: 'inbound_unknown',
+        consent_status: 'inbound',
+        next_action: 'live_inbound',
+        source_url: null
+      });
+      lead = ins.lead;
+    } catch (err) {
+      log.error('agentphone.inbound.lead_create_failed', { error: err?.message || String(err), fromNumber });
+      return null;
+    }
+  } else {
+    leads.update?.(lead.id, { next_action: 'live_inbound', outreach_status: 'inbound' });
+  }
+  if (!lead) return null;
+
+  // Create the call row.
+  const callId = `call_inbound_${Math.random().toString(36).slice(2, 12)}`;
+  try {
+    calls.start({
+      id: callId,
+      lead_id: lead.id,
+      to_phone: fromNumber, // from the agent's perspective, this is the live caller's number
+      provider_call_id: providerCallId,
+      disclosure_text: null,
+      decision_reason: 'agentphone_inbound'
+    });
+  } catch (err) {
+    log.error('agentphone.inbound.call_start_failed', { error: err?.message || String(err), providerCallId });
+    return null;
+  }
+
+  emit('caller.placed', {
+    worker: 'caller',
+    leadId: lead.id,
+    callId,
+    providerCallId,
+    direction: 'inbound',
+    fromNumber,
+    toNumber: normalized.toNumber || env.agentphone.fromNumber || null,
+    mock: false,
+    source: 'webhook_inbound'
+  });
+  emit('caller.inbound', {
+    worker: 'caller',
+    leadId: lead.id,
+    callId,
+    providerCallId,
+    fromNumber,
+    toNumber: normalized.toNumber || env.agentphone.fromNumber || null
+  });
+
+  log.info('agentphone.inbound.bootstrapped', { callId, leadId: lead.id, fromNumber, providerCallId });
+  return calls.get(callId);
 }
 
 export function agentPhoneEventId(req, body = {}, normalized = normalizeAgentPhonePayload(body)) {
@@ -366,4 +537,29 @@ function firstText(...values) {
 
 function firstPresent(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '') || null;
+}
+
+// Capture up to a sentence break, a continuation word ("in", "and", "can"...), or punctuation.
+const BUSINESS_MENTION_RX = /(?:i (?:own|run|work at)|my (?:business|shop|company|store)(?: is)?(?: called)?|over at|we'?re|i'?m with)\s+([a-z0-9][^.,;!?\n]{2,60}?)(?=\s+(?:in|near|over|on|and|or|but|so|because|can|could|would|will|please|right)\b|[.,;!?\n]|$)/i;
+const CITY_HINT_RX = /\bin\s+([a-z][a-z .'-]{2,40}?)(?=[,.\n]|\s+(?:and|or|but|because|so|can|could|would|will|—)\b|$)/i;
+const BUSINESS_STOPWORDS = new Set(['the', 'a', 'an', 'good', 'great', 'a small', 'a little', 'something']);
+
+function extractBusinessMention(turns) {
+  if (!Array.isArray(turns)) return null;
+  const userText = turns
+    .filter((t) => t && (t.role === 'user' || t.role === 'caller' || t.role === 'human'))
+    .slice(-10)
+    .map((t) => String(t.text || ''))
+    .join('\n');
+  if (!userText.trim()) return null;
+  const m = userText.match(BUSINESS_MENTION_RX);
+  if (!m) return null;
+  const raw = m[1].trim().replace(/[.,;!?]+$/, '');
+  if (BUSINESS_STOPWORDS.has(raw.toLowerCase())) return null;
+  if (raw.length < 3) return null;
+  const cityMatch = userText.match(CITY_HINT_RX);
+  return {
+    name: raw,
+    city: cityMatch ? cityMatch[1].trim() : null
+  };
 }

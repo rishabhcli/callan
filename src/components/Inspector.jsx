@@ -295,7 +295,21 @@ export default function Inspector({
   onLeadChanged
 }) {
   return (
-    <div className="inspector">
+    <div className="inspector inspector-overhaul">
+      {focusedLeadId ? (
+        <LeadHero
+          leadId={focusedLeadId}
+          detail={leadDetail}
+          builderInfo={builderInfo}
+          builderAction={builderAction}
+          outreach={outreach}
+          onStartAutonomy={onStartAutonomy}
+          onStopAutonomy={onStopAutonomy}
+          onLeadChanged={onLeadChanged}
+        />
+      ) : (
+        <div className="lead-hero-empty">// select a lead on the left to inspect</div>
+      )}
       <div className="inspector-tabs">
         {TABS.map((tab) => (
           <button
@@ -307,29 +321,7 @@ export default function Inspector({
             <span className="tab-label">{tab}</span>
           </button>
         ))}
-        <div className="inspector-id mono">
-          {focusedLeadId || '— no lead focused —'}
-        </div>
       </div>
-      {focusedLeadId ? (
-        <OperatorControls
-          leadId={focusedLeadId}
-          detail={leadDetail}
-          outreach={outreach}
-          onStartAutonomy={onStartAutonomy}
-          onStopAutonomy={onStopAutonomy}
-          onLeadChanged={onLeadChanged}
-        />
-      ) : null}
-      {focusedLeadId ? (
-        <LeadProofRail
-          detail={leadDetail}
-          focusedLeadId={focusedLeadId}
-          builderInfo={builderInfo}
-          builderAction={builderAction}
-          health={health}
-        />
-      ) : null}
       <div className="inspector-body">
         {!focusedLeadId ? (
           <div className="empty-inspector">
@@ -369,6 +361,162 @@ export default function Inspector({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function LeadHero({ leadId, detail, builderInfo, builderAction, outreach, onStartAutonomy, onStopAutonomy, onLeadChanged }) {
+  const lead = detailLead(detail);
+  const profile = profileFromDetail(detail);
+  const presence = presenceFromEvidence(lead, profile);
+  const callability = explainCallability(lead, profile);
+  const builderState = useMemo(
+    () => mergeBuilderState(detail, builderInfo, leadId),
+    [detail, builderInfo, leadId]
+  );
+  const stages = useMemo(() => proofStages(detail, builderState), [detail, builderState]);
+  const containerTag = lead.container_tag || '—';
+  const phone = lead.phone || profile?.phone || '—';
+  const busyBuild = builderAction?.running && builderAction?.leadId === leadId;
+
+  return (
+    <section className="lead-hero">
+      <div className="lead-hero-top">
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div className="lead-hero-title">{lead.business_name || leadId || '—'}</div>
+          <div className="lead-hero-meta">
+            <span><span className="lead-hero-meta-key">id</span> {leadId}</span>
+            <span><span className="lead-hero-meta-key">phone</span> {phone}</span>
+            <span><span className="lead-hero-meta-key">tag</span> {containerTag}</span>
+          </div>
+        </div>
+        <div className="lead-hero-chips">
+          {presence ? (
+            <span className={`lead-hero-chip lead-hero-chip-${presence === 'strong' ? 'stop' : presence === 'mixed' ? 'warn' : 'good'}`}>
+              {presence}
+            </span>
+          ) : null}
+          <span className={`lead-hero-chip lead-hero-chip-${callability.tone}`}>{callability.label}</span>
+          {busyBuild ? <span className="lead-hero-chip lead-hero-chip-warn">build starting</span> : null}
+          {builderState.authNeeded ? <span className="lead-hero-chip lead-hero-chip-bad">auth needed</span> : null}
+          <ActionMenu
+            leadId={leadId}
+            detail={detail}
+            outreach={outreach}
+            onStartAutonomy={onStartAutonomy}
+            onStopAutonomy={onStopAutonomy}
+            onLeadChanged={onLeadChanged}
+            explanation={callability.explanation}
+          />
+        </div>
+      </div>
+      <div className="lead-hero-pipe">
+        {stages.map((stage) => (
+          <span key={stage.label} className={`lead-hero-stage lead-hero-stage-${stage.state}`}>
+            <span className="lead-hero-stage-dot" />
+            {stage.label}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ActionMenu({ leadId, detail, outreach, onStartAutonomy, onStopAutonomy, onLeadChanged, explanation }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(null);
+  const [explain, setExplain] = useState(null);
+  const [error, setError] = useState(null);
+  const menuRef = React.useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (event) => {
+      if (menuRef.current && !menuRef.current.contains(event.target)) setOpen(false);
+    };
+    const onKey = (event) => { if (event.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  async function run(action) {
+    setBusy(action);
+    setError(null);
+    try {
+      if (action === 'approve') await api.approveLiveCall(leadId);
+      if (action === 'retry') await api.forceRetry(leadId);
+      if (action === 'optout') await api.optOutLead(leadId);
+      if (action === 'block') {
+        await api.blockLead(leadId, {
+          reasonCode: 'operator_blocked',
+          reason: 'Operator blocked lead before outreach'
+        });
+      }
+      if (action === 'autonomy') {
+        if (outreach?.running) await onStopAutonomy?.();
+        else await onStartAutonomy?.();
+      }
+      if (action === 'why') {
+        const data = await api.explainCallability(leadId);
+        setExplain(data);
+        return;
+      }
+      if (action !== 'autonomy') onLeadChanged?.(leadId);
+      setOpen(false);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="action-menu" ref={menuRef}>
+      <button
+        type="button"
+        className="action-menu-btn"
+        onClick={() => setOpen((prev) => !prev)}
+        disabled={!leadId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+      >
+        actions ▾
+      </button>
+      {open ? (
+        <div className="action-menu-list" role="menu">
+          <button className="action-menu-item" onClick={() => run('approve')} disabled={busy === 'approve'}>
+            {busy === 'approve' ? 'approving…' : 'approve live-call'}
+          </button>
+          <button className="action-menu-item" onClick={() => run('retry')} disabled={busy === 'retry'}>
+            {busy === 'retry' ? 'retrying…' : 'force retry'}
+          </button>
+          <button className="action-menu-item action-menu-item-danger" onClick={() => run('optout')} disabled={busy === 'optout'}>
+            {busy === 'optout' ? 'opting out…' : 'opt-out (do-not-call)'}
+          </button>
+          <button className="action-menu-item action-menu-item-danger" onClick={() => run('block')} disabled={busy === 'block'}>
+            {busy === 'block' ? 'blocking…' : 'block lead'}
+          </button>
+          <button className="action-menu-item" onClick={() => run('autonomy')} disabled={busy === 'autonomy'}>
+            {outreach?.running ? 'pause autonomy' : 'start autonomy'}
+          </button>
+          <button className="action-menu-item action-menu-item-info" onClick={() => run('why')} disabled={busy === 'why'}>
+            {busy === 'why' ? 'checking…' : 'why is this state?'}
+          </button>
+          {explain ? (
+            <div className="action-menu-explain">
+              <div><strong>{explain.decision || 'callability'}:</strong> {explain.callability?.reason || explanation}</div>
+              {(explain.blockers || []).slice(0, 3).map((b) => (
+                <div key={`${b.source}:${b.code}`}>· {b.code}: {b.reason}</div>
+              ))}
+            </div>
+          ) : null}
+          {error ? <div className="action-menu-explain" style={{ color: 'var(--error)' }}>{error}</div> : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -684,31 +832,34 @@ function buildProofMode(builderState) {
 function MemoryTab({ detail }) {
   const mem = detail?.memory;
   const lead = detailLead(detail);
-  if (!mem) {
-    return (
-      <div className="memtab-empty">
-        <div className="hd">memory</div>
-        <ResearchEvidencePanel detail={detail} />
-        <ReasoningPanel detail={detail} />
-        <MemoryConsole leadId={lead.id} />
-        <div className="mono note">// supermemory offline or no docs yet.</div>
-      </div>
-    );
-  }
   return (
-    <div className="memtab">
+    <div className="memtab memtab-overhaul">
       <div className="memtab-head">
         <div className="hd">supermemory</div>
-        <div className="mono note">containerTag: <span className="accent">{lead.container_tag}</span></div>
+        <div className="mono note">
+          {lead.container_tag ? <>containerTag: <span className="accent">{lead.container_tag}</span></> : '// per-lead container will appear once research completes.'}
+        </div>
       </div>
-      <ResearchEvidencePanel detail={detail} />
-      <ReasoningPanel detail={detail} />
       <MemoryConsole leadId={lead.id} />
-      <MemoryDoc kind="profile"     doc={mem.business_profile?.[0] || mem.profile?.[0]}     defaultOpen />
-      <MemoryDoc kind="pitch"       doc={mem.pitch?.[0]}       />
-      <MemoryDoc kind="call_log"    doc={mem.call_transcript?.[0] || mem.call_log?.[0]}    />
-      <MemoryDoc kind="post_mortem" doc={mem.call_analysis?.[0] || mem.post_mortem?.[0]} />
-      <MemoryDoc kind="mail_thread" doc={mem.mail_thread?.[0]} />
+      <details className="memory-more">
+        <summary>
+          <span>research evidence + reasoning + supermemory docs</span>
+          <span className="memory-more-toggle" />
+        </summary>
+        <div className="memory-more-body">
+          <ResearchEvidencePanel detail={detail} />
+          <ReasoningPanel detail={detail} />
+          {mem ? (
+            <>
+              <MemoryDoc kind="profile"     doc={mem.business_profile?.[0] || mem.profile?.[0]}     defaultOpen />
+              <MemoryDoc kind="pitch"       doc={mem.pitch?.[0]}       />
+              <MemoryDoc kind="call_log"    doc={mem.call_transcript?.[0] || mem.call_log?.[0]}    />
+              <MemoryDoc kind="post_mortem" doc={mem.call_analysis?.[0] || mem.post_mortem?.[0]} />
+              <MemoryDoc kind="mail_thread" doc={mem.mail_thread?.[0]} />
+            </>
+          ) : <div className="mono note">// supermemory offline or no docs yet.</div>}
+        </div>
+      </details>
     </div>
   );
 }

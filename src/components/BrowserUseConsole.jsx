@@ -30,6 +30,7 @@ export default function BrowserUseConsole({ onLeadChanged }) {
   const [error, setError] = useState(null);
   const [action, setAction] = useState(null);
   const [form, setForm] = useState({ niche: 'hvac repair', city: 'San Francisco', count: 3 });
+  const [expanded, setExpanded] = useState(false);
 
   const load = useCallback(async ({ quiet = false } = {}) => {
     if (!quiet) setLoading(true);
@@ -118,57 +119,87 @@ export default function BrowserUseConsole({ onLeadChanged }) {
     }
   }
 
+  const counts = data.counts || EMPTY.counts;
+  const telemetry = data.telemetry || EMPTY.telemetry;
+
   return (
-    <section className="browser-console">
-      <div className="browser-console-head">
-        <div>
-          <div className="hd">Browser Use command center</div>
-          <div className="browser-console-sub mono">
-            {loading ? 'syncing' : `${data.counts?.total || 0} sessions`} · {data.telemetry?.models?.join(', ') || 'no model yet'}
+    <section className="bu-strip-card">
+      <div
+        className="bu-strip"
+        role="button"
+        tabIndex={0}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setExpanded((prev) => !prev);
+          }
+        }}
+        aria-expanded={expanded}
+      >
+        <div className="bu-strip-left">
+          <span className="bu-strip-label">Browser Use builds</span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">total</span><span className="bu-strip-stat-val">{counts.total || 0}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">active</span><span className="bu-strip-stat-val">{counts.active || 0}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">done</span><span className="bu-strip-stat-val">{counts.completed || 0}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">failed</span><span className="bu-strip-stat-val">{(counts.failed || 0) + (counts.auth_wall || 0)}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">evidence</span><span className="bu-strip-stat-val">{telemetry.evidenceCount || 0}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">cost</span><span className="bu-strip-stat-val">${Number(telemetry.totalCostUsd || 0).toFixed(2)}</span></span>
+        </div>
+        <span className="bu-strip-toggle">{expanded ? 'collapse ▴' : 'expand ▾'}</span>
+      </div>
+      {expanded ? (
+        <div className="bu-strip-body">
+          <div className="browser-console-head" style={{ padding: '10px 12px' }}>
+            <div>
+              <div className="browser-console-sub mono">
+                {loading ? 'syncing' : `${counts.total || 0} sessions`} · {telemetry.models?.join(', ') || 'no model yet'}
+              </div>
+            </div>
+            <form className="browser-research-form" onSubmit={startResearch}>
+              <input
+                aria-label="research niche"
+                value={form.niche}
+                onChange={(event) => setForm((prev) => ({ ...prev, niche: event.target.value }))}
+              />
+              <input
+                aria-label="research city"
+                value={form.city}
+                onChange={(event) => setForm((prev) => ({ ...prev, city: event.target.value }))}
+              />
+              <input
+                aria-label="research count"
+                type="number"
+                min="1"
+                max="8"
+                value={form.count}
+                onChange={(event) => setForm((prev) => ({ ...prev, count: event.target.value }))}
+              />
+              <button className="btn btn-primary btn-mini" disabled={action === 'start'}>
+                {action === 'start' ? 'starting' : 'start research'}
+              </button>
+            </form>
+          </div>
+
+          <TelemetryStrip telemetry={telemetry} counts={counts} />
+
+          {error ? <div className="browser-console-error mono">{error}</div> : null}
+
+          <div className="browser-console-grid">
+            {GROUPS.map((group) => (
+              <SessionColumn
+                key={group.key}
+                title={group.title}
+                sessions={group.key === 'failed' ? grouped.failed : grouped[group.key]}
+                action={action}
+                onStop={stopSession}
+                onRetry={retrySource}
+              />
+            ))}
+            <ExtractionStream events={events} />
           </div>
         </div>
-        <form className="browser-research-form" onSubmit={startResearch}>
-          <input
-            aria-label="research niche"
-            value={form.niche}
-            onChange={(event) => setForm((prev) => ({ ...prev, niche: event.target.value }))}
-          />
-          <input
-            aria-label="research city"
-            value={form.city}
-            onChange={(event) => setForm((prev) => ({ ...prev, city: event.target.value }))}
-          />
-          <input
-            aria-label="research count"
-            type="number"
-            min="1"
-            max="8"
-            value={form.count}
-            onChange={(event) => setForm((prev) => ({ ...prev, count: event.target.value }))}
-          />
-          <button className="btn btn-primary btn-mini" disabled={action === 'start'}>
-            {action === 'start' ? 'starting' : 'start research'}
-          </button>
-        </form>
-      </div>
-
-      <TelemetryStrip telemetry={data.telemetry || EMPTY.telemetry} counts={data.counts || EMPTY.counts} />
-
-      {error ? <div className="browser-console-error mono">{error}</div> : null}
-
-      <div className="browser-console-grid">
-        {GROUPS.map((group) => (
-          <SessionColumn
-            key={group.key}
-            title={group.title}
-            sessions={group.key === 'failed' ? grouped.failed : grouped[group.key]}
-            action={action}
-            onStop={stopSession}
-            onRetry={retrySource}
-          />
-        ))}
-        <ExtractionStream events={events} />
-      </div>
+      ) : null}
     </section>
   );
 }

@@ -71,9 +71,34 @@ function edgePath(edge, byId) {
   return { d: `M ${x1} ${y1} L ${x2} ${y2}`, x1, y1, x2, y2, cx: mx, cy: my };
 }
 
-export default function NodeGraph({ states, counters, pulses, focusedNodeId, onSelect }) {
+export default function NodeGraph({ states, counters, pulses, focusedNodeId, onSelect, compact = false }) {
   const byId = useMemo(() => Object.fromEntries(NODES.map((n) => [n.id, n])), []);
   const paths = useMemo(() => Object.fromEntries(EDGES.map((e) => [e.id, edgePath(e, byId)])), [byId]);
+
+  if (compact) {
+    return (
+      <div className="node-strip" role="toolbar" aria-label="agent pipeline">
+        {NODES.map((n) => {
+          const state = states[n.id] || 'idle';
+          const isFocus = focusedNodeId === n.id;
+          const count = counters[n.id] || 0;
+          return (
+            <button
+              key={n.id}
+              type="button"
+              className={`node-chip node-chip-${state} ${isFocus ? 'node-chip-focus' : ''}`}
+              onClick={() => onSelect?.(n.id)}
+              title={`${n.label} · ${n.gloss} · ${state}`}
+            >
+              <span className="node-chip-state" />
+              <span>{n.label}</span>
+              <span className="node-chip-count">{count > 0 ? count : '·'}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
     <svg className="graph-svg" viewBox="0 0 1024 280" preserveAspectRatio="xMidYMid meet">
