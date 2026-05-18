@@ -282,13 +282,13 @@ async function processOutreachBatch() {
   if (processingBatch) return;
   processingBatch = true;
   try {
-    processOutreachBatchOnce();
+    await processOutreachBatchOnce();
   } finally {
     processingBatch = false;
   }
 }
 
-function processOutreachBatchOnce() {
+async function processOutreachBatchOnce() {
   recoverActiveJobs();
 
   const control = autonomyControlState();

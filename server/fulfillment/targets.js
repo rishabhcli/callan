@@ -1,10 +1,11 @@
 import { env, modeAllowsSideEffect } from '../env.js';
 import { LovableBuildTarget } from '../providers/lovable.js';
 import { V0BuildTarget, v0ReadinessDetails } from '../providers/v0.js';
+import { AnythingBuildTarget } from '../providers/anything.js';
 import { browserUseReadinessDetails } from '../providers/browserUse.js';
 
-export const BUILD_TARGETS = Object.freeze(['lovable', 'v0']);
-const DEFAULT_TARGET = 'lovable';
+export const BUILD_TARGETS = Object.freeze(['anything', 'lovable', 'v0']);
+const DEFAULT_TARGET = 'anything';
 
 export function normalizeBuildTarget(value) {
   const target = String(value || process.env.BUILD_TARGET || process.env.FULFILLMENT_TARGET || DEFAULT_TARGET)
@@ -16,7 +17,8 @@ export function normalizeBuildTarget(value) {
 export function createBuildTarget(name) {
   const target = normalizeBuildTarget(name);
   if (target === 'v0') return new V0BuildTarget();
-  return new LovableBuildTarget();
+  if (target === 'lovable') return new LovableBuildTarget();
+  return new AnythingBuildTarget();
 }
 
 export function assertBuildTarget(target) {
@@ -35,6 +37,9 @@ export function canRunLiveBuildTarget(targetName) {
     return { ok: false, reason: 'LIVE_BUILDS=false', live: false, target };
   }
   if (target === 'lovable' && !env.browserUse.apiKey) {
+    return { ok: false, reason: 'BROWSER_USE_API_KEY missing', live: false, target };
+  }
+  if (target === 'anything' && !env.browserUse.apiKey) {
     return { ok: false, reason: 'BROWSER_USE_API_KEY missing', live: false, target };
   }
   if (target === 'v0' && !process.env.V0_API_KEY) {
@@ -69,6 +74,12 @@ export function fulfillmentReadiness() {
   return {
     defaultTarget,
     targets: {
+      anything: {
+        configured: !!env.browserUse.apiKey,
+        live: canRunLiveBuildTarget('anything').ok,
+        provider: 'browserUse',
+        detail: { ...browserUseReadinessDetails().lovable, surface: 'anything.com via persistent Browser Use profile' }
+      },
       lovable: {
         configured: !!env.browserUse.apiKey,
         live: canRunLiveBuildTarget('lovable').ok,

@@ -380,10 +380,12 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
   }
 }
 
-export async function runPreviewBuilder({ leadId, onLiveUrl } = {}) {
+export async function runPreviewBuilder({ leadId, onLiveUrl, target } = {}) {
   if (!leadId) throw new Error('runPreviewBuilder requires leadId');
   const buildId = `bld_preview_${leadId}`;
-  return runBuilder({ leadId, buildId, target: 'lovable', onLiveUrl });
+  // Default target = 'anything' (anything.com). Lovable still callable via
+  // explicit target='lovable' override. See server/fulfillment/targets.js.
+  return runBuilder({ leadId, buildId, target: target || 'anything', onLiveUrl });
 }
 
 function safeRecordBuilderSteps({ leadId, sessionId, steps }) {
