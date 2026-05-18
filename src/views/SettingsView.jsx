@@ -16,6 +16,8 @@ export default function SettingsView({ health, outreach, onStartAutonomy, onStop
   const mode = (health?.mode || 'init').toUpperCase();
   const running = !!outreach?.running;
   const quotas = outreach?.readiness?.outreach || health?.readiness?.outreach || {};
+  const agents = outreach?.agents || {};
+  const queue = outreach?.queue || {};
 
   return (
     <div className="nyna-settings-shell">
@@ -37,6 +39,16 @@ export default function SettingsView({ health, outreach, onStartAutonomy, onStop
             hint={running ? 'Workers will pick the next callable lead automatically.' : 'Calls/builds only run when you click them.'}
             value={running ? 'on' : 'paused'}
           />
+          <Row
+            label="Caller agents"
+            hint="Concurrent workers draining queued outreach."
+            value={`${agents.active ?? 0}/${agents.concurrency ?? 1}`}
+          />
+          <Row
+            label="Queue slots"
+            hint="Available caller capacity right now."
+            value={agents.available ?? 0}
+          />
           <div style={{ display: 'flex', gap: 8, paddingTop: 12 }}>
             {running ? (
               <button className="nyna-action nyna-action-primary" onClick={onStopAutonomy}>pause autonomy</button>
@@ -50,9 +62,9 @@ export default function SettingsView({ health, outreach, onStartAutonomy, onStop
         <Card title="quotas (today)">
           <Row label="Calls placed" value={quotas.todaysCalls ?? 0} />
           <Row label="Opt-outs"     value={quotas.optOuts ?? 0} />
-          <Row label="Queued"       value={quotas.queued ?? 0} />
-          <Row label="In-call"      value={quotas.calling ?? 0} />
-          <Row label="Blocked"      value={quotas.blocked ?? 0} />
+          <Row label="Queued"       value={queue.queued ?? quotas.queued ?? 0} />
+          <Row label="In-call"      value={queue.running ?? quotas.calling ?? 0} />
+          <Row label="Blocked"      value={queue.blockedVisible ?? quotas.blocked ?? 0} />
         </Card>
 
         <Card title="providers" wide>
@@ -78,7 +90,7 @@ export default function SettingsView({ health, outreach, onStartAutonomy, onStop
                value="enabled" />
           <Row label="Share-link domain"
                hint="Public URL prefix sent in emails."
-               value="callmemaybe.dev/share/build/:token" />
+               value="callan.dev/share/build/:token" />
         </Card>
 
         <Card title="branding">

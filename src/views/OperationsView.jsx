@@ -14,17 +14,15 @@ const AgentScene = lazy(() => import('../components/AgentScene.jsx'));
  * before the canvas is mounted.
  */
 const NODE_META = {
-  memory:  { id: 'memory',  label: 'Super Memory', sub: 'long-term memory',     code: 'SUM', accent: '#D8973C', glow: '#FD9BB7', description: 'Knowledge graph linking every business, evidence shard, transcript, and outcome.' },
-  caller:  { id: 'caller',  label: 'Callers',      sub: 'agentphone voice',     code: 'CAL', accent: '#FD9BB7', glow: '#FD9BB7', description: 'Multiple voice agent instances dialing leads, recording transcripts, pitching builds.' },
-  scraper: { id: 'scraper', label: 'Scraper',      sub: 'browser swarm',        code: 'SCR', accent: '#D8973C', glow: '#D8973C', description: 'Cloud browser fleet harvesting evidence: search, directories, websites, social, maps.' },
-  analyst: { id: 'analyst', label: 'Analyst',      sub: 'needs + growth',       code: 'ANA', accent: '#F3E6BD', glow: '#D8973C', description: 'Call postmortems, needs assessment, growth plans, presence scoring.' },
-  mailer:  { id: 'mailer',  label: 'Mailer',       sub: 'invoice + reply',      code: 'MAI', accent: '#D8973C', glow: '#FD9BB7', description: 'AgentMail threads, Stripe payment links, autoreplies, mailbox routing.' },
-  builder: { id: 'builder', label: 'Builder',      sub: 'live site build',      code: 'BLD', accent: '#FD9BB7', glow: '#FD9BB7', description: 'Browser Use + Lovable building the customer site live, with shareable preview.' }
+  memory:  { id: 'memory',  label: 'Supermemory',  sub: 'long-term memory',          code: 'SM', accent: '#58A8FF', glow: '#A7CBF2', description: 'Knowledge graph linking every business, evidence shard, transcript, and outcome.' },
+  caller:  { id: 'caller',  label: 'Agent Phone',  sub: 'Caller logs and sessions', code: 'AP', accent: '#FD9BB7', glow: '#FD9BB7', description: 'Multiple voice agent instances dialing leads, recording transcripts, pitching builds.' },
+  scraper: { id: 'scraper', label: 'Browser Use',  sub: 'Browser Scraper',           code: 'SCR', accent: '#D8973C', glow: '#D8973C', description: 'Cloud browser fleet harvesting evidence, scoring needs, and writing growth postmortems.' },
+  mailer:  { id: 'mailer',  label: 'Agent Mail',   sub: 'inbox + replies',          code: 'AM', accent: '#D8973C', glow: '#FD9BB7', description: 'AgentMail threads, Stripe payment links, autoreplies, mailbox routing.' },
+  builder: { id: 'builder', label: 'Lovable',      sub: 'Lovable build session',    code: 'BU', accent: '#FD9BB7', glow: '#4B73FF', description: 'Browser Use drives the Lovable building session live, with a shareable preview.' }
 };
 
 const NODE_TO_INSPECTOR_TAB = {
   caller: 'Caller',
-  analyst: 'Analyst',
   mailer: 'Mailer',
   builder: 'Builder',
   memory: 'Memory'
@@ -59,7 +57,7 @@ export default function OperationsView({
         <strong>OPERATIONS</strong> · agent floor · real-time
       </div>
       <div className="nyna-stage-headline">
-        <span className="nyna-stage-headline-eye">callmemaybe</span>
+        <span className="nyna-stage-headline-eye">Callan</span>
         <div className="nyna-stage-headline-line">we sell the agency, not the agent.</div>
       </div>
 
@@ -72,13 +70,6 @@ export default function OperationsView({
             onSelect={onSelectNode}
           />
         </Suspense>
-      </div>
-
-      <div className="nyna-stage-helptext">
-        <span><em>drag</em> rotate</span>
-        <span><em>scroll</em> zoom</span>
-        <span><em>right-click + drag</em> pan</span>
-        <span><em>click</em> a box to inspect</span>
       </div>
 
       {inbound && (inbound.active || inbound.callId) ? (
@@ -159,7 +150,7 @@ function NodeDetailOverlay({
         <div className="nyna-detail-head">
           <div className="nyna-detail-head-left">
             <div className="nyna-detail-icon" style={{ background: `linear-gradient(135deg, ${node.accent}, ${node.glow})` }}>
-              {node.code}
+              <DetailProviderMark id={node.id} fallback={node.code} />
             </div>
             <div>
               <div className="nyna-detail-subtitle">{node.sub}</div>
@@ -184,7 +175,21 @@ function NodeDetailOverlay({
           {node.id === 'memory' ? (
             <MemoryDetail leadId={focusedLeadId} />
           ) : node.id === 'scraper' ? (
-            <ScraperDetail />
+            <ScraperDetail
+              focusedLeadId={focusedLeadId}
+              leadDetail={leadDetail}
+              liveTranscript={liveTranscript}
+              liveCallId={liveCallId}
+              liveCallActive={liveCallActive}
+              builderInfo={builderInfo}
+              builderAction={builderAction}
+              health={health}
+              onRetryBuild={onRetryBuild}
+              outreach={outreach}
+              onStartAutonomy={onStartAutonomy}
+              onStopAutonomy={onStopAutonomy}
+              onLeadChanged={onLeadChanged}
+            />
           ) : node.id === 'builder' ? (
             <BuilderDetail
               focusedLeadId={focusedLeadId}
@@ -336,10 +341,107 @@ function generateMockGraph() {
   return { points, edges };
 }
 
-function ScraperDetail() {
+function DetailProviderMark({ id, fallback }) {
+  if (id === 'memory') {
+    return (
+      <svg viewBox="0 0 30 24" aria-hidden="true">
+        <path d="M29.3388 9.46767H18.448V0.00146484H14.9293V10.2725C14.9293 11.3634 15.36 12.411 16.1254 13.183L25.018 22.151L27.506 19.6419L20.938 13.0183H29.3408V9.46975L29.3388 9.46767Z" />
+        <path d="M1.82839 4.36056L8.39633 10.9842H-0.00646973V14.5328H10.8843V23.999H14.403V13.728C14.403 12.637 13.9723 11.5894 13.2069 10.8175L4.31635 1.85147L1.82839 4.36056Z" />
+      </svg>
+    );
+  }
+  if (id === 'mailer') {
+    return (
+      <svg viewBox="0 0 32 24" aria-hidden="true">
+        <rect x="3" y="5" width="26" height="16" rx="3" />
+        <path d="M5.5 7.5 16 14.7 26.5 7.5" fill="none" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M5.5 19 12.2 13.8M26.5 19 19.8 13.8" fill="none" strokeWidth="2.4" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  if (id === 'builder') {
+    return (
+      <svg viewBox="0 0 121 122" aria-hidden="true" className="is-lovable">
+        <defs>
+          <linearGradient id="lovable-detail-gradient" x1="28" x2="92" y1="18" y2="118" gradientUnits="userSpaceOnUse">
+            <stop offset="0.03" stopColor="#FE7B02" />
+            <stop offset="0.48" stopColor="#FF66F4" />
+            <stop offset="0.95" stopColor="#4B73FF" />
+          </linearGradient>
+        </defs>
+        <path d="M36.069 0c19.92 0 36.068 16.155 36.068 36.084v13.713h12.004c19.92 0 36.069 16.156 36.069 36.084 0 19.928-16.149 36.083-36.069 36.083H0v-85.88C0 16.155 16.148 0 36.069 0Z" fill="url(#lovable-detail-gradient)" />
+      </svg>
+    );
+  }
+  if (id === 'caller') {
+    return (
+      <img
+        className="is-agentphone"
+        src="https://agentphone.ai/logo.png"
+        alt=""
+        draggable="false"
+        referrerPolicy="no-referrer"
+      />
+    );
+  }
+  if (id === 'scraper') {
+    return (
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="4" y="6" width="24" height="17" rx="3" />
+        <path d="M4.5 11h23" fill="none" strokeWidth="2" />
+        <circle cx="12" cy="18" r="3" fill="none" strokeWidth="2.2" />
+        <path d="m14.2 20.2 4.6 4.6M19 18h5" fill="none" strokeWidth="2.2" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return <span>{fallback}</span>;
+}
+
+function ScraperDetail({
+  focusedLeadId,
+  leadDetail,
+  liveTranscript,
+  liveCallId,
+  liveCallActive,
+  builderInfo,
+  builderAction,
+  health,
+  onRetryBuild,
+  outreach,
+  onStartAutonomy,
+  onStopAutonomy,
+  onLeadChanged
+}) {
   return (
-    <div className="nyna-card" style={{ padding: 0, overflow: 'hidden' }}>
-      <BrowserResearchConsole />
+    <div className="nyna-scraper-merged">
+      <div className="nyna-card" style={{ padding: 0, overflow: 'hidden' }}>
+        <BrowserResearchConsole />
+      </div>
+      {focusedLeadId ? (
+        <InspectorPanel
+          tab="Analyst"
+          focusedLeadId={focusedLeadId}
+          leadDetail={leadDetail}
+          liveTranscript={liveTranscript}
+          liveCallId={liveCallId}
+          liveCallActive={liveCallActive}
+          builderInfo={builderInfo}
+          builderAction={builderAction}
+          health={health}
+          onRetryBuild={onRetryBuild}
+          outreach={outreach}
+          onStartAutonomy={onStartAutonomy}
+          onStopAutonomy={onStopAutonomy}
+          onLeadChanged={onLeadChanged}
+        />
+      ) : (
+        <div className="nyna-card nyna-scraper-analysis-card">
+          <div className="nyna-card-title">analysis folded into scraper</div>
+          <div className="nyna-card-body">
+            Needs assessment, growth planning, call postmortems, and presence scoring now live under the browser research lane. Focus a lead to inspect the analyst output here.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -401,11 +503,8 @@ function statsForNode(id, { counters, builderInfo, leadDetail }) {
       ];
     case 'scraper':
       return [
-        { key: 'browser fleet', value: counters.scraper || 0, tone: counters.scraper > 0 ? 'good' : undefined }
-      ];
-    case 'analyst':
-      return [
-        { key: 'postmortems', value: counters.analyst || 0 }
+        { key: 'browser fleet', value: counters.scraper || 0, tone: counters.scraper > 0 ? 'good' : undefined },
+        { key: 'analysis/min', value: counters.analyst || 0, tone: counters.analyst > 0 ? 'warm' : undefined }
       ];
     case 'mailer':
       return [
@@ -413,7 +512,7 @@ function statsForNode(id, { counters, builderInfo, leadDetail }) {
       ];
     case 'builder':
       return [
-        { key: 'session', value: builderInfo?.status || 'idle', tone: builderInfo?.status === 'running' ? 'warm' : undefined },
+        { key: 'session', value: builderInfo?.status === 'not_started' ? 'idle' : builderInfo?.status || 'idle', tone: builderInfo?.status === 'running' ? 'warm' : undefined },
         { key: 'cost', value: builderInfo?.totalCostUsd ? `$${builderInfo.totalCostUsd}` : '—' }
       ];
     default:

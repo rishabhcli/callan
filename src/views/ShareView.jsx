@@ -109,7 +109,7 @@ export default function ShareView({ token }) {
       </section>
 
       <footer className="nyna-share-foot">
-        callmemaybe · private build session · token <span style={{ color: 'var(--apricot)', marginLeft: 6 }}>{token.slice(0, 10)}…</span>
+        callan · private build session · token <span style={{ color: 'var(--apricot)', marginLeft: 6 }}>{token.slice(0, 10)}…</span>
       </footer>
     </div>
   );

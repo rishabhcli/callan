@@ -303,6 +303,34 @@ async function runCoreChecks(mods) {
     return order.join(' > ');
   });
 
+  await check('queue.claims_multiple_outreach_agents_without_duplicates', () => {
+    resetComplianceEnv(env);
+    env.outreach.batchSize = 3;
+    const first = insertLead(leads, containerTagFor, { id: stamp('claim_first'), phone: phone('0230') });
+    const second = insertLead(leads, containerTagFor, { id: stamp('claim_second'), phone: phone('0231') });
+    const future = insertLead(leads, containerTagFor, { id: stamp('claim_future'), phone: phone('0232') });
+    const now = Date.now();
+    leads.update(first, { research_status: 'qualified', outreach_status: 'queued', next_action: 'call', last_contacted_at: null });
+    leads.update(second, { research_status: 'qualified', outreach_status: 'queued', next_action: 'call', last_contacted_at: null });
+    leads.update(future, { research_status: 'qualified', outreach_status: 'retry', next_action: `retry_after:${now + 60_000}`, last_contacted_at: now });
+
+    const claimA = leads.claimOutreach(first, { now, phoneClassification: 'business_landline' });
+    const duplicate = leads.claimOutreach(first, { now: now + 1, phoneClassification: 'business_landline' });
+    const claimB = leads.claimOutreach(second, { now: now + 2, phoneClassification: 'business_landline' });
+    const blockedByBackoff = leads.claimOutreach(future, { now: now + 3, phoneClassification: 'business_landline' });
+    const runningCount = db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE outreach_status = 'running' AND id IN (?, ?)`).get(first, second).n;
+
+    assert(claimA.claimed === true, `first claim failed: ${JSON.stringify(claimA)}`);
+    assert(duplicate.claimed === false, `duplicate claim succeeded: ${JSON.stringify(duplicate)}`);
+    assert(claimB.claimed === true, `second claim failed: ${JSON.stringify(claimB)}`);
+    assert(blockedByBackoff.claimed === false, `future retry was claimed: ${JSON.stringify(blockedByBackoff)}`);
+    assert(runningCount === 2, `expected two running claims, got ${runningCount}`);
+    assert(leads.get(first).outreach_status === 'running', 'first was not running');
+    assert(leads.get(second).outreach_status === 'running', 'second was not running');
+    assert(leads.get(future).outreach_status === 'retry', 'future retry should remain queued');
+    return { claimed: [claimA.row.id, claimB.row.id], duplicate: duplicate.reason, future: blockedByBackoff.reason };
+  });
+
   await check('idempotency.payment_lookup_and_unique_key', () => {
     const leadId = insertLead(leads, containerTagFor, { id: stamp('payment'), phone: phone('0214') });
     const key = `invoice_${leadId}_50000`;

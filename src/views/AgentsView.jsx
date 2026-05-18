@@ -9,8 +9,11 @@ const WORKERS = [
   { id: 'builder', label: 'Builder driver',   sub: 'browser-use + lovable' }
 ];
 
-export default function AgentsView({ nodeStates = {}, counters = {}, leads = [], onFocusLead }) {
+export default function AgentsView({ nodeStates = {}, counters = {}, leads = [], outreach = null, onFocusLead }) {
   const liveLeads = useMemo(() => leads.filter((l) => ['calling', 'building', 'closing'].includes(l.status)), [leads]);
+  const callerAgents = outreach?.agents || {};
+  const activeJobs = callerAgents.activeJobs || outreach?.activeJobs || [];
+  const queued = outreach?.queue?.queued ?? leads.filter((l) => ['queued', 'retry'].includes(l.outreach_status)).length;
 
   return (
     <div className="nyna-agents-shell">
@@ -23,6 +26,11 @@ export default function AgentsView({ nodeStates = {}, counters = {}, leads = [],
             Below is the per-worker fleet rollup; the right rail tracks per-lead state.
           </div>
         </div>
+        <div className="nyna-agents-meters">
+          <Meter label="caller agents" value={`${callerAgents.active ?? 0}/${callerAgents.concurrency ?? 1}`} />
+          <Meter label="available" value={callerAgents.available ?? 0} />
+          <Meter label="queued" value={queued} />
+        </div>
       </header>
 
       <section className="nyna-agents-grid">
@@ -32,9 +40,28 @@ export default function AgentsView({ nodeStates = {}, counters = {}, leads = [],
             worker={w}
             state={nodeStates[w.id] || 'idle'}
             rate={counters[w.id] || 0}
+            instances={w.id === 'caller' ? callerAgents : null}
           />
         ))}
       </section>
+
+      {activeJobs.length ? (
+        <section>
+          <div className="nyna-section-title">active caller agents</div>
+          <div className="nyna-workloads">
+            {activeJobs.map((job) => (
+              <button key={job.leadId} className="nyna-workload-row" onClick={() => onFocusLead?.(job.leadId)}>
+                <div className="nyna-workload-name">
+                  <span className="nyna-workload-dot" />
+                  <span>{job.businessName || job.leadId}</span>
+                </div>
+                <span className="nyna-workload-status">{job.agentId || 'caller'}</span>
+                <span className="nyna-workload-meta">{elapsed(job.startedAt)} running</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section>
         <div className="nyna-section-title">live workloads</div>
@@ -61,7 +88,18 @@ export default function AgentsView({ nodeStates = {}, counters = {}, leads = [],
   );
 }
 
-function WorkerCard({ worker, state, rate }) {
+function Meter({ label, value }) {
+  return (
+    <div className="nyna-agents-meter">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function WorkerCard({ worker, state, rate, instances }) {
+  const active = instances?.active ?? 0;
+  const concurrency = instances?.concurrency ?? null;
   return (
     <article className={`nyna-worker-card nyna-worker-${state}`}>
       <header className="nyna-worker-head">
@@ -70,12 +108,19 @@ function WorkerCard({ worker, state, rate }) {
       </header>
       <div className="nyna-worker-title">{worker.label}</div>
       <div className="nyna-worker-rate">
-        <div className="nyna-worker-rate-val">{rate}</div>
-        <div className="nyna-worker-rate-key">events/min</div>
+        <div className="nyna-worker-rate-val">{instances ? active : rate}</div>
+        <div className="nyna-worker-rate-key">{instances ? `of ${concurrency || 1} agents active` : 'events/min'}</div>
       </div>
       <div className="nyna-worker-bar">
-        <div className="nyna-worker-bar-fill" style={{ width: `${Math.min(100, rate * 8)}%` }} />
+        <div className="nyna-worker-bar-fill" style={{ width: `${Math.min(100, instances ? (active / Math.max(1, concurrency || 1)) * 100 : rate * 8)}%` }} />
       </div>
     </article>
   );
+}
+
+function elapsed(startedAt) {
+  if (!startedAt) return '0s';
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m`;
 }

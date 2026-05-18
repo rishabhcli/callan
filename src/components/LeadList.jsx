@@ -26,7 +26,7 @@ function statusClass(s) {
   }
 }
 
-const FALLBACK_EMAIL = 'owner@demo.callmemaybe.dev';
+const FALLBACK_EMAIL = 'owner@demo.callan.dev';
 const PRESENCE_STRENGTHS = new Set(['none', 'weak', 'mixed', 'strong']);
 
 function labelize(value) {

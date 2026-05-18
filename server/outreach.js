@@ -37,7 +37,8 @@ const cfg = {
 };
 
 let timer = null;
-let activeJob = null;
+const activeJobs = new Map();
+let processingBatch = false;
 
 export function startOutreachLoop() {
   recoverActiveJobs();
@@ -77,12 +78,21 @@ export function resumeOutreachLoop({ reason = 'operator_resume' } = {}) {
 
 export function outreachStatus() {
   const control = autonomyControlState();
+  const jobs = activeJobList();
+  const concurrency = outreachConcurrency();
   return {
     running: !!timer && !control.paused,
     loopActive: !!timer,
     paused: control.paused,
     pauseReason: control.reason,
-    activeJob,
+    activeJob: jobs[0] || null,
+    activeJobs: jobs,
+    agents: {
+      concurrency,
+      active: jobs.length,
+      available: Math.max(0, concurrency - jobs.length),
+      activeJobs: jobs
+    },
     states: Object.values(OUTREACH_STATES),
     queue: outreachQueueSummary(),
     quota: dailyQuotaStatus(),
@@ -261,8 +271,17 @@ export function canRouteCallLead(leadId, options = {}) {
 }
 
 async function processOutreachBatch() {
+  if (processingBatch) return;
+  processingBatch = true;
+  try {
+    processOutreachBatchOnce();
+  } finally {
+    processingBatch = false;
+  }
+}
+
+function processOutreachBatchOnce() {
   recoverActiveJobs();
-  if (activeJob) return;
 
   const control = autonomyControlState();
   if (control.paused) {
@@ -282,23 +301,73 @@ async function processOutreachBatch() {
     return;
   }
 
-  const batch = listDueOutreachQueue({ limit: env.outreach.batchSize });
+  const slots = availableOutreachSlots({ quota });
+  if (slots <= 0) return;
+
+  const batch = listDueOutreachQueue({ limit: Math.max(slots * 4, slots, 10) });
   if (!batch.length) return;
 
+  let started = 0;
   for (const lead of batch) {
-    if (activeJob) return;
+    if (started >= slots) return;
+    if (activeJobs.has(lead.id)) continue;
     const explanation = explainCallabilityForLead(lead);
     if (!explanation.callable) {
       handleUncallableQueuedLead(lead, explanation);
       continue;
     }
-    await runLeadOutreach(lead, explanation);
+    const disclosureText = recordingDisclosure(lead.business_name);
+    const check = callabilityForLead({ lead, disclosureText });
+    if (!check.ok) {
+      recordCallDecision({
+        leadId: lead.id,
+        phone: lead.phone,
+        allowed: false,
+        reason: check.reason,
+        disclosureText
+      });
+      handleUncallableQueuedLead(lead, {
+        ...explanation,
+        blockers: [{ name: 'callability', reason: check.reason, terminal: true }],
+        gates: [...(explanation.gates || []), { name: 'callability', ok: false, reason: check.reason, terminal: true }]
+      });
+      continue;
+    }
+
+    const now = Date.now();
+    const claim = leads.claimOutreach(lead.id, {
+      now,
+      riskStatus: 'callable',
+      phoneClassification: check.phoneClassification,
+      nextAction: 'call_in_progress',
+      actor: 'caller'
+    });
+    if (!claim.claimed || !claim.row) continue;
+
+    const job = {
+      agentId: nextAgentId(),
+      leadId: claim.row.id,
+      businessName: claim.row.business_name,
+      startedAt: now,
+      phoneClassification: check.phoneClassification
+    };
+    activeJobs.set(claim.row.id, job);
+    recordOutreachEvent(claim.row.id, 'outreach_attempt', 'calling lead', {
+      agentId: job.agentId,
+      phoneClassification: check.phoneClassification,
+      mode: env.runMode
+    });
+    emit('outreach.agent_claimed', { ...job, active: activeJobs.size, concurrency: outreachConcurrency() });
+    runLeadOutreach(claim.row, explanation, { check, job }).catch((err) => {
+      emit('outreach.error', { worker: 'caller', leadId: claim.row.id, error: err?.message || String(err) });
+    });
+    started += 1;
   }
 }
 
-async function runLeadOutreach(lead, explanation) {
+async function runLeadOutreach(lead, explanation, { check = null, job = null } = {}) {
   const disclosureText = recordingDisclosure(lead.business_name);
-  const check = callabilityForLead({ lead, disclosureText });
+  check = check || callabilityForLead({ lead, disclosureText });
   if (!check.ok) {
     recordCallDecision({
       leadId: lead.id,
@@ -316,11 +385,15 @@ async function runLeadOutreach(lead, explanation) {
   }
 
   const now = Date.now();
-  activeJob = { leadId: lead.id, businessName: lead.business_name, startedAt: now, phoneClassification: check.phoneClassification };
-  recordOutreachEvent(lead.id, 'outreach_attempt', 'calling lead', {
-    phoneClassification: check.phoneClassification,
-    mode: env.runMode
-  });
+  if (!activeJobs.has(lead.id)) {
+    activeJobs.set(lead.id, job || {
+      agentId: nextAgentId(),
+      leadId: lead.id,
+      businessName: lead.business_name,
+      startedAt: now,
+      phoneClassification: check.phoneClassification
+    });
+  }
 
   try {
     leads.update(lead.id, {
@@ -336,10 +409,10 @@ async function runLeadOutreach(lead, explanation) {
       direction: 'outbound',
       channel: 'agentphone',
       body: check.reason,
-      metadata: { phoneClassification: check.phoneClassification, mode: env.runMode }
+      metadata: { agentId: activeJobs.get(lead.id)?.agentId || null, phoneClassification: check.phoneClassification, mode: env.runMode }
     });
-    emit('outreach.running', { leadId: lead.id, businessName: lead.business_name, phoneClassification: check.phoneClassification });
-    emit('outreach.calling', { leadId: lead.id, businessName: lead.business_name, phoneClassification: check.phoneClassification });
+    emit('outreach.running', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
+    emit('outreach.calling', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
 
     await runCaller({ leadId: lead.id, toPhone: check.phone });
 
@@ -350,7 +423,7 @@ async function runLeadOutreach(lead, explanation) {
     }
     leads.update(lead.id, { outreach_status: OUTREACH_STATES.COMPLETED, next_action: 'await_analysis' });
     recordOutreachEvent(lead.id, 'outreach_completed', 'caller completed', { mode: env.runMode });
-    emit('outreach.completed', { leadId: lead.id, businessName: lead.business_name });
+    emit('outreach.completed', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null });
   } catch (err) {
     const latest = leads.get(lead.id) || lead;
     if (BLOCKED_STATES.has(latest.outreach_status) || latest.risk_status === 'opt-out') {
@@ -361,7 +434,15 @@ async function runLeadOutreach(lead, explanation) {
     }
     scheduleRetryOrFail(latest, err);
   } finally {
-    activeJob = null;
+    activeJobs.delete(lead.id);
+    emit('outreach.agent_released', { leadId: lead.id, businessName: lead.business_name, active: activeJobs.size, concurrency: outreachConcurrency() });
+    if (timer) {
+      queueMicrotask(() => {
+        processOutreachBatch().catch((err) => {
+          emit('outreach.error', { worker: 'caller', error: err?.message || String(err) });
+        });
+      });
+    }
   }
 }
 
@@ -420,7 +501,8 @@ function recoverActiveJobs() {
   `).all();
 
   for (const lead of rows) {
-    if (activeJob?.leadId === lead.id && now - activeJob.startedAt < cfg.activeJobTimeoutMs) continue;
+    const activeJob = activeJobs.get(lead.id);
+    if (activeJob && now - activeJob.startedAt < cfg.activeJobTimeoutMs) continue;
     const touchedAt = lead.last_contacted_at || lead.updated_at || lead.created_at || 0;
     if (now - touchedAt < cfg.activeJobTimeoutMs) continue;
 
@@ -428,6 +510,7 @@ function recoverActiveJobs() {
     const maxAttempts = Math.max(1, env.outreach.maxAttemptsPerPhone);
     if (attempts < maxAttempts) {
       const dueAt = now + retryDelayMs(attempts || 1);
+      activeJobs.delete(lead.id);
       leads.update(lead.id, {
         outreach_status: OUTREACH_STATES.QUEUED,
         risk_status: 'recovered_active_job',
@@ -436,6 +519,7 @@ function recoverActiveJobs() {
       recordOutreachEvent(lead.id, 'outreach_active_recovered', 'stale active job requeued', { attempts, maxAttempts, dueAt });
       emit('outreach.job_recovered', { leadId: lead.id, businessName: lead.business_name, status: 'queued', dueAt });
     } else {
+      activeJobs.delete(lead.id);
       leads.update(lead.id, {
         outreach_status: OUTREACH_STATES.FAILED,
         risk_status: 'recovered_active_job',
@@ -445,6 +529,31 @@ function recoverActiveJobs() {
       emit('outreach.job_recovered', { leadId: lead.id, businessName: lead.business_name, status: 'failed' });
     }
   }
+}
+
+function outreachConcurrency() {
+  return Math.max(1, Math.floor(Number(env.outreach.batchSize) || 1));
+}
+
+function activeJobList() {
+  return [...activeJobs.values()].sort((a, b) => a.startedAt - b.startedAt);
+}
+
+function availableOutreachSlots({ quota }) {
+  const concurrency = outreachConcurrency();
+  let slots = Math.max(0, concurrency - activeJobs.size);
+  if (quota?.enforced) slots = Math.min(slots, Math.max(0, quota.remaining ?? 0));
+  return slots;
+}
+
+function nextAgentId() {
+  const used = new Set(activeJobs.values().map((job) => job.agentId));
+  const concurrency = outreachConcurrency();
+  for (let i = 1; i <= concurrency; i += 1) {
+    const id = `caller-${i}`;
+    if (!used.has(id)) return id;
+  }
+  return `caller-${activeJobs.size + 1}`;
 }
 
 function explainCallabilityForLead(lead, {
