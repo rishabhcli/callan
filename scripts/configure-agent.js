@@ -19,6 +19,7 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildDemoSystemPromptAddendum } from '../server/demoMode.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,6 +27,7 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = path.join(REPO_ROOT, '.env');
 
 const args = parseArgs(process.argv.slice(2));
+const PROMPT_ONLY = !!(args['prompt-only'] || args.promptOnly);
 const PUBLIC_URL = (args.url || process.env.APP_PUBLIC_URL || '').replace(/\/+$/, '');
 const API_KEY = process.env.AGENTPHONE_API_KEY;
 const AGENT_ID = process.env.AGENTPHONE_AGENT_ID;
@@ -34,18 +36,20 @@ const VOICE = process.env.AGENTPHONE_DEFAULT_VOICE || 'Polly.Joanna';
 
 if (!API_KEY) fatal('Missing AGENTPHONE_API_KEY in .env');
 if (!AGENT_ID) fatal('Missing AGENTPHONE_AGENT_ID in .env');
-if (!PUBLIC_URL) fatal('No public URL. Pass --url <https://...> or set APP_PUBLIC_URL in .env.');
-if (PUBLIC_URL.startsWith('http://localhost') || PUBLIC_URL.startsWith('http://127.')) {
-  fatal(`Public URL "${PUBLIC_URL}" is localhost — AgentPhone cannot reach it.
+if (!PROMPT_ONLY) {
+  if (!PUBLIC_URL) fatal('No public URL. Pass --url <https://...> or set APP_PUBLIC_URL in .env. (Or use --prompt-only to skip webhook registration.)');
+  if (PUBLIC_URL.startsWith('http://localhost') || PUBLIC_URL.startsWith('http://127.')) {
+    fatal(`Public URL "${PUBLIC_URL}" is localhost — AgentPhone cannot reach it.
 Run ngrok (or cloudflared) first:
     ngrok http 8787
 Then re-run with the https forwarding URL:
     node scripts/configure-agent.js --url https://YOURID.ngrok-free.app`);
+  }
 }
 
-const WEBHOOK_URL = `${PUBLIC_URL}/api/webhooks/agentphone`;
+const WEBHOOK_URL = PROMPT_ONLY ? null : `${PUBLIC_URL}/api/webhooks/agentphone`;
 
-const SYSTEM_PROMPT = `You are Callan, the live voice operator for callmemaybe, an agentic web agency that researches small businesses, calls them, and builds $500 same-day websites for them.
+const BASE_SYSTEM_PROMPT = `You are Callan, the live voice operator for callmemaybe, an agentic web agency that researches small businesses, calls them, and builds $500 same-day websites for them.
 
 The person on this line is talking to you right now. LISTEN to what they say, then answer in one or two short sentences. Never go past three.
 
@@ -70,6 +74,11 @@ RULES:
 - If someone says "do not call", "remove me", or "opt out", respond: "Got it, you are now on our do-not-call list. You will not hear from us again."
 - Always read back phone numbers, emails, and dollar amounts before confirming.
 - After your greeting, WAIT for the caller to speak. Do not narrate or fill silence.`;
+
+// Demo Mode lives in server/demoMode.js so the prompt, dashboard, and email all
+// stay in sync. Append it to the base prompt so the LLM handles the persona
+// switch organically when it hears the exact trigger phrase "Enter Demo Mode".
+const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n${buildDemoSystemPromptAddendum()}`;
 
 const BEGIN_MESSAGE = `Hi, this is Callan, callmemaybe's voice operator. Who am I speaking with?`;
 
@@ -101,6 +110,12 @@ async function main() {
     interruptionSensitivity: 0.7  // a bit less trigger-happy than default
   });
   console.log(`  ✓ agent updated (id=${updated?.id || AGENT_ID})`);
+
+  if (PROMPT_ONLY) {
+    banner('PROMPT-ONLY MODE: skipping webhook registration + secret rotation');
+    console.log('Webhook URL and secret left untouched. Server does NOT need a restart.');
+    return;
+  }
 
   banner('STEP 2: register webhook URL');
   console.log(`  url           ${WEBHOOK_URL}`);

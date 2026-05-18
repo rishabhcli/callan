@@ -3,7 +3,8 @@ import cors from 'cors';
 import { env } from './env.js';
 import { log } from './logger.js';
 import { attachStream, emit } from './sse.js';
-import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, db } from './db.js';
+import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts } from './db.js';
+import { marginForLead } from './costs.js';
 import { DiscoverRequest, CallRequest, FollowupRequest, BuildRequest } from './types.js';
 import {
   listKinds,
@@ -16,10 +17,12 @@ import {
 import { handleAgentPhoneWebhook, verifyAgentPhone } from './webhooks/agentphone.js';
 import { agentMailWebhookEventId, isInboundAgentMailWebhook, normalizeAgentMailWebhook, verifyAgentMail } from './webhooks/agentmail.js';
 import { processStripeWebhookEvent, verifyStripe } from './webhooks/stripe.js';
+import { acceptHostingSubscription, handleStripeSubscriptionEvent } from './hostingSubscription.js';
 import { liveReadiness } from './readiness.js';
 import { fulfillmentReadiness } from './fulfillment/targets.js';
 import { fulfillmentQueueSnapshot } from './fulfillment/queue.js';
 import { recoverTriggeredPaymentBuilds, revenueHealthSummary, revenueStatusForLead } from './paymentFlow.js';
+import { listExperimentKeys, rollup as experimentRollup } from './experiments.js';
 import { callabilityForLead, normalizePhone, recordingDisclosure } from './compliance.js';
 import {
   approveLeadForLiveCall,
@@ -35,11 +38,21 @@ import {
   startOutreachLoop,
   stopOutreachLoop
 } from './outreach.js';
+import { reputationStatus, startReputationLoop } from './reputation.js';
+import { topPriorityLeads, nicheWinRateMap } from './leadPriority.js';
 import { runScraper } from './workers/scraper.js';
 import { runCaller } from './workers/caller.js';
 import { runAnalyst } from './workers/analyst.js';
 import { handleAgentMailInbound, runMailer } from './workers/mailer.js';
 import { runBuilder } from './workers/builder.js';
+import { runScheduledCaller } from './workers/scheduledCaller.js';
+import {
+  registerScheduledCallDispatcher,
+  startScheduledCallLoop,
+  cancelScheduledCall,
+  fireScheduledCallNow
+} from './scheduledCalls.js';
+import { ensureOperatorTransferConfigured } from './operatorTransfer.js';
 import {
   createBrowserUseResearchJob,
   getBrowserResearchStatus,
@@ -51,6 +64,16 @@ import { BrowserUseLovableAdapter, normalizeBrowserUseSessionSnapshot } from './
 import { generateGrowthPlanForLead, growthStatus, readGrowthState, recordGrowthCustomerResponse, sendGrowthRecap } from './growth/index.js';
 import { mossStatusForLead } from './moss/hotIndex.js';
 import { buildQaReadModel } from './fulfillment/hooks/index.js';
+import { recordReferralClick, referralRollup, totalReferralClicks } from './referrals.js';
+import {
+  acceptQuote as portalAcceptQuote,
+  requestEdit as portalRequestEdit,
+  bookCallback as portalBookCallback,
+  optOut as portalOptOut,
+  quoteStatusForLead,
+  paymentLinksForLead,
+  pendingCallbackForLead
+} from './customerPortal.js';
 
 const app = express();
 app.use(cors());
@@ -69,10 +92,94 @@ const fire = (worker, args, fn) => {
     });
 };
 
-const startBuilder = (args) => fire('builder', args, runBuilder);
+/**
+ * Look up the customer-email-thread context for a paid lead so the builder's
+ * onLiveUrl callback can send the "Watch your site come together" email in
+ * the same AgentMail thread the invoice was in.
+ *
+ * Sources, in priority order:
+ *   - `payments.customer_email` (set when Stripe webhook records the paid event)
+ *   - the latest inbound AgentMail contact_event for the lead (their reply)
+ *   - the latest outbound AgentMail contact_event provides messageId + threadId
+ *
+ * Returns null if we can't reconstruct enough to send.
+ */
+function findEmailContextForLead(leadId) {
+  if (!leadId) return null;
+  try {
+    const lead = leads.get(leadId);
+    if (!lead) return null;
+    const outbound = db.prepare(`
+      SELECT provider_id, thread_id, subject
+      FROM contact_events
+      WHERE lead_id = ? AND channel = 'agentmail' AND direction = 'outbound'
+        AND provider_id IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(leadId);
+    const payment = db.prepare(`
+      SELECT customer_email
+      FROM payments
+      WHERE lead_id = ? AND customer_email IS NOT NULL AND customer_email != ''
+      ORDER BY paid_at DESC, created_at DESC
+      LIMIT 1
+    `).get(leadId);
+    const customerEmail = payment?.customer_email || null;
+    if (!outbound || !customerEmail) return null;
+    return {
+      messageId: outbound.provider_id,
+      threadId: outbound.thread_id || lead.agentmail_thread_id,
+      customerEmail,
+      businessName: lead.business_name
+    };
+  } catch (err) {
+    log.warn('builder.email_context_lookup_failed', { leadId, error: err?.message || String(err) });
+    return null;
+  }
+}
+
+/**
+ * Wraps runBuilder with the onLiveUrl callback that emails the customer the
+ * Browser Use live URL the moment the build session starts. Lazy-imports
+ * sendPreviewBuildEmail to avoid a circular dep at module load.
+ */
+const startBuilder = (args) => fire('builder', { ...args }, async (a) => {
+  const { sendPreviewBuildEmail } = await import('./workers/mailer.js');
+  const onLiveUrl = async (liveUrl, ctx) => {
+    const ec = findEmailContextForLead(a.leadId);
+    if (!ec) {
+      log.warn('builder.live_url.skipped', { leadId: a.leadId, reason: 'no_email_context' });
+      return;
+    }
+    try {
+      await sendPreviewBuildEmail({
+        leadId: a.leadId,
+        liveUrl,
+        inReplyToMessageId: ec.messageId,
+        threadId: ec.threadId,
+        toEmail: ec.customerEmail,
+        businessName: ec.businessName,
+        buildId: ctx?.buildId,
+        sessionId: ctx?.sessionId,
+        mock: !!ctx?.mock
+      });
+    } catch (err) {
+      log.warn('builder.live_url.email_failed', { leadId: a.leadId, error: err?.message || String(err) });
+    }
+  };
+  return runBuilder({ ...a, onLiveUrl });
+});
 
 app.get('/api/health', (_req, res) => {
   const readiness = liveReadiness();
+  const since24h = Date.now() - 24 * 3600 * 1000;
+  let economics24h = null;
+  try {
+    economics24h = economicsByNiche({ since: since24h }).totals;
+  } catch (err) {
+    log.warn('health.economics_rollup_failed', { error: err?.message || String(err) });
+    economics24h = { costUsd: 0, revenueUsd: 0, marginUsd: 0, marginPct: null, leads: 0 };
+  }
   res.json({
     ok: true,
     ts: Date.now(),
@@ -94,7 +201,17 @@ app.get('/api/health', (_req, res) => {
     browserUseStatus: browserUseStatusSummary(),
     reasoning: reasoningTraces.summary(),
     growth: growthStatus(),
-    revenue: revenueHealthSummary(),
+    revenue: {
+      ...revenueHealthSummary(),
+      mrrUsd: subscriptions.activeMrrCents() / 100,
+      subscriptionsByStatus: subscriptions.countByStatus(),
+      costsUsd24h: economics24h?.costUsd ?? 0,
+      marginUsd24h: economics24h?.marginUsd ?? 0
+    },
+    referrals: {
+      totalClicks: totalReferralClicks(),
+      topReferrers: referralRollup({ limit: 10 })
+    },
     lastErrors: Object.fromEntries(Object.entries(readiness.providers).map(([k, v]) => [k, v.lastError]).filter(([, v]) => v)),
     hackathon: env.hackathon
   });
@@ -182,6 +299,36 @@ app.get('/api/leads', (_req, res) => {
   res.json({ leads: leads.list() });
 });
 
+app.get('/api/economics/by-niche', (req, res) => {
+  try {
+    const since = parseSince(req.query?.since);
+    const rollup = economicsByNiche({ since });
+    res.json({
+      generatedAt: Date.now(),
+      since,
+      ...rollup
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.get('/api/leads/priorities', (req, res) => {
+  try {
+    const limit = boundedLimit(req.query?.limit, 30, 100);
+    const top = topPriorityLeads({ limit });
+    const winRates = nicheWinRateMap({});
+    res.json({
+      generatedAt: Date.now(),
+      limit,
+      leads: top,
+      nicheWinRates: winRates
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 app.get('/api/memory/businesses', (_req, res) => {
   res.json({ businesses: memoryBusinesses() });
 });
@@ -222,6 +369,12 @@ app.get('/api/leads/:id', async (req, res) => {
   } catch (err) {
     log.warn('memory.list failed', { error: err.message });
   }
+  let margin = null;
+  try {
+    margin = marginForLead(lead.id);
+  } catch (err) {
+    log.warn('lead.margin_lookup_failed', { leadId: lead.id, error: err?.message || String(err) });
+  }
   res.json({
     lead,
     calls: callRows,
@@ -242,7 +395,8 @@ app.get('/api/leads/:id', async (req, res) => {
     builderQa,
     reasoningTraces: leadReasoningTraces,
     moss,
-    growth
+    growth,
+    margin
   });
 });
 
@@ -558,6 +712,15 @@ app.get('/api/outreach/routes', (_req, res) => {
   res.json(outreachRouteSmoke());
 });
 
+app.get('/api/reputation/status', async (_req, res) => {
+  try {
+    const payload = await reputationStatus();
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
 app.get('/api/browser-use/sessions', async (req, res) => {
   const limit = boundedLimit(req.query?.limit, 80, 200);
   const hydrate = req.query?.hydrate !== 'false';
@@ -720,6 +883,68 @@ app.post('/api/leads/:id/build', (req, res) => {
   res.status(202).json({ accepted: true, target: target || 'default' });
 });
 
+const previewScreenshotAdapter = (() => {
+  let adapter = null;
+  return () => {
+    if (!env.browserUse.apiKey) return null;
+    if (!adapter) adapter = new BrowserUseLovableAdapter();
+    return adapter;
+  };
+})();
+
+function sendPreviewScreenshotFallback(res, businessName) {
+  const safe = (businessName || 'Your site').replace(/[<>&]/g, '');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 630"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0a0a"/><stop offset="1" stop-color="#191d24"/></linearGradient></defs><rect width="1120" height="630" fill="url(#g)"/><rect x="32" y="32" width="1056" height="566" rx="14" fill="#0f0f0f" stroke="#2a2a2a"/><circle cx="68" cy="68" r="6" fill="#ff5f56"/><circle cx="92" cy="68" r="6" fill="#ffbd2e"/><circle cx="116" cy="68" r="6" fill="#27c93f"/><rect x="160" y="58" width="880" height="22" rx="6" fill="#1a1a1a"/><text x="180" y="74" font-family="-apple-system,Segoe UI,sans-serif" font-size="13" fill="#888">lovable.dev/${safe.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)} — building now</text><circle cx="130" cy="180" r="10" fill="#e74c3c"/><text x="155" y="186" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#e74c3c" font-weight="700">LIVE</text><text x="120" y="290" font-family="-apple-system,Segoe UI,sans-serif" font-size="40" fill="#fafafa" font-weight="700">${safe}</text><text x="120" y="340" font-family="-apple-system,Segoe UI,sans-serif" font-size="20" fill="#aaa">Tap to watch the live build session →</text></svg>`;
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Content-Type', 'image/svg+xml');
+  res.send(svg);
+}
+
+app.get('/api/preview-build/:buildId/screenshot.png', async (req, res) => {
+  const buildId = req.params.buildId;
+  const buildRow = builds.get(buildId);
+  if (!buildRow) {
+    sendPreviewScreenshotFallback(res, 'Your site');
+    return;
+  }
+  const lead = leads.get(buildRow.lead_id);
+  const businessName = lead?.business_name || 'Your site';
+
+  const sessionId = buildRow.browser_session_id;
+  if (!sessionId || sessionId.startsWith('mock-')) {
+    sendPreviewScreenshotFallback(res, businessName);
+    return;
+  }
+
+  const adapter = previewScreenshotAdapter();
+  if (!adapter) {
+    sendPreviewScreenshotFallback(res, businessName);
+    return;
+  }
+
+  try {
+    const session = await adapter.getSession(sessionId);
+    const shotUrl = session?.screenshotUrl;
+    if (!shotUrl) {
+      sendPreviewScreenshotFallback(res, businessName);
+      return;
+    }
+    const upstream = await fetch(shotUrl);
+    if (!upstream.ok) {
+      sendPreviewScreenshotFallback(res, businessName);
+      return;
+    }
+    const contentType = upstream.headers.get('content-type') || 'image/png';
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.send(buf);
+  } catch (err) {
+    log.warn('preview_build.screenshot_failed', { buildId, sessionId, err: err?.message || String(err) });
+    sendPreviewScreenshotFallback(res, businessName);
+  }
+});
+
 app.get('/api/leads/:id/build-preview', (req, res) => {
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).send('<!doctype html><html><body>Lead not found.</body></html>');
@@ -804,7 +1029,7 @@ app.post('/api/webhooks/agentmail', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const v = verifyStripe(req.rawBody || req.body, sig);
   if (!v.ok) {
@@ -813,7 +1038,37 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req
   }
   const event = v.event;
   const result = processStripeWebhookEvent(event, { req, startBuilder });
-  res.json(result);
+  let subscription = null;
+  if (typeof event?.type === 'string' && event.type.startsWith('customer.subscription.')) {
+    try {
+      subscription = await handleStripeSubscriptionEvent(event);
+    } catch (err) {
+      log.warn('hosting_subscription.webhook_failed', {
+        eventType: event.type,
+        error: err?.message || String(err)
+      });
+      subscription = { ok: false, reason: 'handler_threw', error: err?.message || String(err) };
+    }
+  }
+  res.json(subscription ? { ...result, subscription } : result);
+});
+
+// Customer-facing one-click accept link from the hosting upsell email.
+// 302-redirects to the Stripe Checkout URL so the customer never sees JSON.
+app.get('/api/hosting/accept/:leadId', async (req, res) => {
+  const leadId = String(req.params.leadId || '').trim();
+  if (!leadId) return res.status(400).send('leadId required');
+  try {
+    const { url } = await acceptHostingSubscription({ leadId });
+    if (!url) return res.status(502).send('Stripe Checkout URL missing');
+    return res.redirect(302, url);
+  } catch (err) {
+    log.warn('hosting_subscription.accept_failed', {
+      leadId,
+      error: err?.message || String(err)
+    });
+    return res.status(500).send(`Could not start hosting subscription: ${err?.message || 'unknown error'}`);
+  }
 });
 
 // --- per-customer share link (browser-use live preview) ---
@@ -827,6 +1082,9 @@ app.get('/api/share/build/:token', (req, res) => {
   const buildRows = builds.listByLead(lead.id) || [];
   const latest = buildRows[0] || null;
   const builderEvents = eventStore.listByLead(lead.id, { worker: 'builder', limit: 60 });
+  const quoteStatus = quoteStatusForLead(lead);
+  const { paymentLinkUrl, invoiceUrl } = paymentLinksForLead(lead.id);
+  const pendingCallback = pendingCallbackForLead(lead.id);
   res.json({
     business: {
       name: lead.business_name || null,
@@ -845,8 +1103,164 @@ app.get('/api/share/build/:token', (req, res) => {
       ts: e.ts || e.created_at,
       type: e.type || e.event_type,
       summary: e.summary || e.note || null
-    }))
+    })),
+    // Customer-portal state — drives the action cards in ShareView.
+    quoteStatus,
+    paymentLinkUrl,
+    invoiceUrl,
+    vertical_pack: lead.vertical_pack || null,
+    existingPendingCallback: pendingCallback ? {
+      id: pendingCallback.id,
+      scheduledAtMs: pendingCallback.scheduled_at_ms,
+      status: pendingCallback.status,
+      createdAt: pendingCallback.created_at
+    } : null
   });
+});
+
+// Customer-portal POST endpoints (idempotent; lock by lead.id token).
+app.post('/api/share/build/:token/accept', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  try {
+    const result = await portalAcceptQuote({ leadId: token });
+    res.json(result);
+  } catch (err) {
+    log.warn('portal.accept_quote_failed', { token, error: err?.message || String(err) });
+    res.status(500).json({ error: err?.message || 'accept_failed' });
+  }
+});
+
+app.post('/api/share/build/:token/edit', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const note = String(req.body?.note || '').trim();
+  if (!note) return res.status(400).json({ error: 'note required' });
+  try {
+    const result = await portalRequestEdit({ leadId: token, note });
+    res.json(result);
+  } catch (err) {
+    log.warn('portal.request_edit_failed', { token, error: err?.message || String(err) });
+    res.status(500).json({ error: err?.message || 'edit_failed' });
+  }
+});
+
+app.post('/api/share/build/:token/callback', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const scheduledAtMs = Number(req.body?.scheduledAtMs);
+  if (!Number.isFinite(scheduledAtMs) || scheduledAtMs <= 0) {
+    return res.status(400).json({ error: 'scheduledAtMs required (epoch ms)' });
+  }
+  const ask = String(req.body?.ask || '').trim();
+  try {
+    const result = portalBookCallback({ leadId: token, scheduledAtMs, ask });
+    res.json(result);
+  } catch (err) {
+    log.warn('portal.book_callback_failed', { token, error: err?.message || String(err) });
+    res.status(500).json({ error: err?.message || 'callback_failed' });
+  }
+});
+
+app.post('/api/share/build/:token/opt-out', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  try {
+    const reason = String(req.body?.reason || '').trim() || 'customer_portal_opt_out';
+    const result = portalOptOut({ leadId: token, reason });
+    res.json(result);
+  } catch (err) {
+    log.warn('portal.opt_out_failed', { token, error: err?.message || String(err) });
+    res.status(500).json({ error: err?.message || 'opt_out_failed' });
+  }
+});
+
+// Experiments rollup. `GET /api/experiments` returns the full set of known
+// experiment keys plus per-arm assignment/conversion/revenue rollups.
+app.get('/api/experiments', (_req, res) => {
+  const keys = listExperimentKeys();
+  const rollups = {};
+  for (const key of keys) {
+    try { rollups[key] = experimentRollup(key); }
+    catch (err) {
+      log.warn('experiments.rollup_failed', { key, error: err?.message || String(err) });
+      rollups[key] = [];
+    }
+  }
+  res.json({ keys, rollups });
+});
+
+// `GET /api/experiments/:key` returns the rollup for a single experiment.
+app.get('/api/experiments/:key', (req, res) => {
+  const key = String(req.params.key || '').trim();
+  if (!key) return res.status(400).json({ error: 'key required' });
+  try {
+    res.json({ key, rollup: experimentRollup(key) });
+  } catch (err) {
+    log.warn('experiments.rollup_failed', { key, error: err?.message || String(err) });
+    res.status(500).json({ error: 'rollup_failed' });
+  }
+});
+
+// Dashboard data: upcoming + recent scheduled callbacks.
+app.get('/api/scheduled-calls', (req, res) => {
+  const pending = scheduledCallsDb.listPending({ limit: 25 }).map(rowToScheduledCallDTO);
+  const recent = scheduledCallsDb.listRecent({ limit: 25 }).map(rowToScheduledCallDTO);
+  res.json({ pending, recent });
+});
+
+// Operator-cancel a pending scheduled callback (used by the right-rail card).
+app.post('/api/scheduled-calls/:id/cancel', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ error: 'id required' });
+  const row = cancelScheduledCall(id, { reason: req.body?.reason || 'operator_cancel' });
+  if (!row) return res.status(404).json({ error: 'not found' });
+  res.json({ ok: true, scheduledCall: rowToScheduledCallDTO(row) });
+});
+
+// Operator: fire a pending callback immediately (used by the right-rail "fire now" button).
+app.post('/api/scheduled-calls/:id/fire', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ error: 'id required' });
+  const row = fireScheduledCallNow(id, { reason: req.body?.reason || 'operator_fire_now' });
+  if (!row) return res.status(409).json({ error: 'row not pending or not found' });
+  res.json({ ok: true, scheduledCall: rowToScheduledCallDTO(row) });
+});
+
+// --- referral loop -----------------------------------------------------------
+// /r/:leadId — log the click, then 302 to the landing page. In production this
+// would point to a marketing site; for now we redirect to the dashboard root.
+app.get('/r/:leadId', (req, res) => {
+  try {
+    recordReferralClick(req, req.params?.leadId);
+  } catch (err) {
+    log.warn('referrals.record_failed', { error: err?.message || String(err) });
+  }
+  res.redirect(302, '/');
+});
+
+// /api/referrals/rollup — top-30 referring leads + total click count. Powers
+// the "Built by callmemaybe" rollup in the operator dashboard.
+app.get('/api/referrals/rollup', (req, res) => {
+  const limit = Number(req.query?.limit);
+  const top = referralRollup({ limit: Number.isFinite(limit) && limit > 0 ? limit : 30 });
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    totalClicks: totalReferralClicks(),
+    topReferrers: top
+  });
+});
+
+// /api/referrals/landing-html — utility preview that mimics the page a referral
+// visitor will land on. Lets the operator eyeball the funnel without leaving
+// the dashboard. The form POSTs niche+city to /api/leads/discover.
+app.get('/api/referrals/landing-html', (_req, res) => {
+  res.type('html').send(renderReferralLandingHtml());
 });
 
 app.use(express.static('dist'));
@@ -860,7 +1274,62 @@ app.listen(env.port, () => {
   log.info(`callmemaybe server listening`, { port: env.port, mode: env.runMode });
   const recovered = recoverTriggeredPaymentBuilds({ startBuilder });
   if (recovered.length) log.warn('builder.recovered_pending_payment_builds', { count: recovered.length });
+
+  // Scheduled-callback service: wire dispatcher then start the loop.
+  registerScheduledCallDispatcher(runScheduledCaller);
+  startScheduledCallLoop();
+
+  // Reputation auto-throttle: 30s sweep that emits reputation.alert and can
+  // pause the outreach loop when opt-out or voicemail-only rates go red.
+  try {
+    startReputationLoop();
+  } catch (err) {
+    log.warn('reputation.loop_start_failed', { error: err?.message || String(err) });
+  }
+
+  // Inbound email poller — picks up "call me" emails even when the AgentMail
+  // webhook isn't pointed at the local tunnel. Bootstraps on first tick.
+  import('./agentmailPoller.js').then(({ startAgentMailPoller }) => {
+    startAgentMailPoller();
+  }).catch((err) => log.warn('agentmail.poll.start_failed', { error: err?.message || String(err) }));
+
+  // One-shot: PATCH the AgentPhone agent record with the operator's transfer
+  // number so the platform can warm-transfer any time our server requests it.
+  // Cached internally so it only fires once per process boot.
+  ensureOperatorTransferConfigured().catch((err) => log.warn('operator.transfer.boot_configure_failed', {
+    error: err?.message || String(err)
+  }));
 });
+
+function rowToScheduledCallDTO(row) {
+  if (!row) return null;
+  const lead = row.lead_id ? leads.get(row.lead_id) : null;
+  let brief = null;
+  if (row.brief_json) {
+    try { brief = JSON.parse(row.brief_json); } catch { brief = null; }
+  }
+  return {
+    id: row.id,
+    leadId: row.lead_id,
+    threadId: row.thread_id,
+    scheduledAtMs: row.scheduled_at_ms,
+    status: row.status,
+    brief,
+    ask: brief?.ask || null,
+    attempts: row.attempts,
+    createdAt: row.created_at,
+    firedAt: row.fired_at,
+    placedCallId: row.placed_call_id,
+    failureReason: row.failure_reason,
+    lead: lead ? {
+      id: lead.id,
+      business_name: lead.business_name,
+      phone: lead.phone,
+      city: lead.city,
+      status: lead.status
+    } : null
+  };
+}
 
 function explainLeadCallability(lead) {
   const disclosureText = recordingDisclosure(lead.business_name);
@@ -994,6 +1463,90 @@ function boundedInt(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function parseSince(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.trunc(n);
+}
+
+function revenueByNiche({ since = 0 } = {}) {
+  return db.prepare(`
+    SELECT COALESCE(l.niche, 'unknown') AS niche,
+           SUM(p.amount_cents) AS revenue_cents
+    FROM payments p
+    JOIN leads l ON l.id = p.lead_id
+    WHERE p.status = 'paid'
+      AND COALESCE(p.paid_at, p.created_at, 0) >= ?
+    GROUP BY COALESCE(l.niche, 'unknown')
+  `).all(since || 0).map((row) => ({
+    niche: row.niche,
+    revenueUsd: (Number(row.revenue_cents) || 0) / 100
+  }));
+}
+
+function economicsByNiche({ since = 0 } = {}) {
+  const costRows = leadCosts.rollupByNiche({ since });
+  const revenueRows = revenueByNiche({ since });
+  const byNiche = new Map();
+  for (const row of costRows) {
+    byNiche.set(row.niche, {
+      niche: row.niche,
+      leads: Number(row.lead_count) || 0,
+      costUsd: Number(row.cost_usd) || 0,
+      revenueUsd: 0
+    });
+  }
+  for (const row of revenueRows) {
+    const entry = byNiche.get(row.niche) || {
+      niche: row.niche,
+      leads: 0,
+      costUsd: 0,
+      revenueUsd: 0
+    };
+    entry.revenueUsd = Number(row.revenueUsd) || 0;
+    byNiche.set(row.niche, entry);
+  }
+  const niches = Array.from(byNiche.values()).map((row) => {
+    const marginUsd = row.revenueUsd - row.costUsd;
+    const marginPct = row.revenueUsd > 0
+      ? Number(((marginUsd / row.revenueUsd) * 100).toFixed(2))
+      : null;
+    return {
+      niche: row.niche,
+      leads: row.leads,
+      costUsd: round2(row.costUsd),
+      revenueUsd: round2(row.revenueUsd),
+      marginUsd: round2(marginUsd),
+      marginPct
+    };
+  });
+  niches.sort((a, b) => (b.marginUsd || 0) - (a.marginUsd || 0));
+  const totals = niches.reduce((acc, row) => {
+    acc.leads += row.leads;
+    acc.costUsd += row.costUsd;
+    acc.revenueUsd += row.revenueUsd;
+    acc.marginUsd += row.marginUsd;
+    return acc;
+  }, { leads: 0, costUsd: 0, revenueUsd: 0, marginUsd: 0 });
+  return {
+    niches,
+    totals: {
+      leads: totals.leads,
+      costUsd: round2(totals.costUsd),
+      revenueUsd: round2(totals.revenueUsd),
+      marginUsd: round2(totals.marginUsd),
+      marginPct: totals.revenueUsd > 0
+        ? Number(((totals.marginUsd / totals.revenueUsd) * 100).toFixed(2))
+        : null
+    }
+  };
+}
+
+function round2(value) {
+  return Number((Number(value) || 0).toFixed(2));
 }
 
 function boundedMoney(value, min, max, fallback) {
@@ -1581,6 +2134,85 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// Minimal, server-rendered landing page used by /api/referrals/landing-html.
+// Keep this string self-contained — the goal is for the operator to preview
+// what a referred visitor sees without any frontend build step.
+function renderReferralLandingHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>callmemaybe — same-day websites for local businesses</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif; color: #17201b; background: #f6f8f4; }
+    main { width: min(640px, calc(100vw - 32px)); margin: 0 auto; padding: 64px 0 96px; }
+    .brand { font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: #4b6650; margin-bottom: 24px; }
+    h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.05; margin: 0 0 16px; }
+    p.lede { font-size: 18px; line-height: 1.5; color: #2c3a31; max-width: 56ch; margin: 0 0 32px; }
+    form { display: grid; gap: 12px; padding: 20px; background: white; border: 1px solid #d6ded8; border-radius: 12px; }
+    label { font-size: 13px; font-weight: 600; color: #2c3a31; }
+    input { padding: 12px 14px; font-size: 16px; border: 1px solid #d6ded8; border-radius: 8px; }
+    button { padding: 12px 16px; font-size: 16px; font-weight: 600; background: #165a3a; color: white; border: 0; border-radius: 8px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { font-size: 14px; color: #4b6650; min-height: 18px; }
+    footer { margin-top: 48px; font-size: 12px; color: #6a7d70; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">callmemaybe</div>
+    <h1>we build your website same-day for $500</h1>
+    <p class="lede">Tell us the business and city. We research it, write the copy, ship a real one-page site, and email you the link before the day is over.</p>
+    <form id="discover-form" autocomplete="off">
+      <div>
+        <label for="niche">Business / niche</label>
+        <input id="niche" name="niche" type="text" placeholder="plumber, salon, law firm…" required minlength="2" />
+      </div>
+      <div>
+        <label for="city">City</label>
+        <input id="city" name="city" type="text" placeholder="Oakland, CA" required minlength="2" />
+      </div>
+      <button type="submit">Build my website</button>
+      <div class="status" id="status" aria-live="polite"></div>
+    </form>
+    <footer>Referred by a site we built. callmemaybe ships small business websites same-day.</footer>
+  </main>
+  <script>
+    (function () {
+      var form = document.getElementById('discover-form');
+      var status = document.getElementById('status');
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var btn = form.querySelector('button');
+        btn.disabled = true;
+        status.textContent = 'Sending to our crew…';
+        var payload = {
+          niche: form.niche.value.trim(),
+          city: form.city.value.trim(),
+          count: 1
+        };
+        fetch('/api/leads/discover', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload)
+        }).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }).then(function () {
+          status.textContent = 'Got it. We will reach out with your site.';
+        }).catch(function (err) {
+          status.textContent = 'Could not submit: ' + (err && err.message ? err.message : 'unknown');
+          btn.disabled = false;
+        });
+      });
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 function agentMailEventId(req, body, msg) {

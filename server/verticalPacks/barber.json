@@ -1,0 +1,45 @@
+{
+  "key": "barber",
+  "name": "Barber, salon, and grooming",
+  "matchNiches": [
+    "barber",
+    "barbershop",
+    "barber shop",
+    "salon",
+    "hair salon",
+    "men's grooming",
+    "stylist",
+    "beauty salon"
+  ],
+  "priceCents": 45000,
+  "pitchTone": "Friendly, low-key, and respectful of chair-side time. Speak like a regular customer who has noticed their work, and assume the owner is in the middle of a cut or a client.",
+  "valuePropHook": "A flat $450 single-page site that shows your best cuts, your booking link, hours, and how to find the chair, so new clients walking by Instagram or Yelp can decide in ten seconds whether to come in.",
+  "objections": [
+    {
+      "objection": "My existing booking app already does that.",
+      "response": "Totally, and we link straight to it. The page sits in front of your booking app so people who find you on Google or Yelp see the work, the hours, and a one-tap link instead of bouncing off a thin profile."
+    },
+    {
+      "objection": "I just use Instagram for everything.",
+      "response": "Makes sense, and we point right at it. The page is the home base that shows the cuts, the hours, the address, and the booking link, so DMs do not have to repeat the same answers every day."
+    },
+    {
+      "objection": "Walk-ins find me fine.",
+      "response": "Good problem to have. This is more about the new client who searches before they walk in: it gives them the hours, the chair, the price tier, and a tap-to-call button so they actually show up."
+    },
+    {
+      "objection": "I do not have good photos yet.",
+      "response": "No worries. We start with what you have on Instagram or your phone and leave clean placeholders; you can swap photos in later without paying again."
+    },
+    {
+      "objection": "I cannot afford a website right now.",
+      "response": "Fair. The whole point is that it is a flat $450 one-time fee, hosted, with no monthly. If a single extra cut a month covers it, the rest is upside."
+    },
+    {
+      "objection": "I do not want clients booking online with strangers.",
+      "response": "Understood. The page does not have to take bookings; it can simply send people to call, text, or DM you, so you still gatekeep who sits in the chair."
+    }
+  ],
+  "siteTemplateHint": "Use a warm, photo-led barber template: dark, masculine palette with one bold accent, big hero image of the chair or a finished cut, services with simple price tier copy, hours, and a sticky tap-to-call button.",
+  "customerPersonaHint": "Local clients searching for a new barber or stylist, scrolling fast on a phone, looking for photos of work, a price feel, hours, and a quick way to call or DM."
+}

@@ -1,0 +1,48 @@
+{
+  "key": "hvac",
+  "name": "HVAC and heating cooling",
+  "matchNiches": [
+    "hvac",
+    "hvac contractor",
+    "heating",
+    "cooling",
+    "air conditioning",
+    "ac",
+    "ac repair",
+    "heating and cooling",
+    "heating cooling",
+    "furnace",
+    "hvac contractor"
+  ],
+  "priceCents": 60000,
+  "pitchTone": "Direct, no-fluff, dependable. Speak like the owner is on a roof or in a crawlspace and only has thirty seconds; lead with the lost-call problem, not jargon.",
+  "valuePropHook": "A flat $600 single-page site that shows your service area, what you actually fix, and a giant tap-to-call number so homeowners who Google an emergency AC at midnight stop bouncing to your competitor.",
+  "objections": [
+    {
+      "objection": "I am too busy on calls all day to deal with this.",
+      "response": "That is exactly the problem. I draft the page from your public listings and reviews, you reply to the invoice email with any corrections, and the whole thing is hosted without you sitting at a computer."
+    },
+    {
+      "objection": "I get all my jobs from word of mouth.",
+      "response": "Word of mouth is great. This is for the half of new customers who then Google your name before they call, see a thin Yelp profile, and hesitate; the page closes that hesitation in one screen."
+    },
+    {
+      "objection": "I already pay Angi or HomeAdvisor for leads.",
+      "response": "Understood. The page is the home base your Angi profile and Google listing point at, so when a homeowner Googles your business name directly, they land somewhere that looks owned by you instead of paying for the lead twice."
+    },
+    {
+      "objection": "I do not work with weekend customers anyway.",
+      "response": "Got it. We can put the hours and the service area front and center so weekend tire-kickers see when you are actually available and the right customers see how to reach you fast."
+    },
+    {
+      "objection": "I do not even check email half the time.",
+      "response": "No problem. The page does not require any logins from you. The invoice is one email, your phone number is the CTA, and the lead comes to your phone, not your inbox."
+    },
+    {
+      "objection": "I tried a website before and nobody came from it.",
+      "response": "Fair. The difference here is a single page focused on the emergency homeowner search, with the phone number and the service area first, not a brochure site no one ever scrolls."
+    }
+  ],
+  "siteTemplateHint": "Use the dependable HVAC/contractor template: white background with deep navy and a safety yellow accent, hero with service area and a huge tap-to-call CTA, short repair vs install service grid, license note if confirmed, and trust proof from existing reviews.",
+  "customerPersonaHint": "Homeowners in an urgent moment (no AC, no heat, leak) Googling on a phone, looking for a real local number to call and confirmation that the company covers their town."
+}

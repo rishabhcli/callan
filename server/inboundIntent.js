@@ -12,6 +12,7 @@ import { env } from './env.js';
 import { log } from './logger.js';
 import { emit } from './sse.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
+import { sendCallbackInvoiceEmail } from './emailCallback.js';
 
 // Per-call de-dupe — keyed by call row id. In-memory is fine; calls are short-lived.
 const sentByCallId = new Set();
@@ -138,20 +139,58 @@ function callmemaybeEmailBody({ businessName, fromPhone }) {
 /**
  * Called after each transcript update on an inbound call.
  * If we detect a valid email + a send intent, fire AgentMail (once per call).
+ *
+ * For email-callback calls (where Callan dialed the user because they emailed
+ * us first), pass `overrideEmail` so we use the originating address without
+ * needing the caller to dictate their email back to the agent.
  */
-export async function maybeFireInboundEmail({ callRow, lead, transcript }) {
+export async function maybeFireInboundEmail({ callRow, lead, transcript, overrideEmail = null }) {
   if (!callRow || sentByCallId.has(callRow.id)) return null;
   if (!env.agentmail?.apiKey || !env.agentmail?.inboxId) {
     log.warn('inbound.email.skipped', { callId: callRow.id, reason: 'agentmail_not_configured' });
     return null;
   }
-  const email = detectEmailInTranscript(transcript);
+  const email = overrideEmail || detectEmailInTranscript(transcript);
   if (!email) return null;
   const wantsEmail = detectSendEmailIntent(transcript);
   if (!wantsEmail) return null;
 
   // Mark BEFORE the await so concurrent transcript events don't double-fire.
   sentByCallId.add(callRow.id);
+
+  // Email-callback calls get a TRANSCRIPT-AWARE invoice instead of the generic
+  // callmemaybe follow-up body. Gemini extracts business name / what they sell /
+  // location / call recap from the actual conversation and weaves them into a
+  // proper invoice email with a real Stripe link.
+  if (callRow.decision_reason === 'agentphone_email_callback') {
+    try {
+      const result = await sendCallbackInvoiceEmail({
+        recipient: email,
+        transcript,
+        callId: callRow.id,
+        leadId: callRow.lead_id || null
+      });
+      log.info('callback.invoice.sent', {
+        callId: callRow.id, toEmail: email,
+        businessName: result?.context?.businessName || null
+      });
+      return { email, ...result };
+    } catch (err) {
+      sentByCallId.delete(callRow.id);
+      log.error('callback.invoice.send_failed', {
+        callId: callRow.id, toEmail: email, error: err?.message || String(err)
+      });
+      emit('mailer.error', {
+        worker: 'mailer',
+        leadId: callRow.lead_id,
+        callId: callRow.id,
+        toEmail: email,
+        error: err?.message || String(err),
+        trigger: 'callback_invoice'
+      });
+      return null;
+    }
+  }
 
   const subject = `Following up from your call — callmemaybe`;
   const text = callmemaybeEmailBody({
@@ -161,7 +200,13 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript }) {
   });
 
   try {
-    const result = await sendAgentMailMessage({ toEmail: email, subject, text });
+    const result = await sendAgentMailMessage({
+      toEmail: email,
+      subject,
+      text,
+      leadId: callRow.lead_id || null,
+      costKind: 'inbound_followup'
+    });
     log.info('inbound.email.sent', {
       callId: callRow.id,
       leadId: callRow.lead_id,

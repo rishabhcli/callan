@@ -1,0 +1,53 @@
+{
+  "key": "restaurant",
+  "name": "Restaurant, cafe, and food",
+  "matchNiches": [
+    "restaurant",
+    "cafe",
+    "coffee shop",
+    "coffee",
+    "bakery",
+    "diner",
+    "deli",
+    "pizzeria",
+    "pizza",
+    "food truck",
+    "bar",
+    "bistro",
+    "eatery",
+    "taqueria",
+    "ice cream",
+    "ice cream shop"
+  ],
+  "priceCents": 50000,
+  "pitchTone": "Warm, hospitality-aware, and practical. Talk like you have already eaten there: assume the owner is on the line or expediting, so be brief and concrete about what a hungry customer needs to see in ten seconds.",
+  "valuePropHook": "A flat $500 single-page site that puts your menu, hours, address with a map link, and a phone number front and center, so the customer who Googles you at 6pm decides to come in instead of bouncing to the next result.",
+  "objections": [
+    {
+      "objection": "We just need menu uploads, not a new site.",
+      "response": "Menus are the core of the page. We put the menu front and center as text so Google can actually read it, plus the hours, the address, and a tap-to-call link; that fixes the most common reason people give up and pick another spot."
+    },
+    {
+      "objection": "We already have a Facebook page.",
+      "response": "Facebook is great for regulars. The website is for the first-time customer who searches your name on Google, sees a thin business listing, and needs the hours, the address, and a real menu in ten seconds to decide to come in."
+    },
+    {
+      "objection": "DoorDash and Yelp handle our online stuff.",
+      "response": "Those drive orders, but they do not own the searcher who types your name into Google. The page is the home base those listings point at and the one place that always has accurate hours, the dine-in menu, and your phone number."
+    },
+    {
+      "objection": "Our menu changes too often.",
+      "response": "Understood. We design the menu section so you can email me an updated PDF or photo and it goes on the page same day, no monthly fee; the structure stays even when the items rotate."
+    },
+    {
+      "objection": "We do not take online orders.",
+      "response": "Not a problem. The page is built around dine-in and call-ahead: hours, address with a map link, phone number, and a clear menu, with no order button to confuse anyone."
+    },
+    {
+      "objection": "We do not have professional food photos.",
+      "response": "Most independents do not. We start with whatever you have on your phone or Yelp and leave clean placeholders; you can swap photos in any time without paying again."
+    }
+  ],
+  "siteTemplateHint": "Use a warm hospitality template: appetite-friendly photo hero, palette inspired by the cuisine with one accent, menu section rendered as readable text (not just an image), hours, address with a map link, and a sticky phone CTA.",
+  "customerPersonaHint": "Hungry locals or visitors searching by name or cuisine on a phone, deciding in seconds whether to come in, looking for hours, the menu, and a clear address with a phone number."
+}

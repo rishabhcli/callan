@@ -83,7 +83,8 @@ export async function sendGrowthRecap({ leadId, toEmail, force = false } = {}) {
     subject,
     text: body,
     threadId: latestMessage?.thread_id || lead.agentmail_thread_id,
-    messageId: latestMessage?.provider_id || null
+    messageId: latestMessage?.provider_id || null,
+    leadId
   });
 
   const contactId = contactEvents.add({
@@ -235,7 +236,7 @@ function persistGrowthFollowup({
   }).row;
 }
 
-async function sendGrowthAgentMail({ toEmail, subject, text, threadId, messageId }) {
+async function sendGrowthAgentMail({ toEmail, subject, text, threadId, messageId, leadId = null }) {
   if (shouldMockGrowthEmail(toEmail)) {
     return createMockAgentMailSendResult({
       threadId: threadId || `mock-growth-thread-${randomBytes(4).toString('hex')}`,
@@ -250,7 +251,9 @@ async function sendGrowthAgentMail({ toEmail, subject, text, threadId, messageId
       toEmail,
       subject,
       text,
-      html: htmlParagraphs(text)
+      html: htmlParagraphs(text),
+      leadId,
+      costKind: 'growth_recap'
     }, { timeoutSeconds: 15, maxRetries: 2 });
   }
   return sendAgentMailMessage({
@@ -258,7 +261,9 @@ async function sendGrowthAgentMail({ toEmail, subject, text, threadId, messageId
     toEmail,
     subject,
     text,
-    html: htmlParagraphs(text)
+    html: htmlParagraphs(text),
+    leadId,
+    costKind: 'growth_recap'
   }, { timeoutSeconds: 15, maxRetries: 2 });
 }
 

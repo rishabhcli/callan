@@ -43,7 +43,10 @@ export default function RightRail({
   focusedLeadId,
   onFocus,
   queueCounts,
-  sseStatus
+  sseStatus,
+  scheduledCalls = { pending: [], recent: [], warmingIds: [] },
+  onCancelScheduled,
+  onFireScheduled
 }) {
   const activeLeads = useMemo(() => {
     const sorted = [...leads].sort((a, b) => {
@@ -76,6 +79,26 @@ export default function RightRail({
       <div className="nyna-rail-body">
         <QueueSummary queueCounts={queueCounts} />
 
+        {scheduledCalls?.pending?.length ? (
+          <>
+            <div className="nyna-rail-section-title">upcoming callbacks</div>
+            {scheduledCalls.pending.slice(0, 5).map((sc) => {
+              const warming = (scheduledCalls.warmingIds || []).includes(sc.id)
+                            || (sc.scheduledAtMs - Date.now() <= 30_000 && sc.scheduledAtMs - Date.now() > 0);
+              return (
+                <ScheduledCard
+                  key={sc.id}
+                  sc={sc}
+                  warming={warming}
+                  onCancel={onCancelScheduled ? () => onCancelScheduled(sc.id) : null}
+                  onFire={onFireScheduled ? () => onFireScheduled(sc.id) : null}
+                  onFocus={() => onFocus?.(sc.leadId)}
+                />
+              );
+            })}
+          </>
+        ) : null}
+
         <div className="nyna-rail-section-title">leads in motion</div>
         {activeLeads.length ? activeLeads.map((lead) => (
           <RailCard
@@ -90,6 +113,88 @@ export default function RightRail({
       </div>
     </aside>
   );
+}
+
+function ScheduledCard({ sc, warming = false, onCancel, onFire, onFocus }) {
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const remainingMs = (sc.scheduledAtMs || 0) - Date.now();
+  const isPast = remainingMs < 0;
+  const business = sc.lead?.business_name || sc.leadId;
+  const localTime = formatLocalTime(sc.scheduledAtMs);
+  const cardClass = warming
+    ? 'nyna-rail-card nyna-rail-card-scheduled nyna-rail-card-scheduled-warming'
+    : 'nyna-rail-card nyna-rail-card-scheduled';
+  return (
+    <div className={cardClass}>
+      <div className="nyna-rail-card-top">
+        <button
+          type="button"
+          onClick={onFocus}
+          style={{ background: 'none', border: 0, padding: 0, color: 'inherit', textAlign: 'left', minWidth: 0, cursor: 'pointer' }}
+        >
+          <div className="nyna-rail-card-name">{business}</div>
+          <div className="nyna-rail-card-loc">{sc.ask || sc.brief?.ask || 'scheduled callback'}</div>
+        </button>
+        <span className="nyna-rail-card-status nyna-rail-card-status-scheduled">
+          {isPast ? 'firing' : formatCountdown(remainingMs)}
+        </span>
+      </div>
+      <div className="nyna-rail-card-meta">
+        <span>{localTime}</span>
+        <div style={{ display: 'inline-flex', gap: 10 }}>
+          {onFire ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onFire(); }}
+              style={{ background: 'transparent', border: 0, color: 'var(--apricot)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase' }}
+            >
+              fire now
+            </button>
+          ) : null}
+          {onCancel ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onCancel(); }}
+              style={{ background: 'transparent', border: 0, color: 'var(--rose)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase' }}
+            >
+              cancel
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatLocalTime(ms) {
+  if (!ms) return '';
+  try {
+    return new Date(ms).toLocaleString('en-US', {
+      weekday: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return '';
+  }
+}
+
+function formatCountdown(ms) {
+  if (ms <= 0) return 'now';
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  if (mins > 0) return `${mins}m ${String(secs).padStart(2, '0')}s`;
+  return `${secs}s`;
 }
 
 function QueueSummary({ queueCounts = {} }) {

@@ -123,9 +123,9 @@ async function retrieveGlobalCompliance(intent, { topK = 2, alpha = 0.78, callId
       metadata: { kind: 'compliance', title: 'Opt-out handling', complianceIntent: 'opt_out' }
     },
     {
-      id: 'global.email_readback',
-      text: 'Read invoice email addresses back exactly and ask for confirmation before sending the invoice.',
-      metadata: { kind: 'compliance', title: 'Email readback', complianceIntent: 'email_readback' }
+      id: 'global.email_capture',
+      text: 'When the owner gives you an email for the invoice, capture it and tell them the invoice is sending now. Do NOT read it back or ask them to confirm — just send the invoice.',
+      metadata: { kind: 'compliance', title: 'Email capture', complianceIntent: 'email_capture' }
     }
   ];
   await ensureMossIndex(indexName, docs, { load: true });

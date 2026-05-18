@@ -1,0 +1,32 @@
+{
+  "key": "default",
+  "name": "Default small business",
+  "matchNiches": [],
+  "priceCents": 50000,
+  "pitchTone": "Warm, specific, and never pushy. Treat the owner like they are busy and skeptical of cold callers, and lead with one concrete signal from the public research before making any ask.",
+  "valuePropHook": "A flat $500 single-page website that clearly explains what they do and gives customers one obvious next step, hosted and ready same day.",
+  "objections": [
+    {
+      "objection": "I already have a website.",
+      "response": "That is helpful to know. This would not replace it; it is a focused conversion page with the most important services, proof, and contact step, so customers do not have to dig."
+    },
+    {
+      "objection": "I am too busy right now.",
+      "response": "Totally fair. I only need the best email for the invoice; the page can be drafted from the public business info I already have, and you can reply with corrections."
+    },
+    {
+      "objection": "Just send me information.",
+      "response": "I can send it through AgentMail. The only thing worth deciding on the call is whether a flat $500 same-day page is worth considering at all."
+    },
+    {
+      "objection": "That is too expensive.",
+      "response": "I get it. The whole point of this offer is to avoid a drawn-out agency project: one flat $500 page, hosted, with the essentials customers need before they call."
+    },
+    {
+      "objection": "Is this a scam?",
+      "response": "Reasonable question. The invoice comes from AgentMail, you can reply right there with questions, and nothing starts unless you actually pay it."
+    }
+  ],
+  "siteTemplateHint": "Use the default style: clean and professional, neutral base with one brand accent, hero with name and tap-to-call CTA, short service section, and a contact section.",
+  "customerPersonaHint": "Local prospects who searched for the business by name or category and want to confirm legitimacy and how to reach them."
+}

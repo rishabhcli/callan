@@ -16,6 +16,10 @@ import {
 import { BrowserResearchOutputSchema, SOURCE_TYPES, validateSourceType } from './schemas.js';
 import { leads as leadsTable } from '../db.js';
 import { addDoc, containerTagFor } from '../memory.js';
+import { recordBrowserUseSteps } from '../costs.js';
+
+// session_id -> Set<leadId> created by that session. Cleared on terminal.
+const sessionLeadIds = new Map();
 
 const DEFAULT_MAX_LEADS = 8;
 const DEFAULT_CONCURRENCY = 5;
@@ -392,6 +396,8 @@ async function runMockSourceSession({ job, source, sessionId, selectedModel, max
       finished_at: Date.now(),
       last_step_summary: 'Stopped by operator.'
     });
+    // Mock abort still counts whatever leads it produced as ledger cost.
+    recordSessionTerminalSteps({ sessionId, steps: 4 });
     emit('research.session.stopped', publicSessionEvent(getSessionRow(sessionId), job));
     return;
   }
@@ -443,6 +449,8 @@ async function runMockSourceSession({ job, source, sessionId, selectedModel, max
     raw_json: jsonText({ output: { leads: evidenceRows }, model: selectedModel, maxCostUsd, keepAlive, mock: true })
   });
   refreshJobCounts(job.id);
+  // Mocks: synthetic step count, ~6 per evidence row captured.
+  recordSessionTerminalSteps({ sessionId, steps: Math.max(persisted.length * 6, 8) });
   emit('research.session.completed', publicSessionEvent(getSessionRow(sessionId), job));
 }
 
@@ -498,6 +506,8 @@ async function runLiveSourceSession({ job, source, sessionId, selectedModel, max
         finished_at: Date.now(),
         last_step_summary: 'Stopped by operator.'
       });
+      const stoppedSteps = Number(latest?.status?.stepCount || 0);
+      recordSessionTerminalSteps({ sessionId, steps: stoppedSteps });
       emit('research.session.stopped', publicSessionEvent(getSessionRow(sessionId), job));
       return;
     }
@@ -519,6 +529,8 @@ async function runLiveSourceSession({ job, source, sessionId, selectedModel, max
       raw: latest.raw
     });
     refreshJobCounts(job.id);
+    const liveSteps = Number(latest?.status?.stepCount || latest?.raw?.stepCount || 0);
+    recordSessionTerminalSteps({ sessionId, steps: liveSteps });
     emit('research.session.completed', publicSessionEvent(getSessionRow(sessionId), job));
   } catch (err) {
     const message = err?.message || String(err);
@@ -530,8 +542,39 @@ async function runLiveSourceSession({ job, source, sessionId, selectedModel, max
       last_step_summary: message
     });
     refreshJobCounts(job.id);
+    // Best-effort step charge on failure too — providerSessionId may not have
+    // updated, so fall back to whatever the row has.
+    const failedRow = getSessionRow(sessionId);
+    const failedSteps = failedRow?.raw_json ? safeStepCount(failedRow.raw_json) : 0;
+    recordSessionTerminalSteps({ sessionId, steps: failedSteps });
     emit('research.session.failed', { ...publicSessionEvent(getSessionRow(sessionId), job), error: message });
     log.warn('browser_research.session_failed', { jobId: job.id, sourceType: source.type, providerSessionId, error: message });
+  }
+}
+
+function recordSessionTerminalSteps({ sessionId, steps }) {
+  if (!sessionId) return;
+  const leadIds = Array.from(sessionLeadIds.get(sessionId) || []);
+  sessionLeadIds.delete(sessionId);
+  if (!leadIds.length || !Number.isFinite(steps) || steps <= 0) return;
+  // Distribute evenly across the leads this session produced. Rounded up so
+  // total never undercounts (each lead pays ≥ 1 step).
+  const per = Math.max(1, Math.ceil(steps / leadIds.length));
+  for (const leadId of leadIds) {
+    try {
+      recordBrowserUseSteps({ leadId, sessionId, steps: per });
+    } catch (err) {
+      log.warn('browser_research.cost_record_failed', { leadId, sessionId, error: err?.message || String(err) });
+    }
+  }
+}
+
+function safeStepCount(rawJson) {
+  try {
+    const obj = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
+    return Number(obj?.stepCount || obj?.step_count || 0) || 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -572,14 +615,14 @@ function persistEvidenceBatch({ job, sessionId, providerSessionId, source, outpu
       skippedReason: saved.skippedReason
     });
     if (!saved.skipped) {
-      mirrorBusinessToMemory({ job, evidence: saved, source });
+      mirrorBusinessToMemory({ job, evidence: saved, source, sessionId });
     }
   }
   refreshJobCounts(job.id);
   return persisted;
 }
 
-function mirrorBusinessToMemory({ job, evidence, source }) {
+function mirrorBusinessToMemory({ job, evidence, source, sessionId = null }) {
   try {
     const profile = evidenceToBusinessProfile(evidence, { niche: job.niche, city: job.city });
     const requestedLeadId = `lead_research_${slugify(evidence.businessName).slice(0, 28)}_${stableHash(evidence.businessName + ':' + (evidence.phone || ''))}`;
@@ -609,6 +652,16 @@ function mirrorBusinessToMemory({ job, evidence, source }) {
     }, { actor: 'browser_research', profile, runId: job.id });
 
     const lead = insertResult.lead;
+    if (sessionId && lead?.id) {
+      const set = sessionLeadIds.get(sessionId) || new Set();
+      set.add(lead.id);
+      sessionLeadIds.set(sessionId, set);
+    }
+    // Lazy-import to avoid an import cycle (outreach.js → leadPriority.js → db.js).
+    // Containing function isn't async, so we fire-and-forget via .then/.catch.
+    import('../leadPriority.js')
+      .then(({ applyPriorityToLead }) => applyPriorityToLead(lead.id))
+      .catch((err) => log.warn('browser_research.priority_score_failed', { leadId: lead.id, error: err?.message || String(err) }));
     emit('lead.created', {
       worker: 'browser_research',
       runId: job.id,

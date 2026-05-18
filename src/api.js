@@ -45,5 +45,13 @@ export const api = {
   stopOutreach: () => call('POST', '/api/outreach/stop', {}),
   pauseOutreach: (reason = 'operator_pause') => call('POST', '/api/outreach/pause', { reason }),
   resumeOutreach: (reason = 'operator_resume') => call('POST', '/api/outreach/resume', { reason }),
-  emergencyStop: (reason = 'emergency_stop') => call('POST', '/api/emergency-stop', { reason })
+  emergencyStop: (reason = 'emergency_stop') => call('POST', '/api/emergency-stop', { reason }),
+  scheduledCalls: () => call('GET', '/api/scheduled-calls'),
+  cancelScheduledCall: (id, reason = 'operator_cancel') => call('POST', `/api/scheduled-calls/${id}/cancel`, { reason }),
+  fireScheduledCallNow: (id, reason = 'operator_fire_now') => call('POST', `/api/scheduled-calls/${id}/fire`, { reason }),
+  experiments: () => call('GET', '/api/experiments'),
+  economicsByNiche: () => call('GET', '/api/economics/by-niche'),
+  reputationStatus: () => call('GET', '/api/reputation/status'),
+  referralsRollup: () => call('GET', '/api/referrals/rollup'),
+  leadPriorities: () => call('GET', '/api/leads/priorities')
 };

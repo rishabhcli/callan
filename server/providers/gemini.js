@@ -2,6 +2,7 @@ import { GoogleGenAI } from '@google/genai';
 import { env } from '../env.js';
 import { log } from '../logger.js';
 import { providerConfigured, sideEffectGate, smokeDetail, withProviderRetry, normalizeProviderError } from './core.js';
+import { recordGeminiTokens } from '../costs.js';
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 30000);
 const PROVIDER = 'gemini';
@@ -18,16 +19,19 @@ export async function generateJson({
   systemInstruction,
   model,
   thinkingLevel = 'low',
-  flash = false
+  flash = false,
+  leadId = null,
+  kind = 'reasoning'
 }) {
   const chain = modelChain(model || (flash ? env.gemini.modelFlash : env.gemini.modelPro));
   let lastError;
 
   for (const useModel of chain) {
     try {
-      const text = await callModel({ model: useModel, prompt, systemInstruction, thinkingLevel, schema });
+      const { text, usage } = await callModel({ model: useModel, prompt, systemInstruction, thinkingLevel, schema });
       const parsed = parseLooseJson(text);
       assertStructuredOutput(parsed, schema);
+      maybeRecordTokens({ leadId, model: useModel, kind, prompt, text, usage });
       return parsed;
     } catch (err) {
       lastError = normalizeGeminiError(err);
@@ -53,14 +57,14 @@ export async function generateStructuredText({
 
   for (const useModel of chain) {
     try {
-      const text = await callModel({
+      const { text, usage } = await callModel({
         model: useModel,
         prompt,
         systemInstruction,
         thinkingLevel,
         schema: jsonSchema || schema
       });
-      return { text, model: useModel };
+      return { text, model: useModel, usage };
     } catch (err) {
       lastError = normalizeGeminiError(err);
       if (!shouldTryNextModel(lastError)) throw err;
@@ -71,13 +75,23 @@ export async function generateStructuredText({
   throw normalizedGeminiThrow('generateStructuredText', lastError);
 }
 
-export async function generateText({ prompt, systemInstruction, model, thinkingLevel = 'low', flash = false }) {
+export async function generateText({
+  prompt,
+  systemInstruction,
+  model,
+  thinkingLevel = 'low',
+  flash = false,
+  leadId = null,
+  kind = 'text'
+}) {
   const chain = modelChain(model || (flash ? env.gemini.modelFlash : env.gemini.modelPro));
   let lastError;
 
   for (const useModel of chain) {
     try {
-      return await callModel({ model: useModel, prompt, systemInstruction, thinkingLevel });
+      const { text, usage } = await callModel({ model: useModel, prompt, systemInstruction, thinkingLevel });
+      maybeRecordTokens({ leadId, model: useModel, kind, prompt, text, usage });
+      return text;
     } catch (err) {
       lastError = normalizeGeminiError(err);
       if (!shouldTryNextModel(lastError)) throw err;
@@ -151,7 +165,29 @@ async function callModel({ model, prompt, systemInstruction, thinkingLevel, sche
 
   const text = pickText(res);
   if (!text) throw geminiError('gemini returned empty text', { retryable: true });
-  return text;
+  const usage = pickUsage(res);
+  return { text, usage };
+}
+
+function pickUsage(res) {
+  const meta = res?.usageMetadata || res?.usage_metadata || res?.response?.usageMetadata || null;
+  if (!meta || typeof meta !== 'object') return null;
+  const inputTokens = Number(meta.promptTokenCount ?? meta.prompt_token_count ?? 0) || 0;
+  const outputTokens = Number(meta.candidatesTokenCount ?? meta.candidates_token_count ?? 0) || 0;
+  const totalTokens = Number(meta.totalTokenCount ?? meta.total_token_count ?? (inputTokens + outputTokens)) || 0;
+  if (!inputTokens && !outputTokens && !totalTokens) return null;
+  return { inputTokens, outputTokens, totalTokens };
+}
+
+function maybeRecordTokens({ leadId, model, kind, prompt, text, usage }) {
+  if (!leadId) return;
+  try {
+    const inputTokens = usage?.inputTokens || Math.ceil(String(prompt || '').length / 4);
+    const outputTokens = usage?.outputTokens || Math.ceil(String(text || '').length / 4);
+    recordGeminiTokens({ leadId, model, inputTokens, outputTokens, kind });
+  } catch (err) {
+    log.warn('gemini.cost_record_failed', { leadId, model, kind, error: err?.message || String(err) });
+  }
 }
 
 function client() {

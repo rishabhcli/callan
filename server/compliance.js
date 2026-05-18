@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { env } from './env.js';
-import { callAttempts, doNotCall, leads } from './db.js';
+import { callAttempts, doNotCall, leads, auditTrail } from './db.js';
 
 const PHONE_RE = /^\+?[1-9]\d{6,14}$/;
 const POLICY_VERSION = 'callability-v2';
@@ -75,9 +75,55 @@ export function recordingDisclosure(businessName) {
   return `Hi! This is callmemaybe calling${businessName ? ` about ${businessName}` : ''}. This call is automated and recorded for quality. If you'd like to opt out, just say "stop" or "remove me" and I'll take care of it.`;
 }
 
-export function recordOptOut(phone, { source = 'call-transcript', reason = REASON_CODES.DNC_OPT_OUT } = {}) {
+export function recordOptOut(phone, { source = 'call-transcript', reason = REASON_CODES.DNC_OPT_OUT, leadId = null } = {}) {
   const p = normalizePhone(phone);
-  if (p) doNotCall.add({ phone: p, reason, source });
+  if (!p) return;
+  doNotCall.add({ phone: p, reason, source });
+  // Mirror the opt-out into the reputation auto-throttle counters. Uses a
+  // dynamic import to avoid the compliance ↔ reputation ↔ outreach cycle at
+  // module-evaluation time. Fire-and-forget; reputation failures must not
+  // break the existing DNC behaviour.
+  import('./reputation.js')
+    .then((mod) => {
+      try {
+        mod.recordOptOut?.({ leadId, phone: p });
+      } catch {
+        // swallow — DNC has already been recorded.
+      }
+    })
+    .catch(() => { /* swallow */ });
+}
+
+/**
+ * Promote a lead's consent_status to operator_approved with a TCPA-defensible audit row.
+ * Used when the lead explicitly requests a callback via email reply — the email IS the
+ * invitation to call, and the inbound message_id is the proof we attach.
+ */
+export function markLeadConsentApproved(leadId, { reason = 'email_invite', proof = null, excerpt = null, contactEventId = null } = {}) {
+  if (!leadId) return null;
+  const lead = leads.get(leadId);
+  if (!lead) return null;
+  const wasApproved = lead.consent_status === 'operator_approved';
+  if (!wasApproved) {
+    leads.update(leadId, { consent_status: 'operator_approved' });
+  }
+  auditTrail.add({
+    event_type: 'consent_email_invite',
+    lead_id: leadId,
+    contact_event_id: contactEventId || null,
+    entity_type: 'lead',
+    entity_id: leadId,
+    action: wasApproved ? 'reaffirmed' : 'promoted',
+    decision_code: 'consent.promoted',
+    decision_reason: reason,
+    metadata: {
+      proof,
+      excerpt: typeof excerpt === 'string' ? excerpt.slice(0, 280) : null,
+      priorStatus: lead.consent_status || null
+    },
+    dedupe_key: proof ? `consent_email_invite:${leadId}:${proof}` : `consent_email_invite:${leadId}:${Date.now()}`
+  });
+  return { promoted: !wasApproved, priorStatus: lead.consent_status };
 }
 
 export function transcriptHasOptOut(transcript) {
@@ -277,7 +323,7 @@ export function complianceGateReport({ mode = env.runMode, now = new Date() } = 
       gate('max_attempts', maxAttempts > 0, `MAX_ATTEMPTS_PER_PHONE=${maxAttempts}`),
       gate('business_phone_classification', true, 'production/autonomous calls require owned or business-landline evidence'),
       gate('recording_ai_disclosure', hasRecordingDisclosure(disclosure), disclosure),
-      gate('invoice_consent', true, 'analyst requires confirmed read-back email before invoice handoff'),
+      gate('invoice_consent', true, 'invoice gate requires transcript-backed interest + a customer email; no readback confirmation required'),
       gate('unsubscribe', true, 'AgentMail opt-out classification records email-opt-out and stops automated replies')
     ],
     outboundCallReasonCodes: REASON_CODES,

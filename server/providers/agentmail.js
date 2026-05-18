@@ -1,4 +1,6 @@
 import { canEmail, env } from '../env.js';
+import { log } from '../logger.js';
+import { recordAgentMailSend } from '../costs.js';
 import { normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 12;
@@ -104,7 +106,9 @@ export async function sendAgentMailMessage({
   labels,
   replyTo,
   cc,
-  bcc
+  bcc,
+  leadId = null,
+  costKind = 'email_send'
 }, options = {}) {
   requireAgentMailConfig(inboxId);
   const recipients = normalizeAddressList(to || toEmail);
@@ -123,7 +127,20 @@ export async function sendAgentMailMessage({
     attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined
   }), requestOptions(options)));
 
-  return normalizeAgentMailSendResult(res, { inboxId, subject, toEmail: recipients[0] });
+  const normalized = normalizeAgentMailSendResult(res, { inboxId, subject, toEmail: recipients[0] });
+  if (leadId) {
+    try {
+      recordAgentMailSend({
+        leadId,
+        messageId: normalized.messageId,
+        threadId: normalized.threadId,
+        kind: costKind
+      });
+    } catch (err) {
+      log.warn('agentmail.cost_record_failed', { leadId, error: err?.message || String(err) });
+    }
+  }
+  return normalized;
 }
 
 export async function replyAgentMailMessage({
@@ -137,10 +154,12 @@ export async function replyAgentMailMessage({
   labels,
   replyTo,
   cc,
-  bcc
+  bcc,
+  leadId = null,
+  costKind = 'email_reply'
 }, options = {}) {
   if (!messageId) {
-    return sendAgentMailMessage({ inboxId, toEmail, subject, text, html, attachments, labels, replyTo, cc, bcc }, options);
+    return sendAgentMailMessage({ inboxId, toEmail, subject, text, html, attachments, labels, replyTo, cc, bcc, leadId, costKind }, options);
   }
 
   requireAgentMailConfig(inboxId);
@@ -155,7 +174,20 @@ export async function replyAgentMailMessage({
     attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined
   }), requestOptions(options)));
 
-  return normalizeAgentMailSendResult(res, { inboxId, subject, repliedToMessageId: messageId });
+  const normalized = normalizeAgentMailSendResult(res, { inboxId, subject, repliedToMessageId: messageId });
+  if (leadId) {
+    try {
+      recordAgentMailSend({
+        leadId,
+        messageId: normalized.messageId,
+        threadId: normalized.threadId,
+        kind: costKind
+      });
+    } catch (err) {
+      log.warn('agentmail.cost_record_failed', { leadId, error: err?.message || String(err) });
+    }
+  }
+  return normalized;
 }
 
 export async function fetchAgentMailIncomingMessages({

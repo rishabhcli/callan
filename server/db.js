@@ -516,6 +516,15 @@ ensureColumn('leads', 'presence_confidence', 'REAL');
 ensureColumn('leads', 'callable_reason', 'TEXT');
 ensureColumn('leads', 'blocked_reason', 'TEXT');
 ensureColumn('leads', 'research_json', 'TEXT');
+ensureColumn('leads', 'next_attempt_at', 'INTEGER');
+ensureColumn('leads', 'attempt_channel', "TEXT");
+ensureColumn('leads', 'attempt_count', "INTEGER NOT NULL DEFAULT 0");
+ensureColumn('leads', 'priority_score', "REAL");
+ensureColumn('leads', 'subscription_id', 'TEXT');
+ensureColumn('leads', 'preview_build_triggered_at', 'INTEGER');
+ensureColumn('leads', 'vertical_pack', 'TEXT');
+ensureColumn('leads', 'preview_build_triggered_at', 'INTEGER');
+ensureColumn('leads', 'preview_build_email_sent_at', 'INTEGER');
 ensureColumn('calls', 'disclosure_text', 'TEXT');
 ensureColumn('calls', 'decision_reason', 'TEXT');
 ensureColumn('payments', 'stripe_invoice_id', 'TEXT');
@@ -529,6 +538,7 @@ ensureColumn('payments', 'offer_version', 'TEXT');
 ensureColumn('payments', 'build_triggered_at', 'INTEGER');
 ensureColumn('builds', 'lovable_url', 'TEXT');
 ensureColumn('builds', 'brief', 'TEXT');
+ensureColumn('builds', 'website_brief_json', 'TEXT');
 ensureColumn('builds', 'error', 'TEXT');
 ensureColumn('builds', 'trigger_key', 'TEXT');
 ensureColumn('builds', 'updated_at', 'INTEGER');
@@ -581,6 +591,135 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_growth_plans_idempotency ON growth_plans(idempotency_key) WHERE idempotency_key IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_growth_followups_lead ON growth_followups(lead_id, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_growth_followups_idempotency ON growth_followups(idempotency_key) WHERE idempotency_key IS NOT NULL;
+`);
+
+// experiments — A/B (or N-arm) bucketing + outcome capture for pitch/voice/price tests.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS experiment_assignments (
+    id TEXT PRIMARY KEY,
+    experiment_key TEXT NOT NULL,
+    lead_id TEXT,
+    bucket_key TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    assigned_at INTEGER NOT NULL,
+    metadata_json TEXT,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_experiment_assignments_key_arm ON experiment_assignments(experiment_key, arm);
+  CREATE INDEX IF NOT EXISTS idx_experiment_assignments_lead ON experiment_assignments(lead_id, experiment_key);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_experiment_assignments_bucket ON experiment_assignments(experiment_key, bucket_key);
+
+  CREATE TABLE IF NOT EXISTS experiment_outcomes (
+    id TEXT PRIMARY KEY,
+    assignment_id TEXT NOT NULL,
+    experiment_key TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    value_cents INTEGER,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(assignment_id) REFERENCES experiment_assignments(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_experiment_outcomes_key ON experiment_outcomes(experiment_key, arm, outcome, created_at);
+`);
+
+// lead_costs — per-lead per-provider cost accumulator for unit economics.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lead_costs (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    usd_micros INTEGER NOT NULL,
+    units REAL,
+    unit_label TEXT,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_lead_costs_lead ON lead_costs(lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_lead_costs_provider ON lead_costs(provider, kind, created_at);
+`);
+
+// referral_clicks — anonymous click-through log for the "Built by callmemaybe" footer.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS referral_clicks (
+    id TEXT PRIMARY KEY,
+    source_lead_id TEXT,
+    utm_source TEXT,
+    utm_medium TEXT,
+    utm_campaign TEXT,
+    referrer TEXT,
+    user_agent TEXT,
+    ip_hash TEXT,
+    landed_path TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(source_lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_referral_clicks_source ON referral_clicks(source_lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_referral_clicks_utm ON referral_clicks(utm_source, utm_campaign);
+`);
+
+// subscriptions — recurring hosting/edits MRR on top of one-shot $500 build.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    stripe_subscription_id TEXT,
+    stripe_customer_id TEXT,
+    stripe_price_id TEXT,
+    status TEXT NOT NULL,
+    plan TEXT,
+    amount_cents INTEGER,
+    currency TEXT,
+    started_at INTEGER,
+    canceled_at INTEGER,
+    last_event_at INTEGER,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_subscriptions_lead ON subscriptions(lead_id, status);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_stripe ON subscriptions(stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL;
+`);
+
+// reputation_events — flagged events for the auto-throttle (opt-outs, voicemail-only calls, BBB style complaints).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reputation_events (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    area_code TEXT,
+    lead_id TEXT,
+    severity TEXT NOT NULL DEFAULT 'info',
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_reputation_events_kind ON reputation_events(kind, created_at);
+  CREATE INDEX IF NOT EXISTS idx_reputation_events_area ON reputation_events(area_code, created_at);
+`);
+
+// scheduled_calls — customer-requested outbound calls scheduled by email reply.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS scheduled_calls (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    thread_id TEXT,
+    inbound_message_id TEXT,
+    scheduled_at_ms INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    brief_json TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    fired_at INTEGER,
+    placed_call_id TEXT,
+    failure_reason TEXT,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_scheduled_calls_due ON scheduled_calls(scheduled_at_ms) WHERE status='pending';
+  CREATE INDEX IF NOT EXISTS idx_scheduled_calls_lead ON scheduled_calls(lead_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_calls_one_pending_per_lead
+    ON scheduled_calls(lead_id) WHERE status='pending';
 `);
 
 backfillLeadDedupeKeys();
@@ -788,7 +927,14 @@ const LEAD_MUTABLE_COLUMNS = new Set([
   'presence_confidence',
   'callable_reason',
   'blocked_reason',
-  'research_json'
+  'research_json',
+  'preview_build_triggered_at',
+  'preview_build_email_sent_at',
+  'subscription_id',
+  'next_attempt_at',
+  'attempt_channel',
+  'attempt_count',
+  'vertical_pack'
 ]);
 
 const STATUS_RANK = {
@@ -1496,6 +1642,329 @@ export const calls = {
   }
 };
 
+export const scheduledCalls = {
+  start({ id, lead_id, thread_id, inbound_message_id, scheduled_at_ms, brief }) {
+    const now = Date.now();
+    const briefJson = jsonText(brief);
+    db.prepare(`
+      INSERT INTO scheduled_calls (id, lead_id, thread_id, inbound_message_id, scheduled_at_ms, status, brief_json, created_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(id, lead_id, thread_id || null, inbound_message_id || null, scheduled_at_ms, briefJson, now);
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'scheduled_call.created',
+      lead_id,
+      entity_type: 'scheduled_call',
+      entity_id: id,
+      action: 'created',
+      metadata: { scheduled_at_ms, thread_id: thread_id || null, brief: brief || null },
+      dedupe_key: `sched:${id}:created`
+    });
+    return this.get(id);
+  },
+  markPlacing(id) {
+    // CAS: only flip a still-pending row. Caller checks info.changes.
+    const info = db.prepare(`
+      UPDATE scheduled_calls SET status='placing', fired_at=?, attempts = attempts + 1
+      WHERE id = ? AND status='pending'
+    `).run(Date.now(), id);
+    return info.changes === 1;
+  },
+  markPlaced(id, { call_id } = {}) {
+    db.prepare(`
+      UPDATE scheduled_calls SET status='placed', placed_call_id = ? WHERE id = ?
+    `).run(call_id || null, id);
+    const row = this.get(id);
+    insertAuditEvent({
+      created_at: Date.now(),
+      event_type: 'scheduled_call.placed',
+      lead_id: row?.lead_id || null,
+      entity_type: 'scheduled_call',
+      entity_id: id,
+      action: 'placed',
+      metadata: { call_id: call_id || null },
+      dedupe_key: `sched:${id}:placed`
+    });
+    return row;
+  },
+  markFailed(id, { reason } = {}) {
+    db.prepare(`
+      UPDATE scheduled_calls SET status='failed', failure_reason=? WHERE id = ?
+    `).run(reason || null, id);
+    const row = this.get(id);
+    insertAuditEvent({
+      created_at: Date.now(),
+      event_type: 'scheduled_call.failed',
+      lead_id: row?.lead_id || null,
+      entity_type: 'scheduled_call',
+      entity_id: id,
+      action: 'failed',
+      decision_reason: reason || null,
+      metadata: { reason: reason || null },
+      dedupe_key: `sched:${id}:failed`
+    });
+    return row;
+  },
+  cancel(id, { reason } = {}) {
+    db.prepare(`
+      UPDATE scheduled_calls SET status='canceled', failure_reason=? WHERE id = ? AND status='pending'
+    `).run(reason || null, id);
+    const row = this.get(id);
+    if (row?.status === 'canceled') {
+      insertAuditEvent({
+        created_at: Date.now(),
+        event_type: 'scheduled_call.canceled',
+        lead_id: row?.lead_id || null,
+        entity_type: 'scheduled_call',
+        entity_id: id,
+        action: 'canceled',
+        decision_reason: reason || null,
+        metadata: { reason: reason || null },
+        dedupe_key: `sched:${id}:canceled`
+      });
+    }
+    return row;
+  },
+  get(id) {
+    return db.prepare(`SELECT * FROM scheduled_calls WHERE id = ?`).get(id);
+  },
+  listDue(nowMs = Date.now(), { limit = 5 } = {}) {
+    return db.prepare(`
+      SELECT * FROM scheduled_calls
+      WHERE status='pending' AND scheduled_at_ms <= ?
+      ORDER BY scheduled_at_ms ASC
+      LIMIT ?
+    `).all(nowMs, limit);
+  },
+  listForLead(lead_id) {
+    return db.prepare(`
+      SELECT * FROM scheduled_calls WHERE lead_id = ? ORDER BY scheduled_at_ms DESC
+    `).all(lead_id);
+  },
+  listPending({ limit = 50 } = {}) {
+    return db.prepare(`
+      SELECT * FROM scheduled_calls WHERE status='pending' ORDER BY scheduled_at_ms ASC LIMIT ?
+    `).all(limit);
+  },
+  listRecent({ limit = 50 } = {}) {
+    return db.prepare(`
+      SELECT * FROM scheduled_calls ORDER BY created_at DESC LIMIT ?
+    `).all(limit);
+  },
+  findPendingForLead(lead_id) {
+    return db.prepare(`
+      SELECT * FROM scheduled_calls WHERE lead_id = ? AND status='pending' LIMIT 1
+    `).get(lead_id);
+  },
+  /** Move a pending row's scheduled time forward so the next loop tick picks it up. */
+  bringForward(id, newScheduledAtMs) {
+    db.prepare(`
+      UPDATE scheduled_calls SET scheduled_at_ms = ? WHERE id = ? AND status='pending'
+    `).run(newScheduledAtMs, id);
+    return this.get(id);
+  },
+  /** Sweep rows stuck in 'placing' for > maxAgeMs back to 'pending' (crash recovery). */
+  recoverStuck({ maxAgeMs = 60_000 } = {}) {
+    const cutoff = Date.now() - maxAgeMs;
+    const info = db.prepare(`
+      UPDATE scheduled_calls SET status='pending', fired_at=NULL
+      WHERE status='placing' AND fired_at IS NOT NULL AND fired_at < ?
+    `).run(cutoff);
+    return info.changes;
+  }
+};
+
+// -- experiments (A/B harness) -----------------------------------------------
+export const experimentAssignments = {
+  insert({ id, experiment_key, lead_id, bucket_key, arm, metadata }) {
+    db.prepare(`
+      INSERT INTO experiment_assignments (id, experiment_key, lead_id, bucket_key, arm, assigned_at, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(experiment_key, bucket_key) DO NOTHING
+    `).run(id, experiment_key, lead_id || null, bucket_key, arm, Date.now(), jsonText(metadata));
+    return this.findByBucket(experiment_key, bucket_key);
+  },
+  findByBucket(experiment_key, bucket_key) {
+    return db.prepare(`SELECT * FROM experiment_assignments WHERE experiment_key = ? AND bucket_key = ?`).get(experiment_key, bucket_key);
+  },
+  findForLead(experiment_key, lead_id) {
+    if (!lead_id) return null;
+    return db.prepare(`SELECT * FROM experiment_assignments WHERE experiment_key = ? AND lead_id = ? ORDER BY assigned_at DESC LIMIT 1`).get(experiment_key, lead_id);
+  }
+};
+
+export const experimentOutcomes = {
+  insert({ id, assignment_id, experiment_key, arm, outcome, value_cents, metadata }) {
+    db.prepare(`
+      INSERT INTO experiment_outcomes (id, assignment_id, experiment_key, arm, outcome, value_cents, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, assignment_id, experiment_key, arm, outcome, value_cents ?? null, jsonText(metadata), Date.now());
+  },
+  rollup(experiment_key) {
+    return db.prepare(`
+      SELECT a.arm,
+             COUNT(DISTINCT a.id)                                AS assignments,
+             COUNT(DISTINCT CASE WHEN o.outcome='converted' THEN o.assignment_id END) AS conversions,
+             COALESCE(SUM(CASE WHEN o.outcome='converted' THEN o.value_cents END), 0) AS revenue_cents
+      FROM experiment_assignments a
+      LEFT JOIN experiment_outcomes o
+        ON o.assignment_id = a.id AND o.experiment_key = a.experiment_key
+      WHERE a.experiment_key = ?
+      GROUP BY a.arm
+      ORDER BY revenue_cents DESC
+    `).all(experiment_key);
+  },
+  listKeys() {
+    return db.prepare(`SELECT DISTINCT experiment_key FROM experiment_assignments ORDER BY experiment_key`).all().map((r) => r.experiment_key);
+  }
+};
+
+// -- per-lead unit economics --------------------------------------------------
+export const leadCosts = {
+  record({ id, lead_id, provider, kind, usd, units, unit_label, metadata }) {
+    const usdMicros = Math.round(Number(usd || 0) * 1_000_000);
+    db.prepare(`
+      INSERT INTO lead_costs (id, lead_id, provider, kind, usd_micros, units, unit_label, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      lead_id,
+      provider,
+      kind,
+      usdMicros,
+      units ?? null,
+      unit_label || null,
+      jsonText(metadata),
+      Date.now()
+    );
+  },
+  totalsForLead(lead_id) {
+    return db.prepare(`
+      SELECT provider, kind, SUM(usd_micros) AS micros, SUM(units) AS units, COUNT(*) AS events
+      FROM lead_costs
+      WHERE lead_id = ?
+      GROUP BY provider, kind
+    `).all(lead_id).map((r) => ({ ...r, usd: r.micros / 1_000_000 }));
+  },
+  rollupByNiche({ since } = {}) {
+    const cutoff = since ? Number(since) : 0;
+    return db.prepare(`
+      SELECT COALESCE(l.niche, 'unknown') AS niche,
+             COUNT(DISTINCT lc.lead_id)   AS lead_count,
+             SUM(lc.usd_micros)           AS cost_micros
+      FROM lead_costs lc
+      JOIN leads l ON l.id = lc.lead_id
+      WHERE lc.created_at >= ?
+      GROUP BY COALESCE(l.niche, 'unknown')
+    `).all(cutoff).map((r) => ({ ...r, cost_usd: r.cost_micros / 1_000_000 }));
+  }
+};
+
+// -- referral clicks (Built-by-callmemaybe footer) ----------------------------
+export const referralClicks = {
+  record({ id, source_lead_id, utm_source, utm_medium, utm_campaign, referrer, user_agent, ip_hash, landed_path }) {
+    db.prepare(`
+      INSERT INTO referral_clicks (id, source_lead_id, utm_source, utm_medium, utm_campaign, referrer, user_agent, ip_hash, landed_path, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, source_lead_id || null, utm_source || null, utm_medium || null, utm_campaign || null, referrer || null, user_agent || null, ip_hash || null, landed_path || null, Date.now());
+  },
+  rollup({ limit = 30 } = {}) {
+    return db.prepare(`
+      SELECT source_lead_id, COUNT(*) AS clicks, MAX(created_at) AS last_at
+      FROM referral_clicks
+      GROUP BY source_lead_id
+      ORDER BY clicks DESC
+      LIMIT ?
+    `).all(limit);
+  },
+  countAll() {
+    return db.prepare(`SELECT COUNT(*) AS n FROM referral_clicks`).get().n;
+  }
+};
+
+// -- recurring subscriptions (hosting/edits MRR) ------------------------------
+export const subscriptions = {
+  upsert({ id, lead_id, stripe_subscription_id, stripe_customer_id, stripe_price_id, status, plan, amount_cents, currency, started_at, canceled_at, metadata }) {
+    const now = Date.now();
+    const existing = stripe_subscription_id
+      ? db.prepare(`SELECT * FROM subscriptions WHERE stripe_subscription_id = ?`).get(stripe_subscription_id)
+      : null;
+    if (existing) {
+      db.prepare(`
+        UPDATE subscriptions SET
+          stripe_customer_id = COALESCE(?, stripe_customer_id),
+          stripe_price_id    = COALESCE(?, stripe_price_id),
+          status             = COALESCE(?, status),
+          plan               = COALESCE(?, plan),
+          amount_cents       = COALESCE(?, amount_cents),
+          currency           = COALESCE(?, currency),
+          canceled_at        = COALESCE(?, canceled_at),
+          last_event_at      = ?,
+          metadata_json      = COALESCE(?, metadata_json),
+          updated_at         = ?
+        WHERE id = ?
+      `).run(stripe_customer_id || null, stripe_price_id || null, status || null, plan || null, amount_cents ?? null, currency || null, canceled_at ?? null, now, jsonText(metadata), now, existing.id);
+      return this.get(existing.id);
+    }
+    db.prepare(`
+      INSERT INTO subscriptions (id, lead_id, stripe_subscription_id, stripe_customer_id, stripe_price_id, status, plan, amount_cents, currency, started_at, canceled_at, last_event_at, metadata_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, lead_id, stripe_subscription_id || null, stripe_customer_id || null, stripe_price_id || null, status, plan || null, amount_cents ?? null, currency || null, started_at ?? null, canceled_at ?? null, now, jsonText(metadata), now, now);
+    return this.get(id);
+  },
+  get(id) {
+    return db.prepare(`SELECT * FROM subscriptions WHERE id = ?`).get(id);
+  },
+  byStripeId(stripe_subscription_id) {
+    return db.prepare(`SELECT * FROM subscriptions WHERE stripe_subscription_id = ?`).get(stripe_subscription_id);
+  },
+  forLead(lead_id) {
+    return db.prepare(`SELECT * FROM subscriptions WHERE lead_id = ? ORDER BY created_at DESC`).all(lead_id);
+  },
+  activeMrrCents() {
+    const row = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS mrr FROM subscriptions WHERE status IN ('active','trialing','past_due')`).get();
+    return row.mrr || 0;
+  },
+  countByStatus() {
+    return db.prepare(`SELECT status, COUNT(*) AS n FROM subscriptions GROUP BY status`).all();
+  }
+};
+
+// -- reputation events --------------------------------------------------------
+export const reputationEvents = {
+  record({ kind, area_code, lead_id, severity = 'info', metadata }) {
+    const id = `repev_${Date.now().toString(36)}_${randomTail(6)}`;
+    db.prepare(`
+      INSERT INTO reputation_events (id, kind, area_code, lead_id, severity, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, kind, area_code || null, lead_id || null, severity, jsonText(metadata), Date.now());
+  },
+  recentByKind(kind, sinceMs) {
+    return db.prepare(`
+      SELECT * FROM reputation_events
+      WHERE kind = ? AND created_at >= ?
+      ORDER BY created_at DESC
+    `).all(kind, sinceMs);
+  },
+  countSince(kind, sinceMs) {
+    return db.prepare(`SELECT COUNT(*) AS n FROM reputation_events WHERE kind = ? AND created_at >= ?`).get(kind, sinceMs).n;
+  },
+  recentAlerts({ sinceMs = Date.now() - 24*3600*1000, limit = 40 } = {}) {
+    return db.prepare(`
+      SELECT * FROM reputation_events
+      WHERE severity IN ('warn','alert') AND created_at >= ?
+      ORDER BY created_at DESC LIMIT ?
+    `).all(sinceMs, limit);
+  }
+};
+
+function randomTail(n) {
+  let s = '';
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
 export const payments = {
   insert(row) {
     const record = {
@@ -1937,6 +2406,15 @@ export const builds = {
   },
   listByLead(lead_id) {
     return db.prepare(`SELECT * FROM builds WHERE lead_id = ? ORDER BY started_at DESC`).all(lead_id);
+  },
+  findActiveForLead(lead_id) {
+    return db.prepare(`
+      SELECT * FROM builds
+      WHERE lead_id = ?
+        AND status IN ('queued', 'starting', 'running', 'qa_review', 'completed')
+      ORDER BY started_at DESC
+      LIMIT 1
+    `).get(lead_id);
   }
 };
 

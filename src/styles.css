@@ -4528,7 +4528,7 @@ body::after {
 .nyna-share {
   min-height: 100vh;
   display: grid;
-  grid-template-rows: 64px 1fr 32px;
+  grid-template-rows: 64px auto auto 40px;
   background:
     radial-gradient(ellipse 80% 50% at 50% 0%, rgba(216, 151, 60, 0.18), transparent 60%),
     radial-gradient(ellipse 60% 40% at 50% 100%, rgba(253, 155, 183, 0.12), transparent 60%),
@@ -4593,7 +4593,7 @@ body::after {
   border-top: 1px solid var(--line);
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--ink-400);
@@ -5005,6 +5005,103 @@ input:focus, select:focus, textarea:focus {
   margin-top: 2px;
 }
 
+/* ---- customer-portal action grid (under the live frame) ---- */
+.nyna-share-actions {
+  padding: 4px 28px 28px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+@media (max-width: 760px) {
+  .nyna-share-actions {
+    grid-template-columns: 1fr;
+    padding: 4px 18px 22px;
+  }
+}
+.nyna-share-action-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background:
+    linear-gradient(180deg, rgba(74, 20, 33, 0.55), rgba(31, 6, 14, 0.65));
+  border-color: var(--line-strong);
+}
+.nyna-share-action-body {
+  font-size: 12.5px;
+  color: var(--ink-200);
+  line-height: 1.55;
+  margin-bottom: 10px;
+}
+.nyna-share-action-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.nyna-share-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.nyna-share-action-textarea,
+.nyna-share-action-input {
+  width: 100%;
+  background: rgba(20, 4, 10, 0.55);
+  color: var(--pearl);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.nyna-share-action-textarea:focus,
+.nyna-share-action-input:focus {
+  outline: none;
+  border-color: var(--apricot);
+  box-shadow: 0 0 0 2px rgba(216, 151, 60, 0.18);
+}
+.nyna-share-action-textarea::placeholder,
+.nyna-share-action-input::placeholder {
+  color: var(--ink-400);
+}
+.nyna-share-action-msg {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--candy);
+  margin-top: 4px;
+  letter-spacing: 0.03em;
+}
+.nyna-share-action-msg-error {
+  color: var(--rose);
+}
+.nyna-share-foot {
+  padding: 0 28px;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.nyna-share-optout {
+  background: none;
+  border: none;
+  color: var(--ink-400);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 4px 6px;
+  transition: color 140ms ease;
+}
+.nyna-share-optout:hover:not(:disabled) {
+  color: var(--rose);
+}
+.nyna-share-optout:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 /* ---- memory view (full tab) ---- */
 .nyna-memory-shell {
   padding: 22px 26px 30px;
@@ -5333,6 +5430,15 @@ input:focus, select:focus, textarea:focus {
 .nyna-inbound-pulse.is-done {
   background: var(--apricot);
 }
+.nyna-inbound-pulse.is-demo {
+  background: var(--apricot);
+  box-shadow: 0 0 0 0 rgba(216, 151, 60, 0.6);
+  animation: inboundPulseDemo 1.4s ease-out infinite;
+}
+@keyframes inboundPulseDemo {
+  0%   { box-shadow: 0 0 0 0 rgba(216, 151, 60, 0.7); }
+  100% { box-shadow: 0 0 0 18px rgba(216, 151, 60, 0); }
+}
 @keyframes inboundPulse {
   0%   { box-shadow: 0 0 0 0 rgba(253, 155, 183, 0.7); }
   100% { box-shadow: 0 0 0 18px rgba(253, 155, 183, 0); }
@@ -5401,6 +5507,31 @@ input:focus, select:focus, textarea:focus {
 .nyna-inbound-banner-body {
   font-size: 12.5px;
   color: var(--pearl);
+}
+.nyna-inbound-banner.is-demo {
+  background: linear-gradient(90deg, rgba(173, 40, 49, 0.22), transparent);
+  border-left-color: var(--candy);
+}
+.nyna-inbound-banner.is-demo .nyna-inbound-banner-eyebrow {
+  color: var(--candy);
+}
+.nyna-inbound-banner-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.nyna-inbound-banner-bullet {
+  font-size: 11.5px;
+  color: var(--ink-200);
+  padding-left: 10px;
+  position: relative;
+}
+.nyna-inbound-banner-bullet::before {
+  content: '·';
+  position: absolute;
+  left: 0;
+  color: var(--apricot);
 }
 
 .nyna-inbound-cols {
@@ -5564,3 +5695,78 @@ input:focus, select:focus, textarea:focus {
   border-left-color: var(--candy);
 }
 .nyna-research-evidence.is-mail .nyna-research-evidence-lane { color: var(--candy); }
+
+/* scheduled callback card — right rail "upcoming" section */
+.nyna-rail-card-scheduled {
+  background: linear-gradient(135deg, rgba(216, 151, 60, 0.12), rgba(110, 31, 46, 0.5));
+  border-color: rgba(216, 151, 60, 0.3);
+}
+.nyna-rail-card-status-scheduled {
+  background: rgba(216, 151, 60, 0.22);
+  color: var(--apricot);
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+}
+
+/* warming state — flashes the upcoming card in the last 30 seconds */
+.nyna-rail-card-scheduled-warming {
+  border-color: var(--candy);
+  animation: warmingPulse 1.4s ease-in-out infinite;
+}
+@keyframes warmingPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(253, 155, 183, 0.0); }
+  50%      { box-shadow: 0 0 0 6px rgba(253, 155, 183, 0.25); }
+}
+.nyna-rail-card-scheduled-warming .nyna-rail-card-status-scheduled {
+  background: var(--candy);
+  color: var(--cherry);
+}
+
+/* business-ops widgets in Settings */
+.nyna-stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 18px;
+  padding: 8px 0;
+}
+.nyna-stat-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.nyna-mini-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.nyna-mini-table th,
+.nyna-mini-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-mono);
+}
+.nyna-mini-table th {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--apricot);
+}
+.nyna-mini-table tr.is-winner td {
+  color: var(--rose);
+  font-weight: 600;
+  background: rgba(253, 155, 183, 0.08);
+}
+.nyna-mini-table tr.is-positive td { color: var(--rose); }
+.nyna-mini-table tr.is-negative td { color: var(--error); }
+.nyna-experiment-block { margin-bottom: 14px; }
+.nyna-experiment-key {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--apricot);
+  margin-bottom: 4px;
+}
