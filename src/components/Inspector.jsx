@@ -1403,7 +1403,7 @@ function MailerTab({ detail }) {
         </div>
         <div className="kv-row">
           <div className="kv-key mono">subject</div>
-          <div className="kv-val">Your callmemaybe website invoice + meeting invite</div>
+          <div className="kv-val">Your callan website invoice + meeting invite</div>
         </div>
         <div className="kv-row">
           <div className="kv-key mono">replies</div>

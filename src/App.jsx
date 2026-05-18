@@ -98,16 +98,6 @@ const TABS = [
   { id: 'settings',   label: 'Settings',   sub: 'config' }
 ];
 
-const NODE_TO_TAB = {
-  scraper: 'scraper',
-  memory: 'memory',
-  caller: 'operations',
-  analyst: 'operations',
-  mailer: 'operations',
-  builder: 'operations',
-  browserUse: 'operations'
-};
-
 const WORKER_FROM_TYPE = (t) => t.split('.')[0];
 const SUCCESS_TYPES = new Set(['scraper.done', 'caller.done', 'analyst.done', 'mailer.done', 'builder.done']);
 const ERROR_TYPES   = new Set(['scraper.error', 'caller.error', 'analyst.error', 'mailer.error', 'builder.error']);
@@ -457,12 +447,6 @@ function Console() {
 
   const handleNodeSelect = useCallback((nodeId) => {
     setFocusedNodeId(nodeId);
-    if (!nodeId) return;
-    const tab = NODE_TO_TAB[nodeId];
-    if (tab && tab !== 'operations') {
-      setActiveTab(tab);
-      setFocusedNodeId(null);
-    }
   }, []);
 
   const handleLeadFocus = useCallback((id) => {
@@ -520,10 +504,6 @@ function Console() {
       <Topbar
         activeTab={activeTab}
         onTabChange={(id) => { setActiveTab(id); setFocusedNodeId(null); }}
-        mode={mode}
-        running={running}
-        onStartAutonomy={running ? pauseAutonomy : startAutonomy}
-        onEmergencyStop={emergencyStop}
         queueCounts={queueCounts}
       />
 
@@ -534,6 +514,10 @@ function Console() {
           queueCounts={queueCounts}
           mode={mode}
           health={health}
+          outreach={outreach}
+          running={running}
+          onStartAutonomy={running ? pauseAutonomy : startAutonomy}
+          onEmergencyStop={emergencyStop}
         />
 
         <div className="nyna-stage-wrap">
@@ -564,6 +548,7 @@ function Console() {
               nodeStates={nodeStates}
               counters={counters}
               leads={leads}
+              outreach={outreach}
               onFocusLead={handleLeadFocus}
             />
           ) : activeTab === 'scraper' ? (
@@ -589,12 +574,6 @@ function Console() {
           sseStatus={sseStatus}
         />
       </main>
-
-      <Footbar
-        mode={mode}
-        sseStatus={sseStatus}
-        focusedLeadId={focusedLeadId}
-      />
     </div>
   );
 }
@@ -616,7 +595,7 @@ function Sparkle({ size = 16, color = '#640D14' }) {
   );
 }
 
-function Topbar({ activeTab, onTabChange, mode, running, onStartAutonomy, onEmergencyStop, queueCounts }) {
+function Topbar({ activeTab, onTabChange, queueCounts }) {
   return (
     <header className="nyna-topbar">
       <div className="nyna-brand">
@@ -624,8 +603,8 @@ function Topbar({ activeTab, onTabChange, mode, running, onStartAutonomy, onEmer
           <Sparkle />
         </div>
         <div className="nyna-brand-text">
-          <div className="nyna-brand-name">callmemaybe</div>
-          <div className="nyna-brand-tag">operator console</div>
+          <div className="nyna-brand-name">Callan</div>
+          <div className="nyna-brand-tag">AI Cold-Calling</div>
         </div>
       </div>
 
@@ -641,25 +620,12 @@ function Topbar({ activeTab, onTabChange, mode, running, onStartAutonomy, onEmer
               role="tab"
               aria-selected={isActive}
             >
-              <span className="nyna-tab-glyph" />
               <span>{tab.label}</span>
               {badge ? <span className="nyna-tab-badge">{badge}</span> : null}
             </button>
           );
         })}
       </nav>
-
-      <div className="nyna-actions">
-        <div className="nyna-action" title={`mode ${mode}`}>
-          <span className="nyna-action-dot nyna-action-dot-off" style={{ background: 'var(--apricot)', boxShadow: '0 0 6px var(--apricot)' }} />
-          <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', fontSize: 10 }}>{mode}</span>
-        </div>
-        <button className="nyna-action nyna-action-primary" onClick={onStartAutonomy}>
-          <span className={`nyna-action-dot ${running ? 'nyna-action-dot-live' : 'nyna-action-dot-off'}`} />
-          {running ? 'pause autonomy' : 'start autonomy'}
-        </button>
-        <button className="nyna-action nyna-action-danger" onClick={onEmergencyStop}>stop</button>
-      </div>
     </header>
   );
 }
@@ -670,7 +636,10 @@ function badgeFor(tabId, queue = {}) {
   return null;
 }
 
-function SideNav({ activeTab, counters, queueCounts, mode, health }) {
+function SideNav({ activeTab, counters, queueCounts, mode, health, outreach, running, onStartAutonomy, onEmergencyStop }) {
+  const agents = outreach?.agents;
+  const agentText = agents ? `${agents.active || 0}/${agents.concurrency || 1}` : '—';
+  const providersText = countProviders(health);
   return (
     <aside className="nyna-side">
       <div className="nyna-side-section">
@@ -686,37 +655,32 @@ function SideNav({ activeTab, counters, queueCounts, mode, health }) {
         ))}
       </div>
 
-      <div className="nyna-side-section">
-        <div className="nyna-side-title">status</div>
-        <div className="nyna-side-item" style={{ cursor: 'default' }}>
-          <span className="nyna-side-item-left">
-            <span className={`nyna-side-spark ${mode === 'MOCK' ? 'nyna-side-spark-warn' : 'nyna-side-spark-live'}`} />
-            <span className="nyna-side-item-label">mode</span>
-          </span>
-          <span className="nyna-side-item-count">{mode || '—'}</span>
+      <div className="nyna-side-status-panel" aria-label="status">
+        <div className="nyna-side-status-head">
+          <span>Status</span>
+          <strong className={mode === 'MOCK' ? 'is-warm' : 'is-live'}>{mode || '—'}</strong>
         </div>
-        <div className="nyna-side-item" style={{ cursor: 'default' }}>
-          <span className="nyna-side-item-left">
-            <span className="nyna-side-spark" />
-            <span className="nyna-side-item-label">providers</span>
-          </span>
-          <span className="nyna-side-item-count">{countProviders(health)}</span>
+        <div className="nyna-side-status-grid">
+          <div>
+            <span>providers</span>
+            <strong>{providersText}</strong>
+          </div>
+          <div>
+            <span>callers</span>
+            <strong>{agentText}</strong>
+          </div>
         </div>
       </div>
 
-      <div className="nyna-side-card">
-        <div className="nyna-side-card-title">NYNÄ palette</div>
-        <div className="nyna-side-card-body">
-          Pearl Beige · Golden Apricot · Cotton Candy · Brown Red · Black Cherry.
-          Warm, human, and built for people who run the floor.
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          {['#F3E6BD', '#D8973C', '#FD9BB7', '#AD2831', '#640D14'].map((c) => (
-            <span key={c} style={{
-              width: 18, height: 18, borderRadius: 5,
-              background: c, border: '1px solid rgba(243,230,189,0.2)'
-            }} />
-          ))}
+      <div className="nyna-side-controls">
+        <div className="nyna-side-controls-kicker">AI Cold-Calling</div>
+        <div className="nyna-side-controls-row">
+          <button className="nyna-side-action nyna-side-action-primary" onClick={onStartAutonomy}>
+            {running ? 'pause' : 'start'}
+          </button>
+          <button className="nyna-side-action nyna-side-action-danger" onClick={onEmergencyStop}>
+            stop
+          </button>
         </div>
       </div>
     </aside>
@@ -733,12 +697,11 @@ function countProviders(health) {
 function sectionItemsForTab(tab, counters = {}, queue = {}) {
   if (tab === 'operations') {
     return [
-      { label: 'super memory', count: counters.memory || 0, tone: counters.memory ? 'live' : null, active: true },
-      { label: 'callers',      count: counters.caller || 0, tone: counters.caller ? 'live' : null },
-      { label: 'scraper',      count: counters.scraper || 0, tone: counters.scraper ? 'live' : null },
-      { label: 'analyst',      count: counters.analyst || 0 },
-      { label: 'mailer',       count: counters.mailer || 0 },
-      { label: 'builder',      count: counters.builder || 0, tone: counters.builder ? 'live' : null }
+      { label: 'supermemory',  count: counters.memory || 0, tone: counters.memory ? 'live' : null, active: true },
+      { label: 'agent phone',  count: counters.caller || 0, tone: counters.caller ? 'live' : null },
+      { label: 'browser use',  count: (counters.scraper || 0) + (counters.analyst || 0), tone: (counters.scraper || counters.analyst) ? 'live' : null },
+      { label: 'agent mail',   count: counters.mailer || 0 },
+      { label: 'lovable',      count: counters.builder || 0, tone: counters.builder ? 'live' : null }
     ];
   }
   if (tab === 'agents') {
@@ -773,29 +736,4 @@ function sectionItemsForTab(tab, counters = {}, queue = {}) {
     ];
   }
   return [];
-}
-
-function Footbar({ mode, sseStatus, focusedLeadId }) {
-  return (
-    <footer className="nyna-foot">
-      <div>
-        <span>we are not selling an agent — we are selling an agency.</span>
-        <span className="nyna-foot-sep">·</span>
-        <span>mode <span style={{ color: 'var(--apricot)' }}>{mode}</span></span>
-        {focusedLeadId ? (
-          <>
-            <span className="nyna-foot-sep">·</span>
-            <span>focus <span style={{ color: 'var(--apricot)' }}>{focusedLeadId.slice(0, 12)}</span></span>
-          </>
-        ) : null}
-      </div>
-      <div className="nyna-foot-right">
-        <span className={`nyna-foot-sse nyna-foot-sse-${sseStatus}`}>
-          <span className="nyna-foot-sse-dot" /> stream {sseStatus}
-        </span>
-        <span className="nyna-foot-sep">·</span>
-        <span>{new Date().toISOString().slice(0, 10)}</span>
-      </div>
-    </footer>
-  );
 }

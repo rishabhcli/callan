@@ -1340,6 +1340,51 @@ export const leads = {
       LIMIT ?
     `).all(limit);
   },
+  claimOutreach(id, {
+    now = Date.now(),
+    riskStatus = 'callable',
+    phoneClassification = null,
+    nextAction = 'call_in_progress',
+    actor = 'caller'
+  } = {}) {
+    const runClaim = db.transaction(() => {
+      const before = this.get(id);
+      if (!before) return { claimed: false, reason: 'not_found', row: null };
+      const info = db.prepare(`
+        UPDATE leads
+        SET
+          outreach_status = 'running',
+          risk_status = ?,
+          phone_classification = COALESCE(?, phone_classification),
+          last_contacted_at = ?,
+          next_action = ?,
+          updated_at = ?
+        WHERE id = ?
+          AND outreach_status IN ('queued', 'retry')
+          AND (
+            next_action IS NULL
+            OR next_action NOT LIKE 'retry_after:%'
+            OR CAST(substr(next_action, 13) AS INTEGER) <= ?
+          )
+      `).run(riskStatus, phoneClassification, now, nextAction, now, id, now);
+      const row = this.get(id);
+      if (info.changes <= 0) {
+        return { claimed: false, reason: row ? `already_${row.outreach_status}` : 'not_found', row };
+      }
+      addHistory({
+        leadId: id,
+        action: 'outreach_claimed',
+        actor,
+        summary: 'Outreach worker claimed queued lead',
+        metadata: {
+          changed: diffLead(before, row, ['outreach_status', 'risk_status', 'phone_classification', 'last_contacted_at', 'next_action'])
+        },
+        ts: now
+      });
+      return { claimed: true, reason: 'claimed', row };
+    });
+    return runClaim();
+  },
   outreachSummary() {
     return {
       queued: db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE outreach_status IN ('queued', 'retry')`).get().n,

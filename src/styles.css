@@ -3612,7 +3612,7 @@ body::after {
 .nyna-shell {
   position: relative;
   display: grid;
-  grid-template-rows: 56px 1fr 28px;
+  grid-template-rows: 76px 1fr;
   height: 100vh;
   z-index: 2;
   color: var(--ink-100);
@@ -3622,23 +3622,41 @@ body::after {
 /* ---- top bar ------------------------------------------------ */
 .nyna-topbar {
   display: grid;
-  grid-template-columns: 240px 1fr auto;
+  grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr);
   align-items: center;
-  padding: 0 20px;
+  gap: 0;
+  margin: 10px 14px 8px;
+  padding: 0 18px;
   background:
-    linear-gradient(180deg, rgba(110, 31, 46, 0.45) 0%, rgba(31, 6, 14, 0.85) 100%);
-  border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+    linear-gradient(180deg, rgba(255, 248, 230, 0.70), rgba(239, 205, 153, 0.48)),
+    rgba(249, 228, 185, 0.56);
+  border: 1px solid rgba(255, 247, 219, 0.46);
+  border-radius: 20px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -1px 0 rgba(100, 13, 20, 0.10),
+    0 18px 46px rgba(39, 5, 18, 0.26);
+  backdrop-filter: blur(24px) saturate(1.35);
+  -webkit-backdrop-filter: blur(24px) saturate(1.35);
   position: relative;
+  overflow: hidden;
   z-index: 30;
+}
+.nyna-topbar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(105deg, rgba(255, 255, 255, 0.62) 0%, rgba(255, 255, 255, 0.08) 34%, rgba(255, 215, 120, 0.24) 62%, rgba(255, 255, 255, 0.02) 100%);
+  opacity: 0.68;
+  pointer-events: none;
 }
 .nyna-topbar::after {
   content: '';
   position: absolute;
-  left: 0; right: 0; bottom: -1px;
+  left: 18px; right: 18px; bottom: 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(216, 151, 60, 0.45), transparent);
+  background: linear-gradient(90deg, transparent, rgba(255, 234, 170, 0.8), transparent);
 }
 
 .nyna-brand {
@@ -3646,16 +3664,21 @@ body::after {
   align-items: center;
   gap: 12px;
   font-family: var(--font-display);
+  min-width: 0;
+  grid-column: 1;
+  position: relative;
+  z-index: 1;
 }
 .nyna-brand-mark {
   width: 34px;
   height: 34px;
-  border-radius: 10px;
+  border-radius: 12px;
   background:
-    radial-gradient(circle at 35% 35%, var(--pearl), var(--apricot) 55%, var(--brown-red) 100%);
+    linear-gradient(145deg, #fff4cc 0%, #e9b351 58%, #a44332 100%);
   box-shadow:
-    inset 0 0 0 1px rgba(243, 230, 189, 0.35),
-    0 5px 16px rgba(173, 40, 49, 0.45);
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    inset 0 -8px 18px rgba(100, 13, 20, 0.18),
+    0 8px 18px rgba(100, 13, 20, 0.18);
   position: relative;
   flex: 0 0 auto;
   display: flex;
@@ -3663,13 +3686,7 @@ body::after {
   justify-content: center;
 }
 .nyna-brand-mark::after {
-  content: '';
-  position: absolute;
-  top: -3px; right: -3px;
-  width: 9px; height: 9px;
-  border-radius: 50%;
-  background: var(--candy);
-  box-shadow: 0 0 8px var(--candy);
+  display: none;
 }
 .nyna-brand-text {
   display: flex;
@@ -3677,68 +3694,71 @@ body::after {
   line-height: 1;
 }
 .nyna-brand-name {
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 600;
-  color: var(--pearl);
-  letter-spacing: -0.01em;
+  color: var(--cherry);
+  letter-spacing: 0;
   font-feature-settings: 'ss01';
 }
 .nyna-brand-tag {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--apricot);
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(100, 13, 20, 0.68);
+  letter-spacing: 0;
+  text-transform: none;
   margin-top: 4px;
 }
 
 .nyna-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
   justify-self: center;
+  grid-column: 2;
+  gap: 8px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  position: relative;
+  z-index: 1;
 }
 .nyna-tab {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   background: transparent;
   border: none;
-  color: var(--ink-300);
-  padding: 8px 16px;
+  color: rgba(100, 13, 20, 0.70);
+  padding: 8px 15px;
   font-family: var(--font-body);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 650;
   cursor: pointer;
-  border-radius: 8px;
+  border-radius: 999px;
   position: relative;
-  transition: color 140ms ease, background 140ms ease;
+  transition: color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease;
 }
-.nyna-tab:hover {
-  color: var(--pearl);
-  background: rgba(243, 230, 189, 0.06);
+.nyna-tab:hover,
+.nyna-tab:focus-visible {
+  color: var(--cherry);
+  background: rgba(255, 248, 230, 0.14);
+  box-shadow:
+    inset 0 0 0 1.5px rgba(216, 151, 60, 0.88),
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    0 8px 18px rgba(216, 151, 60, 0.12);
+  outline: none;
 }
 .nyna-tab-active {
-  color: var(--pearl);
-  background: rgba(216, 151, 60, 0.14);
+  color: var(--cherry);
+  background: transparent;
+  box-shadow: none;
+  font-weight: 750;
 }
 .nyna-tab-active::after {
-  content: '';
-  position: absolute;
-  left: 12px; right: 12px; bottom: -10px;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--apricot), transparent);
-  border-radius: 2px;
-}
-.nyna-tab-glyph {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ink-500);
-}
-.nyna-tab-active .nyna-tab-glyph {
-  background: var(--apricot);
-  box-shadow: 0 0 8px var(--apricot);
+  content: none;
 }
 .nyna-tab-badge {
   display: inline-flex;
@@ -3747,14 +3767,14 @@ body::after {
   min-width: 18px;
   height: 18px;
   padding: 0 6px;
-  background: var(--surface-2);
-  color: var(--pearl);
+  background: rgba(100, 13, 20, 0.14);
+  color: var(--cherry);
   font-family: var(--font-mono);
   font-size: 10px;
   border-radius: 9px;
 }
 .nyna-tab-active .nyna-tab-badge {
-  background: var(--apricot);
+  background: rgba(100, 13, 20, 0.18);
   color: var(--cherry);
 }
 
@@ -3833,17 +3853,32 @@ body::after {
 .nyna-side {
   display: flex;
   flex-direction: column;
-  padding: 20px 16px;
-  gap: 4px;
-  border-right: 1px solid var(--line);
+  padding: 20px 16px 22px;
+  gap: 14px;
+  border-right: 1px solid rgba(216, 151, 60, 0.18);
   background:
-    linear-gradient(180deg, rgba(31, 6, 14, 0.4) 0%, transparent 100%);
+    radial-gradient(circle at 88% 8%, rgba(253, 155, 183, 0.22), transparent 28%),
+    radial-gradient(circle at 0% 78%, rgba(216, 151, 60, 0.18), transparent 34%),
+    linear-gradient(168deg, rgba(74, 20, 33, 0.62), rgba(31, 6, 14, 0.84) 52%, rgba(20, 4, 10, 0.92));
   overflow-y: auto;
   position: relative;
   z-index: 10;
 }
+.nyna-side::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(243, 230, 189, 0.08), transparent 24%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05), transparent 42%);
+  pointer-events: none;
+}
+.nyna-side > * {
+  position: relative;
+  z-index: 1;
+}
 .nyna-side-section {
-  margin-bottom: 18px;
+  margin-bottom: 0;
 }
 .nyna-side-title {
   display: flex;
@@ -3851,35 +3886,38 @@ body::after {
   justify-content: space-between;
   font-family: var(--font-mono);
   font-size: 9.5px;
-  color: var(--apricot);
+  color: rgba(243, 230, 189, 0.64);
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  padding: 0 8px 10px;
+  padding: 0 4px 10px;
 }
 .nyna-side-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 9px 12px;
-  border-radius: 8px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border-radius: 10px;
   cursor: pointer;
-  font-size: 12.5px;
-  color: var(--ink-200);
+  font-size: 13px;
+  color: rgba(243, 230, 189, 0.78);
   border: 1px solid transparent;
-  transition: all 140ms ease;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease, transform 160ms ease;
   background: transparent;
   text-align: left;
   font-family: var(--font-body);
 }
 .nyna-side-item:hover {
-  background: rgba(243, 230, 189, 0.05);
+  background: rgba(243, 230, 189, 0.07);
   color: var(--pearl);
+  transform: translateX(2px);
 }
 .nyna-side-item-active {
-  background: rgba(216, 151, 60, 0.12);
+  background:
+    linear-gradient(90deg, rgba(216, 151, 60, 0.20), rgba(243, 230, 189, 0.06));
   color: var(--pearl);
-  border-color: rgba(216, 151, 60, 0.25);
+  border-color: rgba(216, 151, 60, 0.28);
 }
 .nyna-side-item-left {
   display: inline-flex;
@@ -3897,62 +3935,185 @@ body::after {
 .nyna-side-item-count {
   font-family: var(--font-mono);
   font-size: 10px;
-  color: var(--apricot);
+  color: rgba(216, 151, 60, 0.92);
 }
 .nyna-side-spark {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ink-500);
+  width: 3px;
+  height: 16px;
+  border-radius: 99px;
+  background: rgba(243, 230, 189, 0.22);
 }
 .nyna-side-spark-live { background: var(--rose); box-shadow: 0 0 8px var(--rose); animation: nynaPulse 1.6s ease-in-out infinite; }
 .nyna-side-spark-warn { background: var(--apricot); box-shadow: 0 0 6px var(--apricot); }
 .nyna-side-spark-err  { background: var(--error); box-shadow: 0 0 6px var(--error); }
 
-.nyna-side-card {
-  margin-top: 14px;
-  border: 1px solid var(--line);
-  background: rgba(74, 20, 33, 0.55);
-  border-radius: 10px;
-  padding: 14px;
-  position: relative;
-  overflow: hidden;
+.nyna-side-status-panel {
+  padding: 13px 14px;
+  border-top: 1px solid rgba(243, 230, 189, 0.12);
+  border-bottom: 1px solid rgba(243, 230, 189, 0.12);
+  background:
+    linear-gradient(135deg, rgba(243, 230, 189, 0.10), rgba(253, 155, 183, 0.08)),
+    rgba(20, 4, 10, 0.20);
 }
-.nyna-side-card::before {
-  content: '';
-  position: absolute;
-  inset: -40% -40% auto auto;
-  width: 160px; height: 160px;
-  background: var(--candy-bloom);
-  pointer-events: none;
-}
-.nyna-side-card-title {
-  font-family: var(--font-display);
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 4px;
-  color: var(--pearl);
-}
-.nyna-side-card-body {
-  font-size: 11.5px;
-  color: var(--ink-300);
-  line-height: 1.45;
-  position: relative;
-  margin-bottom: 10px;
-}
-.nyna-side-card-cta {
-  display: inline-flex;
+.nyna-side-status-head {
+  display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.nyna-side-status-head span,
+.nyna-side-status-grid span {
   font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--apricot);
-  letter-spacing: 0.1em;
+  font-size: 9px;
+  color: rgba(243, 230, 189, 0.54);
+  letter-spacing: 0.16em;
   text-transform: uppercase;
+}
+.nyna-side-status-head strong,
+.nyna-side-status-grid strong {
+  color: var(--pearl);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.nyna-side-status-head strong.is-warm {
+  color: var(--apricot);
+}
+.nyna-side-status-head strong.is-live {
+  color: var(--rose);
+}
+.nyna-side-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.nyna-side-status-grid div {
+  min-width: 0;
+  padding: 8px 9px;
+  border-radius: 9px;
+  background: rgba(20, 4, 10, 0.24);
+  border: 1px solid rgba(243, 230, 189, 0.09);
+}
+.nyna-side-status-grid span,
+.nyna-side-status-grid strong {
+  display: block;
+}
+
+.nyna-side-controls {
+  margin-top: auto;
+  padding: 12px;
+  border: 1px solid rgba(243, 230, 189, 0.16);
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255, 245, 218, 0.13), rgba(216, 151, 60, 0.08)),
+    rgba(31, 6, 14, 0.42);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 18px 36px rgba(20, 4, 10, 0.26);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+.nyna-side-controls-kicker {
+  margin-bottom: 9px;
+  color: var(--ink-300);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.nyna-side-controls-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.nyna-side-action {
+  width: 100%;
+  min-height: 38px;
+  border-radius: 12px;
+  border: 1px solid rgba(243, 230, 189, 0.16);
+  background: rgba(243, 230, 189, 0.06);
+  color: var(--ink-100);
+  font-family: var(--font-body);
+  font-size: 12px;
+  font-weight: 700;
   cursor: pointer;
-  background: transparent;
-  border: none;
-  padding: 0;
+  transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, box-shadow 180ms ease, color 180ms ease;
+}
+.nyna-side-action:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 210, 88, 0.62);
+  background: rgba(255, 210, 88, 0.18);
+  box-shadow: 0 10px 22px rgba(216, 151, 60, 0.16);
+}
+.nyna-side-action:active {
+  transform: translateY(0);
+}
+.nyna-side-action-primary {
+  background: rgba(255, 210, 88, 0.78);
+  border-color: rgba(255, 231, 160, 0.65);
+  color: var(--cherry);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    0 10px 24px rgba(216, 151, 60, 0.20);
+}
+.nyna-side-action-primary:hover {
+  background: rgba(255, 219, 109, 0.92);
+  color: var(--cherry);
+}
+.nyna-side-action-danger {
+  color: var(--rose);
+  border-color: rgba(253, 155, 183, 0.28);
+}
+.nyna-side-action-danger:hover {
+  color: var(--pearl);
+  border-color: rgba(253, 155, 183, 0.5);
+  background: rgba(173, 40, 49, 0.18);
+  box-shadow: 0 10px 22px rgba(173, 40, 49, 0.14);
+}
+
+@media (max-width: 900px) {
+  .nyna-shell {
+    height: auto;
+    min-height: 100vh;
+    grid-template-rows: auto 1fr;
+  }
+  .nyna-topbar {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    min-height: 92px;
+    padding: 12px 14px;
+  }
+  .nyna-brand,
+  .nyna-tabs {
+    grid-column: 1;
+  }
+  .nyna-tabs {
+    justify-self: stretch;
+    justify-content: flex-start;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+  .nyna-tab {
+    flex: 0 0 auto;
+  }
+  .nyna-main {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(540px, 72vh) auto;
+  }
+  .nyna-side {
+    min-height: 0;
+    max-height: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .nyna-stage-wrap {
+    min-height: 540px;
+  }
+  .nyna-rail {
+    min-height: 360px;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
 }
 
 /* ---- center stage (3D scene + detail overlay) -------------- */
@@ -3992,28 +4153,6 @@ body::after {
   font-weight: 500;
   margin-right: 8px;
 }
-.nyna-stage-helptext {
-  position: absolute;
-  bottom: 22px;
-  left: 50%;
-  transform: translateX(-50%);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--ink-400);
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  pointer-events: none;
-  z-index: 2;
-  display: inline-flex;
-  align-items: center;
-  gap: 14px;
-}
-.nyna-stage-helptext span { display: inline-flex; align-items: center; gap: 6px; }
-.nyna-stage-helptext em {
-  font-style: normal;
-  color: var(--apricot);
-}
-
 .nyna-stage-headline {
   position: absolute;
   top: 22px;
@@ -4109,6 +4248,25 @@ body::after {
   font-size: 13px;
   flex: 0 0 auto;
   box-shadow: 0 4px 14px rgba(216, 151, 60, 0.35), inset 0 1px 0 rgba(243, 230, 189, 0.4);
+}
+.nyna-detail-icon svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+  stroke: currentColor;
+  color: var(--cherry);
+}
+.nyna-detail-icon svg.is-lovable {
+  width: 25px;
+  height: 25px;
+  stroke: none;
+}
+.nyna-detail-icon img.is-agentphone {
+  width: 27px;
+  height: 27px;
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 3px 7px rgba(20, 4, 10, 0.28));
 }
 .nyna-detail-title {
   font-family: var(--font-display);
@@ -4328,39 +4486,6 @@ body::after {
   font-family: var(--font-mono);
 }
 
-/* ---- footer ------------------------------------------------ */
-.nyna-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 20px;
-  border-top: 1px solid var(--line);
-  background:
-    linear-gradient(0deg, rgba(31, 6, 14, 0.6) 0%, transparent 100%);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--ink-400);
-  letter-spacing: 0.1em;
-}
-.nyna-foot-sep {
-  color: var(--ink-500);
-  margin: 0 12px;
-}
-.nyna-foot-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.nyna-foot-sse {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.nyna-foot-sse-dot { width: 6px; height: 6px; border-radius: 50%; }
-.nyna-foot-sse-connected .nyna-foot-sse-dot { background: var(--rose); box-shadow: 0 0 6px var(--rose); }
-.nyna-foot-sse-connecting .nyna-foot-sse-dot { background: var(--apricot); }
-.nyna-foot-sse-closed .nyna-foot-sse-dot { background: var(--error); }
-
 /* ---- generic enterprise card (used inside detail bodies) --- */
 .nyna-card {
   background: rgba(74, 20, 33, 0.4);
@@ -4384,24 +4509,32 @@ body::after {
 /* ---- scraper grid (browser-use cloud windows) ---- */
 .nyna-scraper-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-auto-rows: minmax(300px, 360px);
+  gap: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  align-content: start;
+  padding-right: 4px;
 }
 .nyna-scraper-card {
   background: rgba(31, 6, 14, 0.6);
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 10px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 .nyna-scraper-card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 14px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   gap: 10px;
+  flex: 0 0 auto;
 }
 .nyna-scraper-card-title {
   font-size: 13px;
@@ -4420,7 +4553,8 @@ body::after {
   position: relative;
   background: var(--bg-0);
   border-bottom: 1px solid var(--line);
-  aspect-ratio: 16 / 10;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4439,11 +4573,12 @@ body::after {
   letter-spacing: 0.08em;
 }
 .nyna-scraper-card-foot {
-  padding: 10px 14px;
+  padding: 9px 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex: 0 0 auto;
 }
 .nyna-scraper-card-status-pill {
   display: inline-flex;
@@ -4656,13 +4791,16 @@ input:focus, select:focus, textarea:focus {
 /* ---- 3D scene HTML labels (drei <Html>) ---- */
 .scene-node-label {
   font-family: var(--font-body);
-  background: rgba(20, 4, 10, 0.78);
-  border: 1px solid rgba(216, 151, 60, 0.45);
-  border-radius: 8px;
-  padding: 8px 12px;
-  min-width: 140px;
+  background:
+    linear-gradient(180deg, rgba(37, 17, 18, 0.94), rgba(20, 4, 10, 0.9));
+  border: 1px solid rgba(216, 151, 60, 0.5);
+  border-radius: 7px;
+  padding: 5px 8px 6px;
+  min-width: 106px;
   color: var(--pearl);
-  box-shadow: 0 8px 26px rgba(20, 4, 10, 0.5), inset 0 0 0 1px rgba(243, 230, 189, 0.05);
+  box-shadow:
+    0 8px 18px rgba(20, 4, 10, 0.36),
+    inset 0 1px 0 rgba(243, 230, 189, 0.08);
   white-space: nowrap;
   user-select: none;
 }
@@ -4675,17 +4813,17 @@ input:focus, select:focus, textarea:focus {
 }
 .scene-node-code {
   font-family: var(--font-mono);
-  font-size: 9.5px;
-  letter-spacing: 0.18em;
+  font-size: 8px;
+  letter-spacing: 0.14em;
   color: var(--apricot);
   text-transform: uppercase;
 }
 .scene-node-state {
   font-family: var(--font-mono);
-  font-size: 8.5px;
-  letter-spacing: 0.16em;
+  font-size: 7.5px;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 4px;
   background: rgba(243, 230, 189, 0.06);
   color: var(--ink-300);
@@ -4699,23 +4837,23 @@ input:focus, select:focus, textarea:focus {
 .scene-node-state-error { color: var(--pearl); background: var(--error); }
 .scene-node-name {
   font-family: var(--font-display);
-  font-size: 14px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--pearl);
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   font-feature-settings: 'ss01';
   line-height: 1.05;
 }
 .scene-node-sub {
   font-family: var(--font-mono);
-  font-size: 9.5px;
-  color: var(--ink-300);
-  letter-spacing: 0.06em;
+  font-size: 8.2px;
+  color: rgba(228, 210, 166, 0.72);
+  letter-spacing: 0.04em;
   margin-top: 3px;
 }
 .scene-node-count {
   font-family: var(--font-display);
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--apricot);
   line-height: 1;
@@ -4729,6 +4867,117 @@ input:focus, select:focus, textarea:focus {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   margin-left: 4px;
+}
+
+.scene-node-logo {
+  width: 86px;
+  height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 11px;
+  color: var(--pearl);
+  background:
+    radial-gradient(circle at 35% 25%, rgba(243, 230, 189, 0.18), transparent 54%),
+    rgba(20, 4, 10, 0.34);
+  border: 1px solid rgba(243, 230, 189, 0.18);
+  box-shadow:
+    0 12px 24px rgba(20, 4, 10, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+.scene-node-logo svg {
+  width: 62px;
+  height: 48px;
+  display: block;
+  fill: currentColor;
+  color: currentColor;
+  filter: drop-shadow(0 4px 9px rgba(20, 4, 10, 0.32));
+}
+.scene-node-logo img {
+  width: 62px;
+  height: 58px;
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 9px rgba(20, 4, 10, 0.32));
+  user-select: none;
+}
+.scene-node-logo-memory {
+  color: #D9E9FA;
+  background:
+    radial-gradient(circle at 45% 30%, rgba(167, 203, 242, 0.34), transparent 58%),
+    rgba(7, 27, 46, 0.54);
+}
+.scene-node-logo-caller {
+  color: #FFD2DF;
+  background:
+    radial-gradient(circle at 45% 28%, rgba(253, 155, 183, 0.26), transparent 58%),
+    rgba(60, 12, 28, 0.42);
+}
+.scene-node-logo-caller img {
+  width: 66px;
+  height: 60px;
+}
+.scene-node-logo-scraper {
+  color: #FFF4D6;
+  background:
+    radial-gradient(circle at 50% 32%, rgba(254, 123, 2, 0.22), transparent 58%),
+    rgba(45, 19, 8, 0.48);
+}
+.scene-node-logo-mailer {
+  color: #FFF3D6;
+  background:
+    radial-gradient(circle at 42% 30%, rgba(216, 151, 60, 0.22), transparent 58%),
+    rgba(42, 8, 16, 0.5);
+}
+.scene-node-logo-mailer svg {
+  width: 58px;
+  height: 58px;
+}
+.scene-node-logo-builder {
+  color: #FFF4D6;
+  border-color: rgba(255, 126, 176, 0.28);
+  background:
+    radial-gradient(circle at 58% 28%, rgba(255, 102, 244, 0.24), transparent 56%),
+    radial-gradient(circle at 28% 74%, rgba(75, 115, 255, 0.22), transparent 60%),
+    rgba(35, 10, 24, 0.42);
+}
+.scene-node-logo-builder svg {
+  width: 58px;
+  height: 58px;
+  fill: currentColor;
+}
+
+.scene-hub-label {
+  min-width: 142px;
+  padding: 8px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(216, 151, 60, 0.62);
+  background:
+    linear-gradient(180deg, rgba(49, 18, 16, 0.96), rgba(20, 4, 10, 0.92));
+  box-shadow:
+    0 12px 26px rgba(20, 4, 10, 0.46),
+    inset 0 1px 0 rgba(243, 230, 189, 0.1);
+  color: var(--pearl);
+  text-align: center;
+  user-select: none;
+  white-space: nowrap;
+}
+.scene-hub-label span {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1;
+  color: var(--pearl);
+}
+.scene-hub-label small {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.13em;
+  color: var(--apricot);
+  text-transform: uppercase;
 }
 
 /* ---- right rail queue summary ---- */
@@ -4829,53 +5078,77 @@ input:focus, select:focus, textarea:focus {
   display: inline-block;
 }
 
-/* ---- scraper view shell ---- */
-.nyna-scraper-shell {
-  padding: 22px 26px 30px;
-  height: 100%;
+.nyna-scraper-merged {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  overflow: auto;
+}
+.nyna-scraper-analysis-card {
+  border-style: dashed;
+  background:
+    radial-gradient(circle at 18% 18%, rgba(216, 151, 60, 0.12), transparent 58%),
+    rgba(31, 6, 14, 0.52);
+}
+
+/* ---- scraper view shell ---- */
+.nyna-scraper-shell {
+  padding: 20px 24px 22px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+  min-height: 0;
 }
 .nyna-scraper-header {
   display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 22px;
-  align-items: center;
-  padding-bottom: 14px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: end;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.nyna-scraper-header > div:first-child {
+  min-width: 0;
 }
 .nyna-scraper-stats {
-  display: flex;
-  gap: 18px;
-  justify-self: center;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(54px, auto));
+  gap: 8px;
+  justify-self: end;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .nyna-scraper-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  min-width: 54px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(243, 230, 189, 0.08);
+  background: rgba(31, 6, 14, 0.28);
 }
 .nyna-scraper-stat-k {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 8px;
   color: var(--ink-400);
-  letter-spacing: 0.18em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
+  display: block;
 }
 .nyna-scraper-stat-v {
   font-family: var(--font-display);
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 500;
   color: var(--pearl);
   font-feature-settings: 'tnum';
   line-height: 1;
+  display: block;
+  margin-top: 4px;
 }
 .nyna-scraper-stat.is-good .nyna-scraper-stat-v { color: var(--rose); }
 .nyna-scraper-stat.is-bad  .nyna-scraper-stat-v { color: var(--error); }
 .nyna-scraper-actions {
-  display: flex;
-  gap: 8px;
+  display: none;
 }
 .nyna-mini-btn.is-on {
   background: var(--apricot);
@@ -4890,6 +5163,21 @@ input:focus, select:focus, textarea:focus {
   border-radius: 8px;
   font-family: var(--font-mono);
   font-size: 11px;
+}
+.nyna-scraper-empty {
+  grid-column: 1 / -1;
+  min-height: 280px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed rgba(243, 230, 189, 0.16);
+  border-radius: 10px;
+  color: var(--ink-400);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-align: center;
+  padding: 24px;
 }
 
 .nyna-scraper-focus {
@@ -5092,6 +5380,39 @@ input:focus, select:focus, textarea:focus {
 .nyna-agents-head {
   padding-bottom: 14px;
   border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+}
+.nyna-agents-meters {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.nyna-agents-meter {
+  min-width: 92px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(216, 151, 60, 0.2);
+  background: rgba(243, 230, 189, 0.05);
+}
+.nyna-agents-meter span {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-400);
+}
+.nyna-agents-meter strong {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--apricot);
 }
 .nyna-agents-grid {
   display: grid;

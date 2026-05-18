@@ -95,7 +95,7 @@ export const env = {
   outreach: {
     enabled: bool(process.env.AUTONOMOUS_OUTREACH_ENABLED),
     intervalMs: num(process.env.OUTREACH_INTERVAL_MS, 15000),
-    batchSize: num(process.env.OUTREACH_BATCH_SIZE, 1),
+    batchSize: num(process.env.OUTREACH_BATCH_SIZE, 3),
     maxAttemptsPerPhone: num(process.env.MAX_ATTEMPTS_PER_PHONE, 1),
     quietHoursStart: num(process.env.QUIET_HOURS_START, 20),
     quietHoursEnd: num(process.env.QUIET_HOURS_END, 9),
