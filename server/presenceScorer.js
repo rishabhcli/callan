@@ -173,6 +173,37 @@ export function detectPresenceUrls(input = '') {
   return extractUrls(String(input)).map(classifyUrl);
 }
 
+// 0-100 numeric presence score. LOWER means worse online presence (more "callable").
+// Used by lead prioritization so a weak-presence lead floats to the top of outreach.
+const STRENGTH_BASE_SCORE = Object.freeze({
+  none: 5,
+  weak: 25,
+  mixed: 55,
+  strong: 90
+});
+
+export function presenceScoreFor(input = {}, options = {}) {
+  // Accept either a raw profile or an already-computed scoreOnlinePresence result.
+  const scored = input && typeof input === 'object' && input.onlinePresenceEvidence && 'onlinePresenceStrength' in input
+    ? input
+    : scoreOnlinePresence(input || {}, options);
+  const strength = normalizePresenceStrength(scored.onlinePresenceStrength, 'weak');
+  const evidence = scored.onlinePresenceEvidence || { website: {}, social: {}, listings: {}, positiveSignals: [], gaps: [] };
+  let score = STRENGTH_BASE_SCORE[strength] ?? STRENGTH_BASE_SCORE.weak;
+  // Layer in evidence so two leads with the same strength can be ranked.
+  if (evidence.website?.found) score += 10;
+  if (evidence.social?.found) score += 3;
+  if (evidence.listings?.found) score += 2;
+  score += Math.min(8, (evidence.positiveSignals?.length || 0) * 2);
+  score -= Math.min(12, (evidence.gaps?.length || 0) * 2);
+  if (typeof scored.presenceConfidence === 'number') {
+    // Confidence pulls extreme strong/none scores toward their archetype.
+    const pivot = strength === 'strong' || strength === 'mixed' ? 50 : 30;
+    score = score + (score - pivot) * 0.15 * scored.presenceConfidence;
+  }
+  return clamp(Math.round(score), 0, 100);
+}
+
 function collectPresenceText(profile, rawText) {
   const chunks = [
     rawText,

@@ -12,6 +12,7 @@ import {
 } from './db.js';
 import { enrichBusinessProfile } from './profileEnrichment.js';
 import { withProviderRetry, normalizeProviderError } from './providers/core.js';
+import { recordSupermemoryDoc } from './costs.js';
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.SUPERMEMORY_TIMEOUT_MS || 15000);
 const TAG_RE = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -157,6 +158,25 @@ export async function addDoc(containerTag, kind, content, metadata = {}, options
       last_error: null,
       last_provider_checked_at: Date.now()
     });
+    // Per-lead unit economics: record one Supermemory doc-write per successful
+    // upsert. Synthetic provider also counts so demos render the same ledger
+    // shape (constants in costs.js can decide whether to charge mock runs).
+    try {
+      const leadId = leadIdFromContainerTag(prepared.container_tag);
+      if (leadId) {
+        recordSupermemoryDoc({
+          leadId,
+          customId: prepared.custom_id,
+          providerDocumentId: res?.id || prepared.custom_id
+        });
+      }
+    } catch (costErr) {
+      log.warn('memory.cost_record_failed', {
+        containerTag: prepared.container_tag,
+        customId: prepared.custom_id,
+        error: costErr?.message || String(costErr)
+      });
+    }
     emit('memory.write.succeeded', memoryEventPayload(prepared, {
       providerDocumentId: res?.id || prepared.custom_id,
       providerStatus,

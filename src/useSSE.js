@@ -7,7 +7,7 @@ const KNOWN_EVENTS = [
   'scraper.session.stopped', 'scraper.done', 'scraper.error',
   'lead.created',
   'caller.start', 'caller.placed', 'caller.transcript', 'caller.pitch_ready',
-  'caller.done', 'caller.error',
+  'caller.done', 'caller.error', 'caller.demo_mode.entered',
   'pitch.created',
   'agentphone.webhook',
   'outreach.started', 'outreach.stopped', 'outreach.blocked',

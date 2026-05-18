@@ -2,6 +2,26 @@ import 'dotenv/config';
 
 const bool = (v) => v === 'true' || v === '1' || v === 'yes';
 const list = (v) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
+
+/**
+ * Parse "email:phone,email:phone" into a lowercased {email→phone} map. Used by
+ * the "call me" email handler to look up the sender's phone when their email
+ * is on file. Whitespace around tokens is trimmed.
+ */
+function parseEmailPhoneMap(raw) {
+  const out = {};
+  if (!raw) return out;
+  for (const pair of String(raw).split(',')) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const idx = trimmed.lastIndexOf(':');
+    if (idx <= 0) continue;
+    const email = trimmed.slice(0, idx).trim().toLowerCase();
+    const phone = trimmed.slice(idx + 1).trim();
+    if (email && phone) out[email] = phone;
+  }
+  return out;
+}
 const num = (v, fallback) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -92,6 +112,13 @@ export const env = {
   },
   allowedPhones: list(process.env.ALLOWED_TARGET_PHONES),
   allowedEmails: list(process.env.ALLOWED_TARGET_EMAILS),
+  // email→phone map for the "call me" email handler. Format:
+  //   CALLBACK_PHONE_BY_EMAIL=river.beach@icloud.com:+15109530626,other@x.com:+14155551234
+  // Used in server/emailCallback.js to look up the sender's phone when their
+  // email is on file, so they don't have to include a number in the body.
+  callbackPhoneByEmail: parseEmailPhoneMap(process.env.CALLBACK_PHONE_BY_EMAIL),
+  // Generic "default" fallback if neither sender lookup nor body parsing finds a phone.
+  defaultCallbackPhone: (process.env.DEMO_CALLBACK_PHONE || '').trim(),
   outreach: {
     enabled: bool(process.env.AUTONOMOUS_OUTREACH_ENABLED),
     intervalMs: num(process.env.OUTREACH_INTERVAL_MS, 15000),
@@ -257,6 +284,40 @@ export function canCallPhone(phone) {
   if (!modeAllowsSideEffect('calls') || !env.live.calls) return false;
   if (env.runMode === 'demo_live') return env.allowedPhones.includes(phone);
   return ['autonomous_live', 'production_live'].includes(env.runMode);
+}
+
+/**
+ * Add a phone number to the in-memory allow list at runtime. Used when a
+ * customer explicitly emails asking for a callback — the request itself is
+ * consent under TCPA-friendly express-invitation rules, so we let them
+ * through `demo_live`'s `ALLOWED_TARGET_PHONES` gate without an operator
+ * having to edit `.env`. Pushes both the raw input and an E.164-normalized
+ * form because different call sites check different shapes.
+ *
+ * Returns true if a new entry was added.
+ */
+export function seedAllowedPhone(phone) {
+  if (!phone) return false;
+  const inputs = [];
+  const raw = String(phone).trim();
+  if (raw) inputs.push(raw);
+  const digits = raw.replace(/\D/g, '');
+  if (digits) {
+    let e164;
+    if (raw.startsWith('+')) e164 = '+' + digits;
+    else if (digits.length === 11 && digits.startsWith('1')) e164 = '+' + digits;
+    else if (digits.length === 10) e164 = '+1' + digits;
+    else e164 = '+' + digits;
+    if (!inputs.includes(e164)) inputs.push(e164);
+  }
+  let added = false;
+  for (const candidate of inputs) {
+    if (!env.allowedPhones.includes(candidate)) {
+      env.allowedPhones.push(candidate);
+      added = true;
+    }
+  }
+  return added;
 }
 
 export function canEmail(email) {

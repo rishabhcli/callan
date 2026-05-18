@@ -21,6 +21,8 @@ import {
 import { generateStructured } from '../reasoning/geminiReasoner.js';
 import { CallScript } from '../reasoning/schemas.js';
 import { callabilityForLead, dncCheck, recordingDisclosure, recordCallDecision, transcriptHasOptOut, recordOptOut } from '../compliance.js';
+import { canDialPhone, recordCallAttempt as reputationRecordCallAttempt } from '../reputation.js';
+import { applyAttemptOutcome } from '../cadence.js';
 import {
   classifyAgentPhoneFailure,
   endAgentPhoneCall,
@@ -32,6 +34,11 @@ import {
   verifyAgentPhoneVoice,
   waitForAgentPhoneFinalTranscript
 } from '../providers/agentphone.js';
+import { shouldTransfer, transferCallToOperator, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
+import { applyPackToPitch, pickPack } from '../verticalPacks/index.js';
+import { applyPitchExperiment } from '../experimentArms.js';
+import { recordOutcome as recordExperimentOutcome } from '../experiments.js';
+import { recordAgentPhoneCallCost } from '../costs.js';
 
 const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human. Output only JSON that matches the supplied schema exactly.`;
 
@@ -243,16 +250,17 @@ async function synthesizeMockTranscript({ pitch, profile, hotContext }) {
   ];
 }
 
-async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, hotContext }) {
+async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, hotContext, experimentAssignment = null }) {
   const callId = `call_${Date.now().toString(36)}`;
   const turns = await synthesizeMockTranscript({ pitch, profile, hotContext });
+  const armReason = experimentAssignment?.arm ? `arm=${experimentAssignment.arm}` : null;
   calls.start({
     id: callId,
     lead_id: leadId,
     to_phone: mask(lead.phone) || 'mock',
     provider_call_id: null,
     disclosure_text: disclosureText,
-    decision_reason: 'mock call'
+    decision_reason: armReason ? `mock call (${armReason})` : 'mock call'
   });
   emit('caller.placed', { worker: 'caller', leadId, runId, callId, providerCallId: null, mock: true });
 
@@ -267,11 +275,30 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, ho
   }
 
   calls.finish(callId, { outcome: 'demo-yes', transcript });
+  try {
+    // Mock calls don't hit AgentPhone, but we still book a synthetic 60s of call
+    // time so the unit-economics ledger renders something for demos.
+    recordAgentPhoneCallCost({ leadId, durationSeconds: 60, callId });
+  } catch (err) {
+    log.warn('caller.cost_record_mock_failed', { leadId, callId, error: err?.message || String(err) });
+  }
+  try {
+    reputationRecordCallAttempt({ leadId, phone: lead.phone, outcome: 'demo-yes' });
+  } catch (err) {
+    log.warn('reputation.record_mock_attempt_failed', { leadId, callId, error: err?.message || String(err) });
+  }
   await safeAddMemory(containerTagFor(leadId), 'call_log', { turns: transcript }, {
     provider_call_id: null,
     outcome: 'demo-yes',
     mock: true
   });
+  if (experimentAssignment) {
+    try {
+      recordExperimentOutcome({ assignment: experimentAssignment, outcome: 'connected', valueCents: null });
+    } catch (err) {
+      log.warn('experiment.outcome.mock_failed', { leadId, callId, error: err?.message || String(err) });
+    }
+  }
   emit('caller.done', { worker: 'caller', leadId, runId, callId, outcome: 'demo-yes', mock: true });
 
   setTimeout(() => {
@@ -363,7 +390,15 @@ function compactMossSnippets(hotContext) {
     .slice(0, 14);
 }
 
-async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext }) {
+function computeCallDurationSeconds(callRow) {
+  if (!callRow) return 0;
+  const started = Number(callRow.started_at) || 0;
+  const ended = Number(callRow.ended_at) || 0;
+  if (!started || !ended || ended < started) return 0;
+  return Math.round((ended - started) / 1000);
+}
+
+async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, experimentAssignment = null }) {
   const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
@@ -386,6 +421,25 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     streamedTurns.push(chunk);
     emit('caller.transcript', { worker: 'caller', leadId, callId, role, text, ts, mock: false, source });
     if (role === 'user') await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: false });
+    // Live operator warm-transfer check. Per-call dedupe lives in
+    // operatorTransfer.js, so it's safe to evaluate on every user turn. Only
+    // fires when OPERATOR_TRANSFER_NUMBER is set; otherwise the transfer
+    // function emits caller.transfer_unavailable and no-ops.
+    if (role === 'user' && OPERATOR_TRANSFER_NUMBER) {
+      const decision = shouldTransfer(streamedTurns);
+      if (decision.transfer) {
+        transferCallToOperator({
+          providerCallId,
+          leadId,
+          callId,
+          reason: decision.reason
+        }).catch((err) => log.warn('operator.transfer.outbound_failed', {
+          callId,
+          providerCallId,
+          error: err?.message || String(err)
+        }));
+      }
+    }
     if (role === 'user' && transcriptHasOptOut(text)) {
       recordOptOut(normalized);
       optedOut = true;
@@ -408,6 +462,51 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       systemPrompt: 'You are a friendly cold-call agent for callmemaybe. Per-call system prompts contain the actual pitch, disclosure, opt-out rule, and email readback rule.'
     });
     const systemPrompt = pitchToSystemPrompt(pitch, lead, hotContext);
+
+    // Reputation auto-throttle pre-call gate. Blocks ONLY when an area code has
+    // hit its daily ceiling — rolling opt-out / voicemail-only rates pause the
+    // outreach loop via the 30s scheduler, not the per-call path.
+    const reputationGate = canDialPhone(normalized || toPhone || lead.phone);
+    if (!reputationGate.ok) {
+      const blockReason = reputationGate.reason || 'reputation_blocked';
+      const blockedCallId = `call_${Date.now().toString(36)}`;
+      calls.start({
+        id: blockedCallId,
+        lead_id: leadId,
+        to_phone: normalized,
+        provider_call_id: null,
+        disclosure_text: disclosureText,
+        decision_reason: blockReason
+      });
+      calls.finish(blockedCallId, {
+        outcome: 'failed:reputation_block',
+        transcript: { error: blockReason, areaCode: reputationGate.areaCode }
+      });
+      try {
+        reputationRecordCallAttempt({ leadId, phone: normalized, outcome: 'failed:reputation_block' });
+      } catch (recErr) {
+        log.warn('reputation.record_block_failed', { leadId, callId: blockedCallId, error: recErr?.message || String(recErr) });
+      }
+      leads.update(leadId, {
+        outreach_status: 'retry',
+        risk_status: 'reputation_block',
+        next_action: 'retry_after_reputation_cooldown'
+      });
+      emit('caller.error', {
+        worker: 'caller',
+        leadId,
+        runId,
+        callId: blockedCallId,
+        outcome: 'failed:reputation_block',
+        reason: blockReason,
+        areaCode: reputationGate.areaCode || null,
+        attempts24h: reputationGate.attempts24h ?? null,
+        limit: reputationGate.limit ?? null,
+        mock: false
+      });
+      throw new Error(`reputation_block: ${blockReason}`);
+    }
+
     const placed = await placeAgentPhoneCall({
       agentId: agent.id,
       toNumber: normalized,
@@ -417,13 +516,17 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     });
     providerCallId = placed.id;
     callId = `call_${Date.now().toString(36)}`;
+    const liveReason = dnc.reason || 'live call allowed';
+    const liveReasonWithArm = experimentAssignment?.arm
+      ? `${liveReason} | arm=${experimentAssignment.arm}`
+      : liveReason;
     calls.start({
       id: callId,
       lead_id: leadId,
       to_phone: normalized,
       provider_call_id: providerCallId,
       disclosure_text: disclosureText,
-      decision_reason: dnc.reason || 'live call allowed'
+      decision_reason: liveReasonWithArm
     });
     emit('caller.placed', {
       worker: 'caller',
@@ -472,22 +575,63 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     const transcriptForStorage = finalTranscript || { turns: streamedTurns, source: 'agentphone-stream-fallback' };
     const outcome = optedOut ? 'opt-out' : 'ended';
     calls.finish(callId, { outcome, transcript: transcriptForStorage });
+    try {
+      const finishedRow = calls.get(callId);
+      const durationSeconds = computeCallDurationSeconds(finishedRow);
+      if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
+        recordAgentPhoneCallCost({ leadId, durationSeconds, callId });
+      }
+    } catch (recErr) {
+      log.warn('caller.cost_record_live_failed', { leadId, callId, error: recErr?.message || String(recErr) });
+    }
+    try {
+      reputationRecordCallAttempt({ leadId, phone: normalized, outcome });
+    } catch (recErr) {
+      log.warn('reputation.record_live_attempt_failed', { leadId, callId, error: recErr?.message || String(recErr) });
+    }
     await safeAddMemory(containerTagFor(leadId), 'call_log', transcriptForStorage || { note: 'no transcript' }, {
       provider_call_id: providerCallId,
       outcome,
       stream_turns: streamedTurns.length
     });
     if (!optedOut) leads.update(leadId, { outreach_status: 'called', next_action: 'analyze_call' });
+    if (experimentAssignment && !optedOut) {
+      // Non-failure terminal outcome = the live call connected and ran to a normal end.
+      try {
+        recordExperimentOutcome({ assignment: experimentAssignment, outcome: 'connected', valueCents: null });
+      } catch (err) {
+        log.warn('experiment.outcome.live_failed', { leadId, callId, error: err?.message || String(err) });
+      }
+    }
     emit('caller.done', { worker: 'caller', leadId, runId, callId, outcome, providerCallId, mock: false });
     fireAnalyst(leadId, callId);
     return { callId, providerCallId };
   } catch (err) {
+    // Pre-call reputation block already recorded its own outcome + caller.error
+    // event before throwing, so we re-throw without double-counting.
+    if (/^reputation_block:/.test(err?.message || '')) {
+      throw err;
+    }
     const failure = classifyAgentPhoneFailure(err);
     if (callId) {
       calls.finish(callId, {
         outcome: failure.outcome,
         transcript: streamedTurns.length ? { turns: streamedTurns, error: failure.reason } : { error: failure.reason }
       });
+      try {
+        const finishedRow = calls.get(callId);
+        const durationSeconds = computeCallDurationSeconds(finishedRow);
+        if (durationSeconds > 0) {
+          recordAgentPhoneCallCost({ leadId, durationSeconds, callId });
+        }
+      } catch (recErr) {
+        log.warn('caller.cost_record_failure_failed', { leadId, callId, error: recErr?.message || String(recErr) });
+      }
+    }
+    try {
+      reputationRecordCallAttempt({ leadId, phone: normalized, outcome: failure.outcome });
+    } catch (recErr) {
+      log.warn('reputation.record_live_failure_failed', { leadId, callId, error: recErr?.message || String(recErr) });
     }
     leads.update(leadId, failure.retryable
       ? { outreach_status: 'retry', risk_status: failure.category, next_action: 'retry_call' }
@@ -503,14 +647,19 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       retryable: failure.retryable,
       mock: false
     });
+    try {
+      applyAttemptOutcome({ leadId, outcome: failure.outcome });
+    } catch (cadenceErr) {
+      log.warn('cadence.apply_failed', { leadId, error: cadenceErr?.message || String(cadenceErr) });
+    }
     throw err;
   }
 }
 
-export async function runCaller({ leadId, toPhone }) {
+export async function runCaller({ leadId, toPhone, pitchOverride = null, source = null, scheduledCallId = null }) {
   const runId = `run_${Date.now().toString(36)}`;
   runs.start({ id: runId, lead_id: leadId, worker: 'caller' });
-  emit('caller.start', { worker: 'caller', leadId, runId, toPhone: mask(toPhone) });
+  emit('caller.start', { worker: 'caller', leadId, runId, toPhone: mask(toPhone), source: source || 'manual', scheduledCallId });
 
   try {
     const lead = leads.get(leadId);
@@ -518,16 +667,56 @@ export async function runCaller({ leadId, toPhone }) {
 
     const profile = await loadProfile(leadId, lead);
     const disclosure = recordingDisclosure(lead.business_name);
-    const pitch = await generatePitch({ profile, lead, disclosure });
+    const generatedPitch = pitchOverride || await generatePitch({ profile, lead, disclosure });
 
-    await safeAddMemory(containerTagFor(leadId), 'pitch', pitch, { generatedFor: leadId });
+    let pack = null;
+    let pitch = generatedPitch;
+    try {
+      pack = pickPack(lead);
+      if (pack) {
+        pitch = applyPackToPitch(generatedPitch, pack) || generatedPitch;
+        if (lead.vertical_pack !== pack.key) {
+          try {
+            leads.update(leadId, { vertical_pack: pack.key });
+          } catch (err) {
+            log.warn('verticalPack.persist_failed', { leadId, packKey: pack.key, error: err?.message || String(err) });
+          }
+        }
+      }
+    } catch (err) {
+      log.warn('verticalPack.apply_failed', { leadId, error: err?.message || String(err) });
+      pitch = generatedPitch;
+    }
+
+    // Layer in the active pitch_v2 experiment arm AFTER the vertical pack
+    // applies so arm rewrites win over the pack tone and the assignment is
+    // sticky on lead.id (assignArm is idempotent by bucket key).
+    let experimentAssignment = null;
+    try {
+      const armed = applyPitchExperiment({ lead, pitch, profile, disclosure });
+      pitch = armed.pitch || pitch;
+      experimentAssignment = armed.assignment || null;
+    } catch (err) {
+      log.warn('experiment.apply_failed', { leadId, error: err?.message || String(err) });
+    }
+
+    if (!pitchOverride) {
+      await safeAddMemory(containerTagFor(leadId), 'pitch', pitch, {
+        generatedFor: leadId,
+        verticalPack: pack?.key || null,
+        experimentArm: experimentAssignment?.arm || null
+      });
+    }
     emit('pitch.created', {
       worker: 'caller',
       leadId,
       runId,
       keys: Object.keys(pitch),
       openingLine: pitch.openingLine,
-      objectionCount: (pitch.objections || []).length
+      objectionCount: (pitch.objections || []).length,
+      source: source || (pitchOverride ? 'override' : 'generated'),
+      verticalPack: pack?.key || null,
+      experimentArm: experimentAssignment?.arm || null
     });
 
     const hotContext = await buildMossHotContext({ leadId, lead, profile, pitch, runId });
@@ -559,8 +748,8 @@ export async function runCaller({ leadId, toPhone }) {
       });
     }
     const result = live
-      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext })
-      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext });
+      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, experimentAssignment })
+      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext, experimentAssignment });
 
     runs.finish(runId, { state: 'completed', detail: { ...result, mock: !live } });
     return result;

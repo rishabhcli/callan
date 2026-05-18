@@ -233,6 +233,25 @@ export async function endAgentPhoneCall(callId, { config = env.agentphone } = {}
   });
 }
 
+// Warm-transfer an in-progress call to a real human number. The AgentPhone SDK
+// surfaces `transferNumber` on the agent record (see
+// node_modules/agentphone/dist/esm/api/types/AgentResponse.d.mts) but does not
+// ship a typed `calls.transfer` method, so we hit the conventional
+// POST /calls/{id}/transfer endpoint directly.
+export async function transferAgentPhoneCall(callId, toNumber, { config = env.agentphone } = {}) {
+  requireAgentPhone(config);
+  if (!callId) throw new Error('transferAgentPhoneCall requires callId');
+  if (!toNumber) throw new Error('transferAgentPhoneCall requires toNumber');
+  return agentPhoneJson('transferCall', `/calls/${encodeURIComponent(callId)}/transfer`, {
+    method: 'POST',
+    body: JSON.stringify({ to: toNumber })
+  }, {
+    config,
+    timeoutMs: 15000,
+    retries: 0
+  });
+}
+
 export async function getAgentPhoneCall(callId, { config = env.agentphone } = {}) {
   requireAgentPhone(config);
   return agentPhoneJson('getCall', `/calls/${encodeURIComponent(callId)}`, {

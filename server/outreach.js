@@ -13,6 +13,8 @@ import { emit } from './sse.js';
 import { liveReadiness } from './readiness.js';
 import { runCaller } from './workers/caller.js';
 import { scoreOnlinePresence } from './presenceScorer.js';
+import { applyPriorityToLead, refreshAllPriorityScores } from './leadPriority.js';
+import { executeDueChannel, listDueCadenceLeads } from './cadence.js';
 
 export const OUTREACH_STATES = Object.freeze({
   QUEUED: 'queued',
@@ -42,6 +44,11 @@ let processingBatch = false;
 
 export function startOutreachLoop() {
   recoverActiveJobs();
+  try {
+    refreshAllPriorityScores();
+  } catch (err) {
+    emit('outreach.error', { worker: 'leadPriority', error: err?.message || String(err) });
+  }
   if (timer) return outreachStatus();
   timer = setInterval(() => {
     processOutreachBatch().catch((err) => {
@@ -188,6 +195,7 @@ export function queueLeadForOutreach({ leadId, profile }) {
     confidence,
     reasons: presence.onlinePresenceReasons
   });
+  try { applyPriorityToLead(leadId); } catch (err) { emit('outreach.error', { worker: 'leadPriority', leadId, error: err?.message || String(err) }); }
   return { queued: true, reason: 'weak or mixed online presence', lead: leads.get(leadId), presence };
 }
 
@@ -362,6 +370,37 @@ function processOutreachBatchOnce() {
       emit('outreach.error', { worker: 'caller', leadId: claim.row.id, error: err?.message || String(err) });
     });
     started += 1;
+  }
+
+  await drainDueCadence();
+}
+
+async function drainDueCadence() {
+  let dueLeads = [];
+  try {
+    dueLeads = listDueCadenceLeads();
+  } catch (err) {
+    emit('cadence.drain_failed', { error: err?.message || String(err) });
+    return;
+  }
+  if (!dueLeads.length) return;
+
+  for (const lead of dueLeads) {
+    if (activeJob && lead.attempt_channel === 'call_retry') continue;
+    const channel = lead.attempt_channel;
+    if (!channel) {
+      try {
+        leads.update(lead.id, { next_attempt_at: null });
+      } catch {
+        // ignore — lead may have been archived/blocked concurrently
+      }
+      continue;
+    }
+    try {
+      await executeDueChannel({ leadId: lead.id, channel });
+    } catch (err) {
+      emit('cadence.execute_failed', { leadId: lead.id, channel, error: err?.message || String(err) });
+    }
   }
 }
 
@@ -656,7 +695,7 @@ function listDueOutreachQueue({ limit }) {
   const rows = db.prepare(`
     SELECT * FROM leads
     WHERE outreach_status IN ('queued', 'retry')
-    ORDER BY COALESCE(last_contacted_at, 0) ASC, created_at ASC
+    ORDER BY priority_score DESC NULLS LAST, created_at ASC
     LIMIT ?
   `).all(fetchLimit);
   return rows.filter((lead) => retryBackoffForLead(lead).due).slice(0, limit);

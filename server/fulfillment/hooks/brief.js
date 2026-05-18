@@ -1,3 +1,6 @@
+import { pickPack } from '../../verticalPacks/index.js';
+import { buildReferralFooterText } from '../../referrals.js';
+
 const REQUIRED_FIELDS = [
   'businessName',
   'phone',
@@ -39,11 +42,19 @@ export function buildWebsiteBrief({ lead, profileDoc, postMortemDoc, latestPayme
     ? needs.join('; ')
     : 'local customers need quick proof, a clear service menu, and an obvious way to contact the business';
   const style = pickStyle(niche);
-  const cta = phone ? `Call ${phone} for service or a quote` : 'Call for service or a quote';
+  // Honor an explicit profile.cta override (used by call-derived briefs where the
+  // CTA was decided on the call — e.g. "Order today"). Falls back to the
+  // phone-call default. The validator still scans the final string for
+  // booking/payment claims, so the override can't smuggle in unsupported language.
+  const cta = firstText(
+    profile?.cta,
+    phone ? `Call ${phone} for service or a quote` : 'Call for service or a quote'
+  );
   const confirmedCapabilities = {
     booking: Boolean(profile?.bookingUrl || profile?.booking_url || profile?.supportsBooking),
     payments: Boolean(profile?.paymentUrl || profile?.payment_url || profile?.supportsOnlinePayments)
   };
+  const pack = safePickPack(lead);
 
   return {
     businessName,
@@ -55,6 +66,12 @@ export function buildWebsiteBrief({ lead, profileDoc, postMortemDoc, latestPayme
     styleDirection: `${style.tone}; ${style.palette}; ${style.layout}`,
     prohibitedClaims: HALLUCINATION_GUARDS,
     confirmedCapabilities,
+    verticalPack: pack ? {
+      key: pack.key,
+      name: pack.name,
+      siteTemplateHint: pack.siteTemplateHint || null,
+      customerPersonaHint: pack.customerPersonaHint || null
+    } : null,
     sourceFacts: {
       niche,
       city,
@@ -73,6 +90,14 @@ export function buildWebsiteBrief({ lead, profileDoc, postMortemDoc, latestPayme
       leadId: lead?.id || null
     }
   };
+}
+
+function safePickPack(lead) {
+  try {
+    return pickPack(lead || {}) || null;
+  } catch {
+    return null;
+  }
 }
 
 export function validateWebsiteBrief(brief = {}) {
@@ -117,6 +142,17 @@ export function validateWebsiteBrief(brief = {}) {
 export function createLovableBuildPrompt(brief) {
   const services = (brief.services || []).slice(0, 6).join(', ');
   const facts = brief.sourceFacts || {};
+  const pack = brief.verticalPack || null;
+  const leadId = brief?.sourceQuality?.leadId || null;
+  // Build the verbatim footer line up-front so the prompt can quote it
+  // exactly. We only emit the instruction if we have a lead id to attribute
+  // the click to — otherwise the link would 404 the rollup.
+  let footerLine = null;
+  try {
+    if (leadId) footerLine = buildReferralFooterText(leadId);
+  } catch {
+    footerLine = null;
+  }
   const prompt = [
     `Build a one-page website for ${brief.businessName}.`,
     `Location/service area: ${brief.locationOrServiceArea}.`,
@@ -128,11 +164,16 @@ export function createLovableBuildPrompt(brief) {
     facts.hours ? `Confirmed hours: ${facts.hours}.` : null,
     facts.address ? `Confirmed address: ${facts.address}.` : null,
     facts.researchSummary ? `Context: ${facts.researchSummary}.` : null,
+    pack && pack.key !== 'default' && pack.siteTemplateHint ? `Vertical template hint (${pack.name || pack.key}): ${pack.siteTemplateHint}` : null,
+    pack && pack.key !== 'default' && pack.customerPersonaHint ? `Vertical customer persona: ${pack.customerPersonaHint}` : null,
     'Required structure: hero with business name and tap-to-call CTA, services section, trust/why-us section using only confirmed facts, and a contact section.',
-    `Guardrails: ${brief.prohibitedClaims.join(' ')}`
+    `Guardrails: ${brief.prohibitedClaims.join(' ')}`,
+    footerLine
+      ? `Referral footer (required): Add a <footer> below the main content containing this single line, with the URL as a clickable link: "${footerLine}". Render this verbatim in a small footer below the main content — small, muted, unobtrusive text (about 12px, low-contrast color, centered). Do not paraphrase, shorten, or remove the URL.`
+      : null
   ].filter(Boolean).join('\n');
 
-  return compactText(prompt, 2400);
+  return compactText(prompt, 2800);
 }
 
 export function renderMockGeneratedSite({ brief, revisionPrompt = null, flawed = false } = {}) {

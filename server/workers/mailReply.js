@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { emit } from '../sse.js';
-import { contactEvents, leads } from '../db.js';
-import { canEmail, env } from '../env.js';
+import { contactEvents, leads, scheduledCalls as scheduledCallsDb } from '../db.js';
+import { canEmail, env, seedAllowedPhone } from '../env.js';
 import { log } from '../logger.js';
 import { addDoc, containerTagFor } from '../memory.js';
 import { generateStructured } from '../reasoning/geminiReasoner.js';
-import { EmailReplyDecision } from '../reasoning/schemas.js';
+import { EmailReplyDecision, InvoiceAffirmation } from '../reasoning/schemas.js';
 import {
   createMockAgentMailSendResult,
   fetchAgentMailIncomingMessages,
@@ -14,6 +14,9 @@ import {
   replyAgentMailMessage
 } from '../providers/agentmail.js';
 import { classifyGrowthReply } from '../growth/replyPolicy.js';
+import { classifyScheduleRequest } from './scheduleClassifier.js';
+import { callingWindowStatus, markLeadConsentApproved } from '../compliance.js';
+import { createScheduledCall, cancelScheduledCall } from '../scheduledCalls.js';
 
 export { fetchAgentMailIncomingMessages };
 
@@ -60,6 +63,105 @@ const OPT_OUT_PATTERNS = Object.freeze([
   /\b(?:do\s+not|don't)\s+(?:email|contact|message)\b/i,
   /\bno\s+more\s+emails?\b/i
 ]);
+
+export const AFFIRMATIVE_INVOICE_REPLY_PATTERNS = Object.freeze([
+  /\b(?:looks?|sounds?)\s+good\b/i,
+  /\bgo\s+ahead\b/i,
+  /\bapproved?\b/i,
+  /\blet'?s\s+(?:do\s+it|go|roll|ship)\b/i,
+  /\bproceed\b/i,
+  /\bconfirmed?\b/i,
+  /\b(?:yes|yep|yeah|yup|sure|absolutely)\b/i,
+  /\bdo\s+it\b/i,
+  /\bgreen\s*light\b/i,
+  /\bmove\s+forward\b/i,
+  /\bship\s+it\b/i,
+  /\bsign\s+me\s+up\b/i
+]);
+
+const AFFIRMATIVE_NEGATION_GUARD = /\b(?:not\s+yet|hold\s+off|hold\s+on|wait|cancel|stop|no\s+thanks?|don'?t|never\s*mind|nevermind)\b/i;
+
+export function detectAffirmativeInvoiceReply({ lead = null, subject = '', text = '' } = {}) {
+  if (!lead) return { affirmative: false, reason: 'no_lead' };
+  if (lead.outreach_status !== 'awaiting_payment') return { affirmative: false, reason: 'gate_outreach_status' };
+  if (lead.preview_build_triggered_at) return { affirmative: false, reason: 'already_triggered' };
+  if (lead.risk_status === 'email-opt-out') return { affirmative: false, reason: 'opted_out' };
+  const policy = normalizePolicyText(`${subject}\n${text}`);
+  if (!policy) return { affirmative: false, reason: 'empty' };
+  if (AFFIRMATIVE_NEGATION_GUARD.test(policy)) return { affirmative: false, reason: 'negation' };
+  const matched = AFFIRMATIVE_INVOICE_REPLY_PATTERNS.find((re) => re.test(policy));
+  if (!matched) return { affirmative: false, reason: 'no_match' };
+  return { affirmative: true, reason: 'matched', pattern: matched.source };
+}
+
+const LLM_AFFIRMATIVE_CONFIDENCE_THRESHOLD = 0.7;
+const LLM_ELIGIBLE_REASONS = new Set(['no_match', 'negation']);
+
+export async function classifyInvoiceAffirmation({ lead = null, subject = '', text = '', eventId = null } = {}) {
+  const det = detectAffirmativeInvoiceReply({ lead, subject, text });
+  if (det.affirmative) {
+    return { affirmative: true, source: 'regex', confidence: 1, reason: det.reason, pattern: det.pattern, scope: 'affirm' };
+  }
+  // Only ask Gemini when the gates passed but the regex itself didn't find a match
+  // (or the negation guard matched — Gemini may still rule the overall intent affirmative).
+  if (!LLM_ELIGIBLE_REASONS.has(det.reason)) {
+    return { affirmative: false, source: 'regex', confidence: 0, reason: det.reason };
+  }
+  if (!env.gemini.apiKey) {
+    return { affirmative: false, source: 'regex', confidence: 0, reason: det.reason };
+  }
+
+  const evidence = {
+    lead: lead ? {
+      id: lead.id,
+      businessName: lead.business_name,
+      status: lead.status,
+      outreachStatus: lead.outreach_status,
+      nextAction: lead.next_action
+    } : null,
+    message: {
+      subject: subject || '',
+      text: text || ''
+    },
+    deterministic: det
+  };
+  const prompt = [
+    `Classify a customer reply to a website-build invoice email.`,
+    `We sent the customer an invoice. We need to decide if their reply is them approving the quoted scope and giving us the green light to start building — meaning we should kick off the website build immediately.`,
+    `confirmed=true ONLY when the reply unambiguously approves the work (any phrasing, any language, any informality). Examples that should be true: "ya sounds dope", "love it, when do we start", "let's pull the trigger", "i'm in", "estoy listo", "go for it".`,
+    `confirmed=false when the reply is a question, a revision request, a price pushback, a hesitation ("not yet", "let me think"), a negation, or anything other than approval.`,
+    `Excerpt the most decisive phrase from the reply (≤120 chars).`,
+    `Reply with the InvoiceAffirmation schema.`
+  ].join('\n');
+
+  try {
+    const { output, trace } = await generateStructured({
+      kind: 'invoiceAffirmation',
+      schema: InvoiceAffirmation,
+      evidence,
+      prompt,
+      leadId: lead?.id || null,
+      worker: 'mailer',
+      eventId: eventId || null,
+      thinkingLevel: 'minimal',
+      flash: true
+    });
+    const affirmative = !!output.confirmed && output.confidence >= LLM_AFFIRMATIVE_CONFIDENCE_THRESHOLD;
+    return {
+      affirmative,
+      source: 'llm',
+      confidence: output.confidence,
+      reason: affirmative ? 'llm_confirmed' : 'llm_not_confirmed',
+      scope: output.scope,
+      excerpt: output.excerpt,
+      llmReason: output.reason,
+      traceId: trace?.id || null
+    };
+  } catch (err) {
+    log.warn('mailer.affirmative_llm_failed', { err: err?.message || String(err), leadId: lead?.id });
+    return { affirmative: false, source: 'llm_failed', confidence: 0, reason: det.reason };
+  }
+}
 
 const UNSUPPORTED_SCOPE_PATTERNS = Object.freeze([
   {
@@ -322,8 +424,34 @@ export async function handleAgentMailInbound(body = {}, {
     }
   }
 
+  // Scheduling intent: only run the Gemini schedule classifier when the deterministic
+  // pass already routed scope='scheduling'. Mutates `classification.replyText` so the
+  // existing sendReply path delivers the confirmation/decline reply for free.
+  let scheduleOutcome = null;
+  if (
+    leadId &&
+    resolvedLead &&
+    classification?.scope === 'scheduling' &&
+    classification?.kind !== 'opt_out' &&
+    !classification?.operatorFlag
+  ) {
+    try {
+      scheduleOutcome = await handleScheduleIntent({
+        lead: resolvedLead,
+        leadId,
+        msg,
+        bodyText,
+        classification
+      });
+    } catch (err) {
+      log.warn('agentmail.schedule.handler_failed', {
+        leadId, threadId: msg.threadId, error: err?.message || String(err)
+      });
+    }
+  }
+
   const replyText = await draftReply({ lead: resolvedLead, msg, classification, forceFallbackReply });
-  const sendResult = await sendReply({ msg, text: replyText, classification, forceMockSend });
+  const sendResult = await sendReply({ msg, text: replyText, classification, forceMockSend, leadId });
   if (leadId) persistThreadForLead(leadId, sendResult.threadId || msg.threadId, resolvedLead);
 
   contactEvents.add({
@@ -353,10 +481,144 @@ export async function handleAgentMailInbound(body = {}, {
     supported: classification.supported,
     operatorFlag: classification.operatorFlag,
     policy: classification,
-    mock: sendResult.mock
+    mock: sendResult.mock,
+    schedule: scheduleOutcome ? {
+      action: scheduleOutcome.action,
+      scheduledCallId: scheduleOutcome.scheduledCallId || null,
+      scheduledAtMs: scheduleOutcome.scheduledAtMs || null,
+      reason: scheduleOutcome.reason || null
+    } : null
   });
 
-  return { ignored: false, leadId, replyText, classification, sendResult };
+  return { ignored: false, leadId, replyText, classification, sendResult, scheduleOutcome };
+}
+
+const MAX_FUTURE_DAYS = 7;
+const MIN_FUTURE_BUFFER_MS = 60_000; // require at least 1 minute in the future
+
+const DETERMINISTIC_CANCEL_RX = /\b(cancel|abort|never\s*mind|nevermind|forget it)\b/i;
+
+export async function handleScheduleIntent({ lead, leadId, msg, bodyText, classification }) {
+  const decision = await classifyScheduleRequest({
+    lead,
+    subject: msg.subject || '',
+    replyText: bodyText || '',
+    threadId: msg.threadId || null,
+    eventId: msg.messageId || msg.threadId || null
+  });
+
+  // Deterministic cancel safety net — if the reply has unambiguous cancel language and
+  // there is a pending row, treat as a cancel regardless of what Gemini decided.
+  const hasPending = !!scheduledCallsDb.findPendingForLead(leadId);
+  const deterministicCancel = DETERMINISTIC_CANCEL_RX.test(bodyText) && hasPending;
+
+  // Customer is canceling a previously-scheduled call.
+  if (decision.isCancel || deterministicCancel) {
+    const existing = scheduledCallsDb.findPendingForLead(leadId);
+    if (existing) {
+      cancelScheduledCall(existing.id, { reason: 'customer_email_cancel' });
+      classification.replyText = "Got it — canceled the callback. Reply here whenever you'd like to pick a new time.";
+      return { action: 'canceled', scheduledCallId: existing.id, reason: 'customer_email_cancel' };
+    }
+    classification.replyText = "No callback was scheduled on my side, but you're all good — I won't call you. Reply if you'd like one set up.";
+    return { action: 'cancel_no_pending', reason: 'no_pending_to_cancel' };
+  }
+
+  if (!decision.wantsCall || decision.confidence < 0.4) {
+    return { action: 'no_intent', reason: 'low_confidence_or_no_intent' };
+  }
+
+  // Parse-failed or no concrete time given.
+  if (!decision.scheduledAtMs) {
+    classification.replyText = "Happy to call. What time works for you? Tell me something like 'today at 3pm' or 'tomorrow morning at 10' and I'll get it on the books.";
+    return { action: 'needs_time', reason: 'no_time_parsed' };
+  }
+
+  // Time in the past.
+  if (decision.scheduledAtMs - Date.now() < MIN_FUTURE_BUFFER_MS) {
+    classification.replyText = `Looks like ${decision.scheduledAtRaw || 'that time'} has already passed. Want to pick a future time?`;
+    return { action: 'past_time', reason: 'time_in_past', scheduledAtMs: decision.scheduledAtMs };
+  }
+
+  // Too far in the future.
+  if (decision.scheduledAtMs - Date.now() > MAX_FUTURE_DAYS * 86_400_000) {
+    classification.replyText = `That's a bit far out — I can schedule callbacks within the next ${MAX_FUTURE_DAYS} days. Want to pick a closer time?`;
+    return { action: 'too_far', reason: 'time_too_far_out', scheduledAtMs: decision.scheduledAtMs };
+  }
+
+  // Quiet-hours check using the existing compliance helper at the target moment.
+  const windowStatus = callingWindowStatus(new Date(decision.scheduledAtMs), { timezone: decision.timezone });
+  if (!windowStatus.allowed && env.runMode !== 'mock') {
+    classification.replyText = `That falls inside our quiet hours (we only call between ${windowStatus.quietHoursEnd}:00 and ${windowStatus.quietHoursStart}:00 ${decision.timezone}). Want to pick a time inside that window?`;
+    return { action: 'quiet_hours', reason: 'outside_calling_window', scheduledAtMs: decision.scheduledAtMs };
+  }
+
+  // Promote consent + seed phone allow list.
+  if (lead.phone) seedAllowedPhone(lead.phone);
+  if (decision.confidence >= 0.6) {
+    markLeadConsentApproved(leadId, {
+      reason: 'email_invite',
+      proof: msg.messageId || null,
+      excerpt: bodyText
+    });
+  }
+
+  // Build the brief that the scheduled caller will turn into a per-call pitch.
+  const brief = {
+    ask: decision.ask || classification.scope || '',
+    replySnippet: (bodyText || '').slice(0, 400),
+    scheduledAtIso: decision.scheduledAtIso,
+    scheduledAtRaw: decision.scheduledAtRaw,
+    timezone: decision.timezone,
+    callerName: lead.business_name && !String(lead.business_name).startsWith('Inbound caller')
+      ? lead.business_name : null,
+    business: lead.business_name && !String(lead.business_name).startsWith('Inbound caller')
+      ? lead.business_name : null,
+    confidence: decision.confidence,
+    classifierReason: decision.reason
+  };
+
+  const id = `sched_${Date.now().toString(36)}${randomBytes(4).toString('hex')}`;
+  let row;
+  try {
+    row = createScheduledCall({
+      id,
+      leadId,
+      threadId: msg.threadId || null,
+      inboundMessageId: msg.messageId || null,
+      scheduledAtMs: decision.scheduledAtMs,
+      brief
+    });
+  } catch (err) {
+    log.error('agentmail.schedule.create_failed', { leadId, error: err?.message || String(err) });
+    classification.replyText = "I tried to schedule that but hit a snag on my end. Reply with a time and I'll try again.";
+    return { action: 'create_failed', reason: err?.message || String(err) };
+  }
+
+  const localTime = formatLocalTime(decision.scheduledAtMs, decision.timezone);
+  classification.replyText = `Got it — I'll have Callan call you at ${localTime} from +1 (662) 602-1352. Reply CANCEL to abort. If you wanted a different time, just send another reply with the time and I'll update it.`;
+
+  return {
+    action: 'scheduled',
+    scheduledCallId: row?.id || id,
+    scheduledAtMs: decision.scheduledAtMs,
+    reason: null
+  };
+}
+
+function formatLocalTime(ms, timezone) {
+  try {
+    return new Date(ms).toLocaleString('en-US', {
+      timeZone: timezone || 'America/Los_Angeles',
+      weekday: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'short'
+    });
+  } catch {
+    return new Date(ms).toISOString();
+  }
 }
 
 export function classifyMessageScope(input = '') {
@@ -658,7 +920,7 @@ async function draftReply({ lead, msg, classification, forceFallbackReply = fals
   return fallbackSupportedReply(classification.scope);
 }
 
-async function sendReply({ msg, text, classification, forceMockSend = false }) {
+async function sendReply({ msg, text, classification, forceMockSend = false, leadId = null }) {
   if (forceMockSend || !canSend(msg.fromEmail)) {
     return {
       ...createMockAgentMailSendResult({
@@ -679,7 +941,9 @@ async function sendReply({ msg, text, classification, forceMockSend = false }) {
     toEmail: msg.fromEmail,
     subject: `Re: ${stripRe(msg.subject)}`,
     text,
-    html
+    html,
+    leadId,
+    costKind: 'reply_classified'
   }, { timeoutSeconds: 12, maxRetries: 2 });
 
   return {

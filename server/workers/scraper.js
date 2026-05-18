@@ -121,6 +121,13 @@ export async function runScraper({ niche, city, count = 4 }) {
         const lead = insertResult.lead;
         const leadId = lead.id;
         const containerTag = lead.container_tag;
+        // Lazy-import to avoid an import cycle with outreach.js (which scraper also imports).
+        try {
+          const { applyPriorityToLead } = await import('../leadPriority.js');
+          applyPriorityToLead(leadId);
+        } catch (err) {
+          log.warn('scraper.priority_score_failed', { leadId, error: err?.message || String(err) });
+        }
         await safeAddProfileDoc(containerTag, normalized, {
           businessName: normalized.businessName,
           niche: normalized.niche,

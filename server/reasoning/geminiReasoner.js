@@ -2,7 +2,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import { env } from '../env.js';
 import { reasoningTraces } from '../db.js';
 import { emit } from '../sse.js';
+import { log } from '../logger.js';
 import { generateStructuredText } from '../providers/gemini.js';
+import { recordGeminiTokens } from '../costs.js';
 import { schemaForKind, toGeminiJsonSchema } from './schemas.js';
 
 const URL_RE = /https?:\/\/[^\s)"'<>]+/gi;
@@ -53,6 +55,8 @@ export async function generateStructured({
   let repairAttempts = 0;
   let usedModel = traceBase.model;
   let source = 'gemini';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   try {
     const jsonSchema = toGeminiJsonSchema(zodSchema);
@@ -77,6 +81,10 @@ export async function generateStructured({
       });
       rawOutput = generated.text;
       usedModel = generated.model || usedModel;
+      const inputTokens = generated.usage?.inputTokens ?? Math.ceil(String(fullPrompt || '').length / 4);
+      const outputTokens = generated.usage?.outputTokens ?? Math.ceil(String(generated.text || '').length / 4);
+      totalInputTokens += inputTokens;
+      totalOutputTokens += outputTokens;
     }
 
     let validated = parseAndValidateStructuredOutput(zodSchema, rawOutput, evidence, validateEvidenceReferences);
@@ -85,7 +93,7 @@ export async function generateStructured({
     if (!validated.ok) {
       firstValidationErrors = validated.errors;
       repairAttempts = 1;
-      repairedOutput = await repairStructuredOutput({
+      const repaired = await repairStructuredOutput({
         kind,
         schemaName: finalSchemaName,
         zodSchema,
@@ -99,6 +107,11 @@ export async function generateStructured({
         flash,
         forceMock: forceMock || mockRawOutput !== undefined || !env.gemini.apiKey
       });
+      repairedOutput = repaired.text;
+      if (repaired.usage) {
+        totalInputTokens += repaired.usage.inputTokens || 0;
+        totalOutputTokens += repaired.usage.outputTokens || 0;
+      }
       validated = parseAndValidateStructuredOutput(zodSchema, repairedOutput, evidence, validateEvidenceReferences);
       validationErrors = [...firstValidationErrors, ...validated.errors];
     }
@@ -118,7 +131,17 @@ export async function generateStructured({
       validationErrors,
       repairAttempts,
       valid: true,
-      latencyMs: Date.now() - started
+      latencyMs: Date.now() - started,
+      totalInputTokens,
+      totalOutputTokens
+    });
+    safeRecordReasoningCost({
+      leadId: traceBase.leadId,
+      model: usedModel,
+      source,
+      kind: traceBase.kind || finalSchemaName,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens
     });
     return { output: finalOutput, trace };
   } catch (err) {
@@ -133,10 +156,23 @@ export async function generateStructured({
       validationErrors: errors,
       repairAttempts,
       valid: false,
-      latencyMs: Date.now() - started
+      latencyMs: Date.now() - started,
+      totalInputTokens,
+      totalOutputTokens
     });
     err.reasoningTrace = trace;
     throw err;
+  }
+}
+
+function safeRecordReasoningCost({ leadId, model, source, kind, inputTokens, outputTokens }) {
+  if (!leadId) return;
+  if (source !== 'gemini') return; // skip mocks
+  if (!inputTokens && !outputTokens) return;
+  try {
+    recordGeminiTokens({ leadId, model, inputTokens, outputTokens, kind: kind || 'reasoning' });
+  } catch (err) {
+    log.warn('reasoning.cost_record_failed', { leadId, model, kind, error: err?.message || String(err) });
   }
 }
 
@@ -155,7 +191,7 @@ async function repairStructuredOutput({
   forceMock
 }) {
   if (forceMock) {
-    return JSON.stringify(mockOutputForKind(kind, evidence), null, 2);
+    return { text: JSON.stringify(mockOutputForKind(kind, evidence), null, 2), usage: null };
   }
 
   try {
@@ -178,9 +214,9 @@ async function repairStructuredOutput({
       thinkingLevel,
       flash
     });
-    return repaired.text;
+    return { text: repaired.text, usage: repaired.usage || null };
   } catch {
-    return JSON.stringify(mockOutputForKind(kind, evidence), null, 2);
+    return { text: JSON.stringify(mockOutputForKind(kind, evidence), null, 2), usage: null };
   }
 }
 

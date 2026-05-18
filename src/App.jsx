@@ -29,7 +29,9 @@ const EMPTY_INBOUND = {
   transcript: [],
   lanes: [],
   evidence: [],
-  context: null
+  context: null,
+  demoMode: false,
+  demoTarget: null
 };
 
 function reduceInbound(state, evt) {
@@ -54,8 +56,11 @@ function reduceInbound(state, evt) {
       transcript: [...state.transcript, { role: evt.role, text: evt.text, ts: evt.ts || Date.now() }].slice(-200)
     };
   }
-  if (t === 'mailer.email_sent' && evt.trigger === 'inbound_voice') {
+  if (t === 'mailer.email_sent' && (evt.trigger === 'inbound_voice' || evt.trigger === 'demo_mode')) {
     return { ...state, email: evt.toEmail };
+  }
+  if (t === 'caller.demo_mode.entered') {
+    return { ...state, demoMode: true, demoTarget: evt.target || null };
   }
   if (t === 'research.session.started') {
     const existing = state.lanes.find((l) => l.lane === evt.lane);
@@ -236,6 +241,7 @@ function Console() {
   const [liveLeadId, setLiveLeadId] = useState(null);
   const [liveCallActive, setLiveCallActive] = useState(false);
   const [inbound, setInbound] = useState(EMPTY_INBOUND);
+  const [scheduledCalls, setScheduledCalls] = useState({ pending: [], recent: [] });
   const [builderInfo, setBuilderInfo] = useState(EMPTY_BUILDER_INFO);
   const [builderAction, setBuilderAction] = useState({ leadId: null, running: false, error: null });
 
@@ -284,16 +290,49 @@ function Console() {
     }
   }, []);
 
+  const refreshScheduledCalls = useCallback(async () => {
+    try {
+      const data = await api.scheduledCalls();
+      setScheduledCalls({
+        pending: data?.pending || [],
+        recent: data?.recent || []
+      });
+    } catch {
+      // ignore — non-fatal
+    }
+  }, []);
+
+  const cancelScheduledCall = useCallback(async (id) => {
+    try {
+      await api.cancelScheduledCall(id);
+      refreshScheduledCalls();
+    } catch (e) {
+      // ignore — non-fatal
+    }
+  }, [refreshScheduledCalls]);
+
+  const fireScheduledCallNow = useCallback(async (id) => {
+    try {
+      await api.fireScheduledCallNow(id);
+      refreshScheduledCalls();
+    } catch (e) {
+      // ignore — non-fatal
+    }
+  }, [refreshScheduledCalls]);
+
   useEffect(() => {
     refreshHealth();
     refreshLeads();
+    refreshScheduledCalls();
     const leadsId = setInterval(refreshLeads, 5000);
     const healthId = setInterval(refreshHealth, 8000);
+    const schedId = setInterval(refreshScheduledCalls, 6000);
     return () => {
       clearInterval(leadsId);
       clearInterval(healthId);
+      clearInterval(schedId);
     };
-  }, [refreshHealth, refreshLeads]);
+  }, [refreshHealth, refreshLeads, refreshScheduledCalls]);
 
   useEffect(() => { refreshLeadDetail(focusedLeadId); }, [focusedLeadId, refreshLeadDetail]);
 
@@ -305,10 +344,28 @@ function Console() {
     if (
       t === 'caller.placed' || t === 'caller.context_loaded' || t === 'caller.transcript' ||
       t === 'caller.done' || t === 'mailer.email_sent' ||
+      t === 'caller.demo_mode.entered' ||
       t === 'research.session.started' || t === 'research.evidence.captured' ||
       t === 'research.session.completed'
     ) {
       setInbound((prev) => reduceInbound(prev, evt));
+    }
+
+    // Scheduled callback lifecycle → keep the right-rail upcoming list fresh.
+    if (
+      t === 'scheduledCall.created' || t === 'scheduledCall.replaced' ||
+      t === 'scheduledCall.canceled' || t === 'scheduledCall.fired' ||
+      t === 'scheduledCall.placed' || t === 'scheduledCall.failed' ||
+      t === 'scheduledCall.brought_forward'
+    ) {
+      refreshScheduledCalls();
+    }
+    // Pre-fire heads-up — flash the matching upcoming card.
+    if (t === 'scheduledCall.warming') {
+      setScheduledCalls((prev) => ({
+        ...prev,
+        warmingIds: [...new Set([...(prev.warmingIds || []), evt.id])]
+      }));
     }
 
     const worker = evt.worker || WORKER_FROM_TYPE(t);
@@ -394,7 +451,7 @@ function Console() {
       refreshLeadDetail(evt.leadId || focusedRef.current);
       refreshHealth();
     }
-  }, [bumpActivity, refreshLeads, refreshLeadDetail, refreshHealth, liveLeadId]);
+  }, [bumpActivity, refreshLeads, refreshLeadDetail, refreshHealth, refreshScheduledCalls, liveLeadId]);
 
   const sseStatus = useSSE(onEvent);
 
@@ -572,6 +629,9 @@ function Console() {
           onFocus={handleLeadFocus}
           queueCounts={queueCounts}
           sseStatus={sseStatus}
+          scheduledCalls={scheduledCalls}
+          onCancelScheduled={cancelScheduledCall}
+          onFireScheduled={fireScheduledCallNow}
         />
       </main>
     </div>

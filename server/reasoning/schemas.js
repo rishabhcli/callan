@@ -149,6 +149,42 @@ export const GrowthPlan = z.object({
   sourceEvidence: z.array(EvidenceItem).max(8)
 }).strict().describe('GrowthPlan');
 
+export const ScheduleCallDecision = z.object({
+  wantsCall: z.boolean().describe('True if the reply requests a scheduled callback.'),
+  isCancel: z.boolean().describe('True if the reply asks to cancel a previously scheduled call.'),
+  scheduledAtIso: z.string().nullable().describe('Customer-requested time as an ISO-8601 timestamp WITH offset, or null if no time given.'),
+  scheduledAtRaw: z.string().describe('Verbatim phrase from the reply that named the time, e.g., "today at 5:14pm".'),
+  ask: z.string().describe('1-2 sentence summary of what the customer wants to discuss on the call.'),
+  reason: z.string().describe('One sentence explaining the classification.'),
+  confidence: z.number().min(0).max(1),
+  sourceEvidence: z.array(EvidenceItem).max(4)
+}).strict().describe('ScheduleCallDecision');
+
+export const PreviewRecap = z.object({
+  body: z.string().describe('50-100 word email paragraph telling the customer we just kicked off their build, written like a teammate texting a quick update. NO greeting line, NO signature, NO live URL, NO markdown.'),
+  citations: z.array(z.object({
+    source: z.enum(['website_brief', 'post_mortem', 'profile', 'lead']).describe('Where this fact came from.'),
+    fact: z.string().describe('The specific concrete detail you cited in the body (e.g. "Tuesday-Thursday booking gap", "the hot lather shave", "section about your fade specialists"). Must appear verbatim or near-verbatim in the body.')
+  }).strict()).min(2).max(5).describe('At least 2 concrete details cited in the body. No vague adjectives.'),
+  confidence: z.number().min(0).max(1)
+}).strict().describe('PreviewRecap');
+
+export const PreviewRecapCritique = z.object({
+  specificity: z.number().min(0).max(1).describe('0 = pure boilerplate, 1 = handcrafted with specific facts. Penalize generic adjectives ("unique vibe", "translates perfectly", "comes together"), reward concrete proper nouns and verbatim quotes from the data.'),
+  fillerPhrases: z.array(z.string()).max(8).describe('Verbatim filler phrases detected in the draft (≤6 words each).'),
+  critique: z.string().describe('One-sentence assessment of what makes the draft generic vs. handcrafted.'),
+  rewrite: z.string().nullable().describe('A more-specific rewrite that strictly references the supplied data. Null if specificity ≥ 0.7.')
+}).strict().describe('PreviewRecapCritique');
+
+export const InvoiceAffirmation = z.object({
+  confirmed: z.boolean().describe('True if the customer is approving the invoice/quoted scope and signaling we should kick off the build now.'),
+  scope: z.enum(['affirm', 'question', 'revision', 'price_pushback', 'negation', 'other']).describe('Best label for the reply intent.'),
+  confidence: z.number().min(0).max(1),
+  excerpt: z.string().describe('Verbatim phrase from the reply that drove the decision (≤120 chars).'),
+  reason: z.string().describe('One short sentence explaining the classification.'),
+  sourceEvidence: z.array(EvidenceItem).max(4)
+}).strict().describe('InvoiceAffirmation');
+
 export const ComplianceDecision = z.object({
   allowed: z.boolean(),
   decisionCode: z.string(),
@@ -171,7 +207,11 @@ export const reasoningSchemas = {
   emailReplyDecision: { schema: EmailReplyDecision, schemaName: 'EmailReplyDecision' },
   websiteBrief: { schema: WebsiteBrief, schemaName: 'WebsiteBrief' },
   growthPlan: { schema: GrowthPlan, schemaName: 'GrowthPlan' },
-  complianceDecision: { schema: ComplianceDecision, schemaName: 'ComplianceDecision' }
+  complianceDecision: { schema: ComplianceDecision, schemaName: 'ComplianceDecision' },
+  scheduleCallDecision: { schema: ScheduleCallDecision, schemaName: 'ScheduleCallDecision' },
+  invoiceAffirmation: { schema: InvoiceAffirmation, schemaName: 'InvoiceAffirmation' },
+  previewRecap: { schema: PreviewRecap, schemaName: 'PreviewRecap' },
+  previewRecapCritique: { schema: PreviewRecapCritique, schemaName: 'PreviewRecapCritique' }
 };
 
 export function schemaForKind(kind) {

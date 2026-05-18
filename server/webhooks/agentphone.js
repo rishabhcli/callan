@@ -14,6 +14,10 @@ import {
 import { maybeFireInboundEmail } from '../inboundIntent.js';
 import { hydrateInboundCall, persistInboundSummary } from '../inboundMemory.js';
 import { startInboundCallerResearch, maybeKickOffBusinessResearch } from '../inboundResearch.js';
+import { maybeMarkDemoMode, isDemoModeCall, clearDemoModeCall, fireDemoFollowupEmail } from '../demoMode.js';
+import { shouldTransfer, transferCallToOperator, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
+import { getCallbackContext } from '../emailCallback.js';
+import { recordAgentPhoneCallCost } from '../costs.js';
 
 const AGENTPHONE_REPLAY_WINDOW_SECONDS = 300;
 
@@ -104,17 +108,53 @@ export async function handleAgentPhoneWebhook(req) {
     }
   }
 
-  // Inbound calls only: if the transcript reveals an email + send intent, fire AgentMail.
-  // Hosted-LLM Callan can say "I'll email you" but has no hands; this gives it hands.
-  if (callRow.decision_reason === 'agentphone_inbound') {
+  // Live operator warm-transfer: scan the latest merged turns for human-intent
+  // or strong-objection signals. Per-call dedupe lives in operatorTransfer.js,
+  // so it's safe to fire on every webhook tick.
+  if (!normalized.terminal && OPERATOR_TRANSFER_NUMBER) {
+    const mergedForTransfer = mergeTurns(
+      normalizeAgentPhoneTranscript(parseTranscript(callRow.transcript_json)),
+      turns
+    );
+    const decision = shouldTransfer(mergedForTransfer);
+    if (decision.transfer) {
+      transferCallToOperator({
+        providerCallId: callRow.provider_call_id,
+        leadId: callRow.lead_id,
+        callId: callRow.id,
+        reason: decision.reason
+      }).catch((err) => log.warn('operator.transfer.webhook_failed', {
+        callId: callRow.id,
+        providerCallId: callRow.provider_call_id,
+        error: err?.message || String(err)
+      }));
+    }
+  }
+
+  // Inbound calls AND email-callbacks: if the transcript reveals a send-intent,
+  // fire AgentMail. Hosted-LLM Callan can verbally promise "I'll email you" but
+  // has no hands — this gives it hands.
+  //   - agentphone_inbound: extract recipient email from transcript
+  //   - agentphone_email_callback: the recipient is already known (the address
+  //     they emailed us from); we look it up via getCallbackContext.
+  if (callRow.decision_reason === 'agentphone_inbound' || callRow.decision_reason === 'agentphone_email_callback') {
     const merged = mergeTurns(
       normalizeAgentPhoneTranscript(parseTranscript(callRow.transcript_json)),
       turns
     );
     const lead = callRow.lead_id ? leads.get(callRow.lead_id) : null;
-    maybeFireInboundEmail({ callRow, lead, transcript: merged }).catch((err) => {
+    const overrideEmail = callRow.decision_reason === 'agentphone_email_callback'
+      ? getCallbackContext(callRow.provider_call_id)?.fromEmail || null
+      : null;
+    maybeFireInboundEmail({ callRow, lead, transcript: merged, overrideEmail }).catch((err) => {
       log.warn('inbound.email.fire_failed', { callId: callRow.id, error: err?.message || String(err) });
     });
+
+    // "Enter Demo Mode" trigger — only on inbound. Demo mode persona switch
+    // only makes sense when we receive a call.
+    if (callRow.decision_reason === 'agentphone_inbound') {
+      maybeMarkDemoMode({ callRow, transcript: merged });
+    }
 
     // Mine the latest user turns for a business mention; kick off a real research
     // job against it. De-duped per call so we only fire once.
@@ -139,17 +179,41 @@ export async function handleAgentPhoneWebhook(req) {
   const finalTranscript = await resolveFinalTranscript(callRow, normalized);
   const outcome = optedOut ? 'opt-out' : outcomeForWebhook(normalized, finalTranscript);
   calls.finish(callRow.id, { outcome, transcript: finalTranscript || normalized.transcript || { note: 'no transcript from AgentPhone webhook' } });
+  try {
+    const finishedRow = calls.get(callRow.id) || callRow;
+    const durationSeconds = resolveCallDurationSeconds(normalized, finishedRow);
+    if (callRow.lead_id && durationSeconds > 0) {
+      recordAgentPhoneCallCost({ leadId: callRow.lead_id, durationSeconds, callId: callRow.id });
+    }
+  } catch (err) {
+    log.warn('agentphone.webhook.cost_record_failed', { callId: callRow.id, error: err?.message || String(err) });
+  }
   await safeAddCallMemory(callRow, finalTranscript || normalized.transcript, outcome);
 
-  // Last chance to fire the inbound follow-up email — final transcript may contain
-  // the email when the streaming chunks didn't. Also persist the cross-call summary.
-  if (callRow.decision_reason === 'agentphone_inbound' && !optedOut) {
+  // Last chance to fire the follow-up email — final transcript may contain
+  // the email or send-intent when the streaming chunks didn't. Also persist
+  // the cross-call summary.
+  if ((callRow.decision_reason === 'agentphone_inbound' || callRow.decision_reason === 'agentphone_email_callback') && !optedOut) {
     const lead = callRow.lead_id ? leads.get(callRow.lead_id) : null;
     const finalTurns = normalizeAgentPhoneTranscript(finalTranscript || normalized.transcript);
-    await maybeFireInboundEmail({ callRow, lead, transcript: finalTurns })
+    const overrideEmail = callRow.decision_reason === 'agentphone_email_callback'
+      ? getCallbackContext(callRow.provider_call_id)?.fromEmail || null
+      : null;
+    // Demo trigger re-check only applies to inbound calls.
+    if (callRow.decision_reason === 'agentphone_inbound') {
+      maybeMarkDemoMode({ callRow, transcript: finalTurns });
+    }
+    await maybeFireInboundEmail({ callRow, lead, transcript: finalTurns, overrideEmail })
       .catch((err) => log.warn('inbound.email.terminal_fire_failed', {
         callId: callRow.id, error: err?.message || String(err)
       }));
+    if (isDemoModeCall(callRow.id)) {
+      await fireDemoFollowupEmail({ callRow, transcript: finalTurns })
+        .catch((err) => log.warn('inbound.demo_mode.email_failed', {
+          callId: callRow.id, error: err?.message || String(err)
+        }));
+      clearDemoModeCall(callRow.id);
+    }
     persistInboundSummary({ callRow, lead, transcript: finalTurns, outcome })
       .catch((err) => log.warn('inbound.memory.persist_failed', {
         callId: callRow.id, error: err?.message || String(err)
@@ -210,6 +274,21 @@ export function normalizeAgentPhonePayload(body = {}) {
   const fromNumber = firstText(body.fromNumber, body.from_number, body.from, data.fromNumber, data.from_number, data.from, call.fromNumber, call.from_number, call.from);
   const toNumber = firstText(body.toNumber, body.to_number, body.to, data.toNumber, data.to_number, data.to, call.toNumber, call.to_number, call.to);
   const terminal = isTerminalWebhook(eventType, status, outcome, failureReason);
+  const durationSeconds = firstNumber(
+    body.durationSeconds, body.duration_seconds, body.duration,
+    data.durationSeconds, data.duration_seconds, data.duration,
+    call.durationSeconds, call.duration_seconds, call.duration
+  );
+  const startedAt = firstNumber(
+    body.startedAt, body.started_at,
+    data.startedAt, data.started_at,
+    call.startedAt, call.started_at
+  );
+  const endedAt = firstNumber(
+    body.endedAt, body.ended_at,
+    data.endedAt, data.ended_at,
+    call.endedAt, call.ended_at
+  );
 
   return {
     eventType,
@@ -223,6 +302,9 @@ export function normalizeAgentPhonePayload(body = {}) {
     fromNumber,
     toNumber,
     terminal,
+    durationSeconds,
+    startedAt,
+    endedAt,
     raw: body
   };
 }
@@ -533,6 +615,43 @@ function firstText(...values) {
     if (typeof value === 'number') return String(value);
   }
   return null;
+}
+
+function firstNumber(...values) {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function resolveCallDurationSeconds(normalized, callRow) {
+  // Provider-supplied duration wins (avoids clock skew). Fall back to
+  // payload startedAt/endedAt → call row started_at/ended_at.
+  if (Number.isFinite(normalized?.durationSeconds) && normalized.durationSeconds > 0) {
+    return Math.round(normalized.durationSeconds);
+  }
+  const startedFromPayload = toMs(normalized?.startedAt);
+  const endedFromPayload = toMs(normalized?.endedAt);
+  if (startedFromPayload && endedFromPayload && endedFromPayload >= startedFromPayload) {
+    return Math.round((endedFromPayload - startedFromPayload) / 1000);
+  }
+  const started = Number(callRow?.started_at) || 0;
+  const ended = Number(callRow?.ended_at) || 0;
+  if (started && ended && ended >= started) {
+    return Math.round((ended - started) / 1000);
+  }
+  return 0;
+}
+
+function toMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  // Heuristic: anything below ~10^11 looks like seconds; otherwise milliseconds.
+  return n < 10_000_000_000 ? n * 1000 : n;
 }
 
 function firstPresent(...values) {

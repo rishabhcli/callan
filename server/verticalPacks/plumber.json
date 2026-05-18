@@ -1,0 +1,45 @@
+{
+  "key": "plumber",
+  "name": "Plumbing and drain",
+  "matchNiches": [
+    "plumber",
+    "plumbing",
+    "plumbing contractor",
+    "drain",
+    "drain cleaning",
+    "plumbing and heating",
+    "sewer",
+    "water heater"
+  ],
+  "priceCents": 60000,
+  "pitchTone": "Plain-spoken, trade-respectful, and tight. Treat the owner like he is under a sink right now; lead with the late-night emergency search, not marketing language.",
+  "valuePropHook": "A flat $600 single-page site built for the homeowner who Googles a plumber at 11pm with a leak; service area at the top, tap-to-call CTA, what you actually fix, and the existing reviews surfaced.",
+  "objections": [
+    {
+      "objection": "I get all my work from Angi already.",
+      "response": "Angi is fine for fresh leads, but when a customer Googles your business name directly, they land on a page you do not own. This is the page that catches that direct search and converts it without paying per lead."
+    },
+    {
+      "objection": "Word of mouth covers me.",
+      "response": "Most word-of-mouth customers still Google the name before they call. The page is the thirty-second confirmation that you are real, you cover their town, and here is the number to call right now."
+    },
+    {
+      "objection": "I am not a website guy.",
+      "response": "You do not have to be. I draft the page from your existing public info and reviews, you reply to one invoice email with corrections, and after that the page just sits there working."
+    },
+    {
+      "objection": "Nobody calls a website, they call a person.",
+      "response": "Exactly. The page is built so the phone number is the headline and the tap-to-call button is the biggest thing on the screen; the website is just the on-ramp to your phone."
+    },
+    {
+      "objection": "I do not have time to take more calls.",
+      "response": "Fair. The page can make the service area, the hours, and the type of work you do not take very clear up front, so the calls that come through are actually the jobs you want."
+    },
+    {
+      "objection": "I tried a website and got nothing.",
+      "response": "Most plumber sites are too generic. This one is built for the local urgent search, with the service area and the phone first, not a multi-page brochure no one reads."
+    }
+  ],
+  "siteTemplateHint": "Use the dependable trades template: white background with deep blue and a clean accent, service-area hero with a giant tap-to-call number, emergency-friendly copy, service grid (drain, water heater, leak, repipe) using only confirmed services, and review proof if present.",
+  "customerPersonaHint": "Homeowners with an active plumbing problem searching on a phone late at night or before work, looking for a local number to call and confirmation that the plumber covers their zip."
+}

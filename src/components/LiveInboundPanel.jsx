@@ -18,14 +18,25 @@ export default function LiveInboundPanel({ inbound, onClose }) {
   const minutes = Math.floor(ringingMs / 60000);
   const seconds = Math.floor((ringingMs % 60000) / 1000).toString().padStart(2, '0');
 
+  const demo = inbound.demoMode ? inbound.demoTarget : null;
+  const pulseClass = demo
+    ? 'is-demo'
+    : inbound.active ? 'is-live' : 'is-done';
+  const eyebrowText = demo
+    ? 'DEMO MODE — outbound cold-call simulation'
+    : inbound.active ? 'live inbound call' : 'last inbound call';
+  const titleText = demo
+    ? `${demo.business} · ${demo.owner}`
+    : (inbound.callerName || maskPhone(inbound.fromNumber) || 'Inbound caller');
+
   return (
-    <div className="nyna-inbound-panel">
+    <div className={`nyna-inbound-panel${demo ? ' is-demo' : ''}`}>
       <header className="nyna-inbound-head">
         <div className="nyna-inbound-head-left">
-          <div className={`nyna-inbound-pulse ${inbound.active ? 'is-live' : 'is-done'}`} />
+          <div className={`nyna-inbound-pulse ${pulseClass}`} />
           <div>
-            <div className="nyna-inbound-eyebrow">{inbound.active ? 'live inbound call' : 'last inbound call'}</div>
-            <div className="nyna-inbound-title">{inbound.callerName || maskPhone(inbound.fromNumber) || 'Inbound caller'}</div>
+            <div className="nyna-inbound-eyebrow">{eyebrowText}</div>
+            <div className="nyna-inbound-title">{titleText}</div>
           </div>
         </div>
         <div className="nyna-inbound-meta">
@@ -34,7 +45,25 @@ export default function LiveInboundPanel({ inbound, onClose }) {
         </div>
       </header>
 
-      {inbound.context?.returning ? (
+      {demo ? (
+        <div className="nyna-inbound-banner is-demo">
+          <span className="nyna-inbound-banner-eyebrow">pitching</span>
+          <span className="nyna-inbound-banner-body">
+            {[
+              demo.business ? demo.business : null,
+              demo.neighborhood ? demo.neighborhood : null,
+              demo.website ? demo.website : null
+            ].filter(Boolean).join(' · ')}
+            {Array.isArray(demo.weaknesses) && demo.weaknesses.length ? (
+              <span className="nyna-inbound-banner-sub">
+                {demo.weaknesses.slice(0, 3).map((w, i) => (
+                  <span key={i} className="nyna-inbound-banner-bullet">{w}</span>
+                ))}
+              </span>
+            ) : null}
+          </span>
+        </div>
+      ) : inbound.context?.returning ? (
         <div className="nyna-inbound-banner">
           <span className="nyna-inbound-banner-eyebrow">returning caller</span>
           <span className="nyna-inbound-banner-body">

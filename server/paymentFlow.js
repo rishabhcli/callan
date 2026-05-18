@@ -2,6 +2,23 @@ import { createHash, randomBytes } from 'node:crypto';
 import { builds, calls, contactEvents, db, leads, payments, runs } from './db.js';
 import { canPay, env } from './env.js';
 import { createHostedInvoice, normalizeStripeEmail } from './providers/stripe.js';
+import { priceCentsForLead } from './verticalPacks/index.js';
+import { currentArmForLead, recordOutcome as recordExperimentOutcome } from './experiments.js';
+import { PITCH_EXPERIMENT_KEY } from './experimentArms.js';
+import { log } from './logger.js';
+import { recordStripeFee } from './costs.js';
+
+/**
+ * Pick the invoice amount for a lead, preferring the lead's matched vertical
+ * pack and falling back to the env STRIPE_PRICE_USD_CENTS default. Always
+ * returns a finite cents value so downstream Stripe calls do not blow up if a
+ * pack file is malformed.
+ */
+export function revenuePriceCentsForLead(lead) {
+  const packPrice = priceCentsForLead(lead);
+  if (Number.isFinite(packPrice) && packPrice > 0) return packPrice;
+  return env.stripe.priceCents;
+}
 
 export const REVENUE_OFFER_VERSION = 'website-flat-500-v1';
 
@@ -69,8 +86,10 @@ export function evaluateInvoiceGate({
 
   if (!resolvedLead) blockers.push(blocker('lead_missing', 'Lead was not found.'));
   if (!interest.ok) blockers.push(blocker('missing_transcript_backed_interest', 'No owner transcript turn explicitly asked to proceed or receive an invoice.'));
-  if (!normalizedEmail) blockers.push(blocker('missing_confirmed_email', 'No confirmed customer email is available.'));
-  else if (!emailProof.ok) blockers.push(blocker('missing_confirmed_email', 'Customer email was not confirmed by read-back evidence.'));
+  // Email gate: we only require an email exists. We do NOT require a verbal read-back
+  // confirmation in the transcript — when the customer says "send the invoice", the
+  // invoice goes out immediately to the email they gave us.
+  if (!normalizedEmail) blockers.push(blocker('missing_customer_email', 'No customer email is available to send the invoice to.'));
   if (optOut.found) blockers.push(blocker('customer_opted_out', optOut.reason));
 
   return {
@@ -143,12 +162,15 @@ export async function createOrReuseRevenueInvoice({
   postMortem,
   profile,
   offerVersion = REVENUE_OFFER_VERSION,
-  amountCents = env.stripe.priceCents,
+  amountCents,
   productName = env.stripe.productName,
   daysUntilDue = 7
 } = {}) {
   const lead = leads.get(leadId);
   if (!lead) throw new Error(`lead ${leadId} not found`);
+  const resolvedAmountCents = Number.isFinite(amountCents) && amountCents > 0
+    ? amountCents
+    : revenuePriceCentsForLead(lead);
   const callRows = calls.listByLead(leadId);
   const contactRows = contactEvents.listByLead(leadId, { limit: 100 });
   const gate = evaluateInvoiceGate({ lead, toEmail, postMortem, callRows, contactRows, offerVersion });
@@ -181,7 +203,7 @@ export async function createOrReuseRevenueInvoice({
         businessName,
         toEmail: gate.normalizedEmail,
         idempotencyKey: gate.idempotencyKey,
-        amountCents,
+        amountCents: resolvedAmountCents,
         productName,
         daysUntilDue
       })
@@ -190,14 +212,15 @@ export async function createOrReuseRevenueInvoice({
         businessName,
         toEmail: gate.normalizedEmail,
         idempotencyKey: gate.idempotencyKey,
-        amountCents,
+        amountCents: resolvedAmountCents,
         productName,
         daysUntilDue,
         offerVersion,
         metadata: {
           offerVersion,
           invoiceConsentEventId: consent.id,
-          confirmedEmail: gate.normalizedEmail
+          confirmedEmail: gate.normalizedEmail,
+          verticalPack: lead.vertical_pack || null
         }
       });
 
@@ -211,7 +234,7 @@ export async function createOrReuseRevenueInvoice({
     payment_link_url: invoice.url || invoice.hostedInvoiceUrl,
     hosted_invoice_url: invoice.hostedInvoiceUrl || invoice.url,
     invoice_pdf_url: invoice.invoicePdfUrl || invoice.invoicePdf || null,
-    amount_cents: invoice.amountCents || amountCents,
+    amount_cents: invoice.amountCents || resolvedAmountCents,
     status: invoice.status || 'open',
     due_at: invoice.dueAt || null,
     idempotency_key: gate.idempotencyKey,
@@ -319,15 +342,60 @@ export function recordPaidPayment(
     outreach_status: 'paid'
   });
 
+  // Conversion outcome for the pitch_v2 experiment: count the paid invoice
+  // toward the arm the lead was bucketed into. Re-recording is harmless (a
+  // new outcome row each time) but we still gate on result.changed so a
+  // duplicate Stripe webhook does not double-count revenue.
+  if (result.changed) {
+    try {
+      const assignment = currentArmForLead(PITCH_EXPERIMENT_KEY, leadId);
+      if (assignment) {
+        const amountCents = Number.isFinite(result.row?.amount_cents) ? result.row.amount_cents : null;
+        recordExperimentOutcome({
+          assignment,
+          outcome: 'converted',
+          valueCents: amountCents,
+          metadata: {
+            paymentId: result.row?.id || null,
+            stripeInvoiceId: result.row?.stripe_invoice_id || null
+          }
+        });
+      }
+    } catch (err) {
+      log.warn('experiment.outcome.conversion_failed', { leadId, error: err?.message || String(err) });
+    }
+    // Stripe processing fee — only on the transition to paid so duplicate
+    // webhooks don't double-charge the ledger.
+    try {
+      const amountCents = Number(result.row?.amount_cents) || 0;
+      if (amountCents > 0) {
+        recordStripeFee({ leadId, amountCents });
+      }
+    } catch (err) {
+      log.warn('stripe.fee_record_failed', { leadId, error: err?.message || String(err) });
+    }
+  }
+
   if (!result.row) return { ...result, leadId, builderTriggerClaimed: false, build: { shouldStart: false, reason: 'missing_payment' } };
   if (typeof startBuilder !== 'function') {
     return { ...result, leadId, builderTriggerClaimed: false, build: { shouldStart: false, reason: 'no_start_builder' } };
   }
 
   const trigger = payments.claimBuilderTrigger(result.row.id);
-  const build = trigger.claimed
-    ? builds.reservePaidBuild({ lead_id: leadId, trigger_key: `payment:${result.row.id}`, staleAfterMs })
-    : { shouldStart: false, reason: 'already_triggered', row: null };
+  let build;
+  if (!trigger.claimed) {
+    build = { shouldStart: false, reason: 'already_triggered', row: null };
+  } else {
+    // Preview-build kickoff (fired on the customer's affirmative invoice reply) may already
+    // be running for this lead under buildId 'bld_preview_<leadId>' with no payment trigger_key.
+    // Don't start a second runner; let the existing build deliver the project URL.
+    const activePreview = builds.findActiveForLead?.(leadId);
+    if (activePreview) {
+      build = { shouldStart: false, reason: 'preview_already_running', row: activePreview };
+    } else {
+      build = builds.reservePaidBuild({ lead_id: leadId, trigger_key: `payment:${result.row.id}`, staleAfterMs });
+    }
+  }
   if (build.shouldStart && build.row) startBuilder({ leadId, buildId: build.row.id, triggerKey: build.row.trigger_key });
   return {
     ...result,

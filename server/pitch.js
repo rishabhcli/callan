@@ -159,7 +159,7 @@ export function createFallbackPitch({ disclosure, profile = {}, lead = {} } = {}
     ],
     close: 'If this sounds useful, I can send the $500 invoice and the project can start from the business details I already found.',
     emailAsk: 'What is the best email for the invoice?',
-    emailReadbackInstruction: 'After the owner says an email address, read it back exactly, including dots and the at sign, then ask them to confirm before ending the call.',
+    emailReadbackInstruction: 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.',
     invoiceClose: 'AgentMail will send the invoice, and you can reply to that email with questions or corrections.',
     beginMessage: `${disclosure} ${concreteSignal} I wanted to ask one quick website question.`
   }, { disclosure, profile, lead }), { disclosure, source: 'fallback' });
@@ -174,8 +174,8 @@ export function buildPitchHotStrategy({ pitch = {}, profile = {}, lead = {} } = 
     `Open with this concrete business signal: ${pitch.openingLine || context.research.whatTheyDo}`,
     `Tie the offer to these customer needs: ${needs}.`,
     `Use this value prop when the owner gives you a few seconds: ${pitch.valueProp || 'A focused $500 same-day website can make the next customer action obvious.'}`,
-    `Close only after positive intent: ${pitch.close || 'If this sounds useful, ask for the best invoice email and read it back.'}`,
-    `If the owner agrees, follow the email readback rule exactly: ${pitch.emailReadbackInstruction || 'Read the email back and ask for confirmation.'}`
+    `Close only after positive intent: ${pitch.close || 'If this sounds useful, ask for the best invoice email and send the invoice.'}`,
+    `If the owner agrees, follow this rule exactly: ${pitch.emailReadbackInstruction || 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.'}. Do NOT ask them to confirm or repeat the email.`
   ].filter(Boolean);
 }
 
@@ -261,7 +261,7 @@ function createFallbackSkeleton({ disclosure, profile = {}, lead = {} }) {
     ],
     close: 'If this sounds useful, I can send the $500 invoice and keep the next step simple.',
     emailAsk: 'What is the best email for the invoice?',
-    emailReadbackInstruction: 'Read the email back exactly and ask for confirmation before ending the call.',
+    emailReadbackInstruction: 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.',
     invoiceClose: 'AgentMail will send the invoice, and you can reply to that email with questions.',
     beginMessage: `${disclosure} I noticed ${businessName} and wanted to ask one quick website question.`
   };
@@ -286,8 +286,8 @@ function semanticIssues(pitch, disclosure) {
   if (!/email/i.test(pitch.emailAsk) || !/invoice/i.test(pitch.emailAsk)) {
     issues.push('emailAsk must ask for the invoice email');
   }
-  if (!/read|repeat/i.test(pitch.emailReadbackInstruction) || !/confirm|right|correct/i.test(pitch.emailReadbackInstruction)) {
-    issues.push('emailReadbackInstruction must require readback and confirmation');
+  if (/\b(read.{0,20}back|repeat.{0,20}back|confirm|are you sure|is that (?:right|correct))\b/i.test(pitch.emailReadbackInstruction || '')) {
+    issues.push('emailReadbackInstruction must NOT ask the customer to confirm — capture the email and send the invoice immediately');
   }
   if (!/AgentMail/i.test(pitch.invoiceClose) || !/reply|question/i.test(pitch.invoiceClose)) {
     issues.push('invoiceClose must mention AgentMail and the reply path');
@@ -316,8 +316,14 @@ function ensureEmailAsk(value) {
 }
 
 function ensureReadbackInstruction(value) {
-  if (/read|repeat/i.test(value) && /confirm|right|correct/i.test(value)) return value;
-  return 'After the owner says an email address, read it back exactly, including dots and the at sign, then ask them to confirm before ending the call.';
+  const text = String(value || '');
+  // Reject any model output that smuggles readback/confirmation language back in;
+  // we want the agent to capture the email and send the invoice immediately.
+  if (/\b(read.{0,20}back|repeat.{0,20}back|confirm|are you sure|is that (?:right|correct))\b/i.test(text)) {
+    return 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.';
+  }
+  if (text.length > 12) return text;
+  return 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.';
 }
 
 function ensureInvoiceClose(value) {
