@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import BrowserResearchConsole from '../components/BrowserResearchConsole.jsx';
+import Inspector from '../components/Inspector.jsx';
 
 const EMPTY = { sessions: [], counts: {}, telemetry: {} };
 
@@ -21,7 +23,7 @@ function statusClass(group) {
   return '';
 }
 
-export default function ScraperView() {
+export default function ScraperView({ focusedLeadId, leadDetail, onLeadChanged }) {
   const [data, setData] = useState(EMPTY);
   const [error, setError] = useState(null);
 
@@ -63,6 +65,20 @@ export default function ScraperView() {
 
       {error ? <div className="nyna-scraper-error">{error}</div> : null}
 
+      <div className="nyna-scraper-research-console">
+        <BrowserResearchConsole />
+      </div>
+
+      {focusedLeadId ? (
+        <div className="nyna-scraper-inspector">
+          <ScraperInspectorPanel
+            focusedLeadId={focusedLeadId}
+            leadDetail={leadDetail}
+            onLeadChanged={onLeadChanged}
+          />
+        </div>
+      ) : null}
+
       <div className="nyna-scraper-grid">
         {sessions.length ? sessions.map((s) => (
           <SessionCard
@@ -76,6 +92,17 @@ export default function ScraperView() {
         )}
       </div>
     </div>
+  );
+}
+
+function ScraperInspectorPanel(props) {
+  const [activeTab, setActiveTab] = useState('Memory');
+  return (
+    <Inspector
+      {...props}
+      activeTab={activeTab}
+      setActiveTab={setActiveTab}
+    />
   );
 }
 

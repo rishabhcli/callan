@@ -14,7 +14,8 @@ const EMPTY = {
     stepCount: 0,
     evidenceCount: 0,
     models: []
-  }
+  },
+  handoffCases: []
 };
 
 const GROUPS = [
@@ -36,11 +37,12 @@ export default function BrowserUseConsole({ onLeadChanged }) {
     if (!quiet) setLoading(true);
     setError(null);
     try {
-      const [sessionData, eventData] = await Promise.all([
+      const [sessionData, eventData, handoffData] = await Promise.all([
         requestJson('/api/browser-use/sessions'),
-        requestJson('/api/browser-use/events?limit=80')
+        requestJson('/api/browser-use/events?limit=80'),
+        requestJson('/api/handoff/cases?status=open&limit=20')
       ]);
-      setData(sessionData || EMPTY);
+      setData({ ...(sessionData || EMPTY), handoffCases: handoffData?.cases || [] });
       setEvents(eventData?.events || []);
     } catch (err) {
       setError(err.message);
@@ -121,6 +123,7 @@ export default function BrowserUseConsole({ onLeadChanged }) {
 
   const counts = data.counts || EMPTY.counts;
   const telemetry = data.telemetry || EMPTY.telemetry;
+  const builderHandoffs = (data.handoffCases || []).filter((item) => ['build_auth_wall', 'qa_failure', 'provider_failure'].includes(item.category));
 
   return (
     <section className="bu-strip-card">
@@ -143,6 +146,7 @@ export default function BrowserUseConsole({ onLeadChanged }) {
           <span className="bu-strip-stat"><span className="bu-strip-stat-key">active</span><span className="bu-strip-stat-val">{counts.active || 0}</span></span>
           <span className="bu-strip-stat"><span className="bu-strip-stat-key">done</span><span className="bu-strip-stat-val">{counts.completed || 0}</span></span>
           <span className="bu-strip-stat"><span className="bu-strip-stat-key">failed</span><span className="bu-strip-stat-val">{(counts.failed || 0) + (counts.auth_wall || 0)}</span></span>
+          <span className="bu-strip-stat"><span className="bu-strip-stat-key">handoff</span><span className="bu-strip-stat-val">{builderHandoffs.length}</span></span>
           <span className="bu-strip-stat"><span className="bu-strip-stat-key">evidence</span><span className="bu-strip-stat-val">{telemetry.evidenceCount || 0}</span></span>
           <span className="bu-strip-stat"><span className="bu-strip-stat-key">cost</span><span className="bu-strip-stat-val">${Number(telemetry.totalCostUsd || 0).toFixed(2)}</span></span>
         </div>
@@ -181,7 +185,7 @@ export default function BrowserUseConsole({ onLeadChanged }) {
             </form>
           </div>
 
-          <TelemetryStrip telemetry={telemetry} counts={counts} />
+          <TelemetryStrip telemetry={telemetry} counts={counts} builderHandoffs={builderHandoffs} />
 
           {error ? <div className="browser-console-error mono">{error}</div> : null}
 
@@ -204,12 +208,13 @@ export default function BrowserUseConsole({ onLeadChanged }) {
   );
 }
 
-function TelemetryStrip({ telemetry, counts }) {
+function TelemetryStrip({ telemetry, counts, builderHandoffs = [] }) {
   return (
     <div className="browser-telemetry mono">
       <Metric label="active" value={counts.active || 0} tone="warn" />
       <Metric label="done" value={counts.completed || 0} tone="good" />
       <Metric label="blocked" value={(counts.failed || 0) + (counts.auth_wall || 0)} tone="bad" />
+      <Metric label="operator cases" value={builderHandoffs.length} tone={builderHandoffs.length ? 'bad' : 'muted'} />
       <Metric label="steps" value={telemetry.stepCount || 0} />
       <Metric label="evidence" value={telemetry.evidenceCount || 0} />
       <Metric label="tokens" value={`${compactNumber(telemetry.inputTokens)} / ${compactNumber(telemetry.outputTokens)}`} />

@@ -227,7 +227,7 @@ try {
     await runBuilder(buildStarts[0]);
     const buildRows = builds.listByLead(leadId);
     assert(buildRows.length === 1, `expected one build row, got ${buildRows.length}`);
-    assert(buildRows[0].status === 'completed', `build not completed: ${buildRows[0].status}`);
+    assert(buildRows[0].status === 'completed', `build not completed: ${buildRows[0].status}${buildRows[0].error ? ` (${buildRows[0].error})` : ''}`);
     return { buildId: buildRows[0].id, duplicate: duplicate.duplicate };
   });
 

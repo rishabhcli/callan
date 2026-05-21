@@ -30,6 +30,8 @@ export const MEMORY_KINDS = Object.freeze([
   'build_brief',
   'build_result',
   'growth_plan',
+  'commerce_plan',
+  'account_manager_plan',
   'compliance_decision'
 ]);
 
@@ -54,6 +56,8 @@ const KIND_CATEGORY = Object.freeze({
   build_brief: 'build',
   build_result: 'build',
   growth_plan: 'growth',
+  commerce_plan: 'commerce',
+  account_manager_plan: 'aftercare',
   compliance_decision: 'compliance'
 });
 
@@ -69,6 +73,8 @@ const FILTER_CONTEXT_BY_KIND = Object.freeze({
   build_brief: { category: ['research', 'sales', 'build'] },
   build_result: { category: ['build'] },
   growth_plan: { category: ['research', 'sales', 'call', 'mail', 'build', 'growth'] },
+  commerce_plan: { category: ['research', 'sales', 'call', 'mail', 'build', 'commerce'] },
+  account_manager_plan: { category: ['research', 'sales', 'call', 'mail', 'build', 'growth', 'aftercare'] },
   compliance_decision: { category: 'compliance' }
 });
 

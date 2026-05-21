@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { env } from './env.js';
-import { callAttempts, doNotCall, leads, auditTrail } from './db.js';
+import { callAttempts, doNotCall, leads, auditTrail, trustLedger } from './db.js';
 
 const PHONE_RE = /^\+?[1-9]\d{6,14}$/;
 const POLICY_VERSION = 'callability-v2';
@@ -48,7 +48,9 @@ export function classifyPhone({ phone, lead, profile } = {}) {
   if (isOwnedPhone(normalized)) return PHONE_CLASSIFICATIONS.OWNED;
 
   const explicit = explicitPhoneClassification({ lead, profile });
+  if (explicit === PHONE_CLASSIFICATIONS.INVALID) return explicit;
   if (explicit === PHONE_CLASSIFICATIONS.MOBILE_RISK) return explicit;
+  if (explicit === PHONE_CLASSIFICATIONS.UNKNOWN) return explicit;
   if (explicit === PHONE_CLASSIFICATIONS.BUSINESS_LANDLINE && hasBusinessPhoneEvidence({ lead, profile })) return explicit;
 
   const lineHint = [
@@ -79,6 +81,21 @@ export function recordOptOut(phone, { source = 'call-transcript', reason = REASO
   const p = normalizePhone(phone);
   if (!p) return;
   doNotCall.add({ phone: p, reason, source });
+  try {
+    trustLedger.add({
+      lead_id: leadId || null,
+      event_type: 'opt_out',
+      actor: source,
+      channel: source.includes('mail') ? 'agentmail' : source.includes('portal') ? 'portal' : 'phone',
+      direction: 'inbound',
+      decision_code: reason,
+      summary: 'Opt-out was recorded and the phone was added to do-not-call.',
+      metadata: { phone: p, source, reason },
+      dedupe_key: `opt_out:${p}:${source}:${reason}`
+    });
+  } catch {
+    // DNC persistence is the source of truth; trust-ledger failure should not reopen outreach.
+  }
   // Mirror the opt-out into the reputation auto-throttle counters. Uses a
   // dynamic import to avoid the compliance ↔ reputation ↔ outreach cycle at
   // module-evaluation time. Fire-and-forget; reputation failures must not
@@ -123,6 +140,30 @@ export function markLeadConsentApproved(leadId, { reason = 'email_invite', proof
     },
     dedupe_key: proof ? `consent_email_invite:${leadId}:${proof}` : `consent_email_invite:${leadId}:${Date.now()}`
   });
+  try {
+    trustLedger.add({
+      lead_id: leadId,
+      event_type: 'consent_status',
+      actor: 'customer',
+      channel: 'agentmail',
+      direction: 'inbound',
+      subject_id: contactEventId || proof || null,
+      decision_code: wasApproved ? 'consent.reaffirmed' : 'consent.promoted',
+      summary: wasApproved
+        ? 'Customer callback consent was reaffirmed from inbound email proof.'
+        : 'Customer callback consent was promoted from inbound email proof.',
+      metadata: {
+        proof,
+        excerpt: typeof excerpt === 'string' ? excerpt.slice(0, 280) : null,
+        priorStatus: lead.consent_status || null,
+        nextStatus: 'operator_approved',
+        reason
+      },
+      dedupe_key: proof ? `trust_consent_email_invite:${leadId}:${proof}` : null
+    });
+  } catch {
+    // Lead consent status and audit trail are already persisted; do not reopen the path.
+  }
   return { promoted: !wasApproved, priorStatus: lead.consent_status };
 }
 
@@ -323,8 +364,10 @@ export function complianceGateReport({ mode = env.runMode, now = new Date() } = 
       gate('max_attempts', maxAttempts > 0, `MAX_ATTEMPTS_PER_PHONE=${maxAttempts}`),
       gate('business_phone_classification', true, 'production/autonomous calls require owned or business-landline evidence'),
       gate('recording_ai_disclosure', hasRecordingDisclosure(disclosure), disclosure),
-      gate('invoice_consent', true, 'invoice gate requires transcript-backed interest + a customer email; no readback confirmation required'),
-      gate('unsubscribe', true, 'AgentMail opt-out classification records email-opt-out and stops automated replies')
+      gate('invoice_consent', true, 'invoice gate requires transcript-backed interest plus readback-confirmed customer email before sending an invoice'),
+      gate('unsubscribe', true, 'AgentMail opt-out classification records email-opt-out and stops automated replies'),
+      gate('source_provenance_response', true, 'where-did-you-get-my-number replies cite stored source evidence and include opt-out language'),
+      gate('trust_ledger', true, 'call decisions, contact events, portal token actions, opt-outs, invoice consent, and provider flags append trust ledger receipts')
     ],
     outboundCallReasonCodes: REASON_CODES,
     phoneClassifications: PHONE_CLASSIFICATIONS
@@ -353,6 +396,7 @@ function canonicalPhoneClassification(value) {
   if (!v) return null;
   if (v === 'invalid') return PHONE_CLASSIFICATIONS.INVALID;
   if (v === 'owned') return PHONE_CLASSIFICATIONS.OWNED;
+  if (v === 'unknown' || v === 'unknown_risk') return PHONE_CLASSIFICATIONS.UNKNOWN;
   if (v === 'mobile_risk' || v === 'mobile' || v === 'wireless' || v === 'cell') return PHONE_CLASSIFICATIONS.MOBILE_RISK;
   if (v === 'business_landline' || v === 'business' || v === 'landline') return PHONE_CLASSIFICATIONS.BUSINESS_LANDLINE;
   return null;
@@ -532,7 +576,10 @@ function persistDecision(decision) {
       phoneClassification: storedDecision.phoneClassification,
       sourceUrl: storedDecision.sourceUrl
     }),
-    disclosure_text: decision.disclosureText || null
+    disclosure_text: decision.disclosureText || null,
+    source_url: storedDecision.sourceUrl || null,
+    decision_code: storedDecision.allowed ? 'call.allowed' : `call.blocked.${storedDecision.reasonCodes[0] || 'policy'}`,
+    metadata: storedDecision
   });
   return { decisionId, decision: storedDecision };
 }

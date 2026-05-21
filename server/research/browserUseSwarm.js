@@ -17,6 +17,8 @@ import { BrowserResearchOutputSchema, SOURCE_TYPES, validateSourceType } from '.
 import { leads as leadsTable } from '../db.js';
 import { addDoc, containerTagFor } from '../memory.js';
 import { recordBrowserUseSteps } from '../costs.js';
+import { buildLeadIntelligence } from './leadIntelligence.js';
+import { enqueueLeadPriorityScore } from '../leadPriorityQueue.js';
 
 // session_id -> Set<leadId> created by that session. Cleared on terminal.
 const sessionLeadIds = new Map();
@@ -611,6 +613,11 @@ function persistEvidenceBatch({ job, sessionId, providerSessionId, source, outpu
       businessName: saved.businessName,
       sourceUrl: saved.sourceUrl,
       presenceStrength: saved.presenceStrength,
+      callOpener: saved.leadIntelligence?.callOpener?.text || null,
+      reviewThemes: saved.leadIntelligence?.reviewThemes || [],
+      competitorGaps: saved.leadIntelligence?.competitorComparison || [],
+      currentWebsiteIssues: saved.leadIntelligence?.currentWebsiteIssues || [],
+      scores: saved.leadIntelligence?.scores || null,
       skipped: saved.skipped,
       skippedReason: saved.skippedReason
     });
@@ -657,11 +664,12 @@ function mirrorBusinessToMemory({ job, evidence, source, sessionId = null }) {
       set.add(lead.id);
       sessionLeadIds.set(sessionId, set);
     }
-    // Lazy-import to avoid an import cycle (outreach.js → leadPriority.js → db.js).
-    // Containing function isn't async, so we fire-and-forget via .then/.catch.
-    import('../leadPriority.js')
-      .then(({ applyPriorityToLead }) => applyPriorityToLead(lead.id))
-      .catch((err) => log.warn('browser_research.priority_score_failed', { leadId: lead.id, error: err?.message || String(err) }));
+    enqueueLeadPriorityScore({
+      leadId: lead.id,
+      source: 'browser_research',
+      runId: job.id,
+      idempotencyKey: `lead.priority_score:${lead.id}:browser_research:${job.id}`
+    });
     emit('lead.created', {
       worker: 'browser_research',
       runId: job.id,
@@ -754,6 +762,35 @@ function normalizeLeadEvidence(raw, { job, source }) {
     signals: list(raw.signals),
     onlinePresenceEvidence: raw.onlinePresenceEvidence
   }, { rawText: jsonText(raw) || '' });
+  const leadIntelligence = buildLeadIntelligence({
+    ...raw,
+    sourceEvidence,
+    reviews,
+    profile: {
+      businessName: raw.businessName,
+      phone: raw.phone,
+      address: raw.address,
+      hours: raw.hours,
+      city: job.city,
+      niche: job.niche,
+      hasWebsite: Boolean(raw.websiteUrl),
+      websiteUrl: raw.websiteUrl,
+      socialUrls,
+      services,
+      reviews,
+      sourceUrl,
+      onlinePresenceStrength: raw.onlinePresenceStrength || scored.onlinePresenceStrength,
+      presenceConfidence: raw.presenceConfidence ?? raw.onlinePresenceConfidence ?? scored.presenceConfidence,
+      onlinePresenceSummary: raw.leadRecommendation || raw.onlinePresenceSummary || sourceEvidence.map((e) => e.evidenceText || e.claim).join(' '),
+      onlinePresenceEvidence: scored.onlinePresenceEvidence
+    }
+  }, {
+    businessName: raw.businessName,
+    niche: job.niche,
+    city: job.city,
+    sourceType: source.type,
+    sourceUrl
+  });
 
   return {
     businessName: cleanText(raw.businessName || raw.name || raw.title),
@@ -768,7 +805,7 @@ function normalizeLeadEvidence(raw, { job, source }) {
     sourceUrl,
     presenceStrength: raw.onlinePresenceStrength || scored.onlinePresenceStrength,
     confidence: boundedConfidence(raw.presenceConfidence ?? raw.onlinePresenceConfidence ?? scored.presenceConfidence),
-    raw: { ...raw, scored }
+    raw: { ...raw, scored, leadIntelligence }
   };
 }
 
@@ -819,6 +856,28 @@ function evidenceToBusinessProfile(item, { niche, city }) {
     presenceConfidence: item.confidence ?? presence.presenceConfidence,
     notWorthCallingReason: presence.notWorthCallingReason,
     callRecommendation: presence.callRecommendation,
+    leadIntelligence: item.leadIntelligence || item.raw?.leadIntelligence || buildLeadIntelligence({
+      profile: {
+        businessName: item.businessName,
+        phone: item.phone,
+        address: item.address,
+        hours: item.hours,
+        city,
+        niche,
+        hasWebsite: Boolean(item.websiteUrl),
+        websiteUrl: item.websiteUrl,
+        socialUrls: item.socialUrls,
+        services: item.services,
+        reviews: item.reviews,
+        sourceUrl: item.sourceUrl,
+        onlinePresenceStrength: presence.onlinePresenceStrength,
+        presenceConfidence: item.confidence ?? presence.presenceConfidence,
+        onlinePresenceSummary: presence.onlinePresenceSummary,
+        onlinePresenceEvidence: presence.onlinePresenceEvidence
+      },
+      sourceEvidence: item.sourceEvidence,
+      reviews: item.reviews
+    }, { niche, city, sourceUrl: item.sourceUrl, sourceType: item.sourceType }),
     ownerHypothesis: null,
     customerPersona: null,
     hours: item.hours,
@@ -887,8 +946,9 @@ function taskForSource({ job, source }) {
     `Return up to ${Math.max(2, Math.ceil(job.maxLeads / 2))} businesses from this source lane.`,
     'Use public business pages only. Do not log in. Do not contact any business. Do not submit forms.',
     'Prefer small independent businesses that have no, weak, or mixed online presence. Still include strong-presence businesses if found, because the caller must visibly skip them.',
-    'Every lead object must include businessName, phone, address, hours, websiteUrl, socialUrls, services, reviews, sourceEvidence, onlinePresenceStrength, and presenceConfidence.',
-    'sourceEvidence must include exact sourceUrl and short evidenceText for phone, address, hours, services, website/social presence, and reviews when visible.',
+    'Every lead object must include businessName, phone, address, hours, websiteUrl, socialUrls, services, reviews, sourceEvidence, onlinePresenceStrength, presenceConfidence, and leadIntelligence.',
+    'sourceEvidence must include a stable id, exact sourceUrl, sourceType, field, value, and short evidenceText for phone, address, hours, services, website/social presence, and reviews when visible.',
+    'leadIntelligence must cover reviewThemes, positiveProof, complaintsPainPoints, missingCustomerInfo, competitorComparison, currentWebsiteIssues, socialListingConsistency, contactConfidence for hours/address/phone, bestCtaRecommendation, whyThisLeadIsWorthCalling, doNotCallBecauseAlreadyStrong, scores, and callOpener. Every claim must cite evidenceIds that exist in sourceEvidence or leadIntelligence.evidence.',
     'Return only structured output matching the provided JSON Schema.'
   ].join('\n');
 }
@@ -947,12 +1007,34 @@ function mockEvidenceForSource({ job, source }) {
       leadRecommendation: 'Skip: strong owned website and booking path already visible.'
     });
   }
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    leadIntelligence: buildLeadIntelligence({
+      ...row,
+      profile: {
+        ...row,
+        city: job.city,
+        niche: job.niche,
+        hasWebsite: Boolean(row.websiteUrl),
+        sourceUrl: row.sourceUrl || row.sourceEvidence?.[0]?.sourceUrl,
+        onlinePresenceSummary: row.leadRecommendation
+      }
+    }, {
+      businessName: row.businessName,
+      city: job.city,
+      niche: job.niche,
+      sourceType: source.type,
+      sourceUrl: row.sourceUrl || row.sourceEvidence?.[0]?.sourceUrl || baseUrl
+    })
+  }));
 }
 
 function mockSourceEvidence({ source, sourceUrl, businessName, websiteUrl, strong = false }) {
+  const base = `${source.type}:${slugify(businessName)}:${slugify(sourceUrl)}`;
   return [
     {
+      id: safeEvidenceId(`${base}:name`),
+      sourceId: safeEvidenceId(`${base}:name`),
       sourceType: source.type,
       sourceUrl,
       field: 'businessName',
@@ -961,11 +1043,33 @@ function mockSourceEvidence({ source, sourceUrl, businessName, websiteUrl, stron
       capturedAt: new Date().toISOString()
     },
     {
+      id: safeEvidenceId(`${base}:website`),
+      sourceId: safeEvidenceId(`${base}:website`),
       sourceType: source.type,
       sourceUrl,
       field: 'websiteUrl',
       value: websiteUrl,
       evidenceText: strong ? 'Owned site has services, booking, reviews, and contact path.' : 'No strong owned website evidence was visible from this source.',
+      capturedAt: new Date().toISOString()
+    },
+    {
+      id: safeEvidenceId(`${base}:reviews`),
+      sourceId: safeEvidenceId(`${base}:reviews`),
+      sourceType: source.type,
+      sourceUrl,
+      field: 'reviews',
+      value: strong ? '4.9 stars / 412 reviews' : '4.3 stars / sparse review detail',
+      evidenceText: strong ? 'Reviews, ratings, photos, and booking proof are visible.' : 'Review proof exists, but the page does not answer enough customer questions.',
+      capturedAt: new Date().toISOString()
+    },
+    {
+      id: safeEvidenceId(`${base}:contact`),
+      sourceId: safeEvidenceId(`${base}:contact`),
+      sourceType: source.type,
+      sourceUrl,
+      field: 'contact',
+      value: strong ? 'phone, hours, booking, contact path' : 'phone and hours only',
+      evidenceText: strong ? 'Phone, hours, booking, and contact path are visible.' : 'Phone and hours are visible, but there is no clear owned-site CTA.',
       capturedAt: new Date().toISOString()
     }
   ];
@@ -1180,7 +1284,7 @@ function rowSession(row) {
 }
 
 function rowEvidence(row) {
-  return {
+  const parsed = {
     id: row.id,
     jobId: row.job_id,
     sessionId: row.session_id,
@@ -1204,6 +1308,25 @@ function rowEvidence(row) {
     updatedAt: row.updated_at,
     raw: parseJson(row.raw_json)
   };
+  parsed.leadIntelligence = parsed.raw?.leadIntelligence || buildLeadIntelligence({
+    profile: {
+      businessName: parsed.businessName,
+      phone: parsed.phone,
+      address: parsed.address,
+      hours: parsed.hours,
+      hasWebsite: Boolean(parsed.websiteUrl),
+      websiteUrl: parsed.websiteUrl,
+      socialUrls: parsed.socialUrls,
+      services: parsed.services,
+      reviews: parsed.reviews,
+      sourceUrl: parsed.sourceUrl,
+      onlinePresenceStrength: parsed.presenceStrength,
+      presenceConfidence: parsed.confidence
+    },
+    sourceEvidence: parsed.sourceEvidence,
+    reviews: parsed.reviews
+  }, { sourceType: parsed.sourceType, sourceUrl: parsed.sourceUrl });
+  return parsed;
 }
 
 function publicJobEvent(job) {
@@ -1258,7 +1381,13 @@ function groupEvidenceByBusiness(evidence) {
       skippedReason: item.skippedReason,
       sources: [],
       services: new Set(),
-      socialUrls: new Set()
+      socialUrls: new Set(),
+      leadIntelligence: item.leadIntelligence || null,
+      reviewThemes: item.leadIntelligence?.reviewThemes || [],
+      competitorGaps: item.leadIntelligence?.competitorComparison || [],
+      currentWebsiteIssues: item.leadIntelligence?.currentWebsiteIssues || [],
+      callOpener: item.leadIntelligence?.callOpener?.text || null,
+      scores: item.leadIntelligence?.scores || null
     };
     current.phone ||= item.phone;
     current.address ||= item.address;
@@ -1266,6 +1395,12 @@ function groupEvidenceByBusiness(evidence) {
     current.websiteUrl ||= item.websiteUrl;
     current.skipped = current.skipped && item.skipped;
     if (!current.skippedReason && item.skippedReason) current.skippedReason = item.skippedReason;
+    if (!current.leadIntelligence && item.leadIntelligence) current.leadIntelligence = item.leadIntelligence;
+    if (!current.callOpener && item.leadIntelligence?.callOpener?.text) current.callOpener = item.leadIntelligence.callOpener.text;
+    if (!current.reviewThemes.length && item.leadIntelligence?.reviewThemes?.length) current.reviewThemes = item.leadIntelligence.reviewThemes;
+    if (!current.competitorGaps.length && item.leadIntelligence?.competitorComparison?.length) current.competitorGaps = item.leadIntelligence.competitorComparison;
+    if (!current.currentWebsiteIssues.length && item.leadIntelligence?.currentWebsiteIssues?.length) current.currentWebsiteIssues = item.leadIntelligence.currentWebsiteIssues;
+    if (!current.scores && item.leadIntelligence?.scores) current.scores = item.leadIntelligence.scores;
     current.sources.push({ sourceType: item.sourceType, sourceUrl: item.sourceUrl, evidenceCount: item.sourceEvidence.length });
     for (const service of item.services) current.services.add(service);
     for (const url of item.socialUrls) current.socialUrls.add(url);
@@ -1366,16 +1501,23 @@ function mockSteps(source, { job } = {}) {
 function normalizeSourceEvidence(value, { raw, source }) {
   const rows = Array.isArray(value) ? value : [];
   const sourceUrl = firstText(raw.sourceUrl, raw.websiteUrl, rows[0]?.sourceUrl, mockSourceUrl({ city: 'demo', niche: 'business' }, source, raw.businessName));
-  const normalized = rows.map((item) => ({
-    sourceType: validateSourceType(item.sourceType || source.type),
-    sourceUrl: firstText(item.sourceUrl, sourceUrl),
-    field: cleanText(item.field || 'profile'),
-    value: nullableText(item.value),
-    evidenceText: cleanText(item.evidenceText || item.evidence || item.summary || 'Evidence captured by Browser Use.'),
-    capturedAt: item.capturedAt || new Date().toISOString()
-  })).filter((item) => item.sourceUrl && item.field && item.evidenceText);
+  const normalized = rows.map((item, index) => {
+    const out = {
+      sourceType: validateSourceType(item.sourceType || source.type),
+      sourceUrl: firstText(item.sourceUrl, sourceUrl),
+      field: cleanText(item.field || 'profile'),
+      value: nullableText(item.value),
+      evidenceText: cleanText(item.evidenceText || item.evidence || item.summary || 'Evidence captured by Browser Use.'),
+      capturedAt: item.capturedAt || new Date().toISOString()
+    };
+    const id = safeEvidenceId(item.id || item.sourceId || `${out.sourceType}:${out.field}:${out.sourceUrl}:${out.evidenceText}:${index}`);
+    return { id, sourceId: item.sourceId || id, ...out };
+  }).filter((item) => item.sourceUrl && item.field && item.evidenceText);
   if (normalized.length) return normalized;
+  const fallbackId = safeEvidenceId(`${source.type}:profile:${sourceUrl}:${raw.businessName || 'business'}`);
   return [{
+    id: fallbackId,
+    sourceId: fallbackId,
     sourceType: source.type,
     sourceUrl,
     field: 'profile',
@@ -1402,6 +1544,10 @@ function localSessionId(jobId, sourceType) {
 
 function evidenceId() {
   return `ev_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+}
+
+function safeEvidenceId(value) {
+  return `ev_${slugify(value || 'source').slice(0, 52)}_${stableHash(value || 'source')}`;
 }
 
 function evidenceDedupeKey(jobId, row) {

@@ -10,6 +10,7 @@ import { search as memorySearch, containerTagFor } from '../memory.js';
 import { briefToPitch } from '../briefToPitch.js';
 import { runCaller } from './caller.js';
 import { env } from '../env.js';
+import { classifyAgentPhoneFailure } from '../providers/agentphone.js';
 
 function parseBrief(briefJson) {
   if (!briefJson) return {};
@@ -36,7 +37,11 @@ async function fetchPriorCallSummary(leadId) {
  * @param {object} row  scheduled_calls row
  * @returns {Promise<{call_id: string|null, failure: string|null}>}
  */
-export async function runScheduledCaller(row) {
+function permanentScheduledFailure(reason) {
+  return /\b(lead_not_found|lead_has_no_phone|call refused|dnc:|invalid-number|blocked|auth)\b/i.test(String(reason || ''));
+}
+
+export async function runScheduledCaller(row, { callerFn = runCaller } = {}) {
   const lead = leads.get(row.lead_id);
   if (!lead) return { call_id: null, failure: 'lead_not_found' };
   if (!lead.phone) return { call_id: null, failure: 'lead_has_no_phone' };
@@ -59,7 +64,7 @@ export async function runScheduledCaller(row) {
   const pitch = briefToPitch(brief, { lead, profile: {} });
 
   try {
-    const result = await runCaller({
+    const result = await callerFn({
       leadId: row.lead_id,
       toPhone: lead.phone,
       pitchOverride: pitch,
@@ -69,7 +74,18 @@ export async function runScheduledCaller(row) {
     return { call_id: result?.callId || null, failure: result?.callId ? null : 'no_call_id_returned' };
   } catch (err) {
     const reason = err?.message || String(err);
-    log.error('scheduledCaller.runCaller_failed', { id: row.id, leadId: row.lead_id, error: reason });
-    return { call_id: null, failure: reason };
+    const failure = classifyAgentPhoneFailure(err);
+    const wrapped = new Error(reason);
+    wrapped.retryable = permanentScheduledFailure(reason) ? false : failure.retryable !== false;
+    wrapped.category = failure.category || 'unknown';
+    wrapped.reason = failure.reason || reason;
+    log.error('scheduledCaller.runCaller_failed', {
+      id: row.id,
+      leadId: row.lead_id,
+      error: reason,
+      retryable: wrapped.retryable,
+      category: wrapped.category
+    });
+    throw wrapped;
   }
 }

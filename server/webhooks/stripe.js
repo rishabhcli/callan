@@ -9,6 +9,7 @@ import {
   recordPaidPayment,
   stripePaymentDetails
 } from '../paymentFlow.js';
+import { createHandoffCaseFromPaymentFailure } from '../handoff.js';
 
 export function verifyStripe(rawBody, signatureHeader) {
   if (!env.stripe.webhookSecret) {
@@ -77,6 +78,7 @@ export function stripeWebhookEventId(_req, event = {}, normalized = normalizeStr
 
 export function processStripeWebhookEvent(event = {}, { req = null, startBuilder } = {}) {
   const normalized = normalizeStripeWebhook(event);
+  const object = event.data?.object || {};
   const eventId = stripeWebhookEventId(req, event, normalized);
   const recorded = webhookEvents.recordOnce({
     provider: 'stripe',
@@ -96,10 +98,23 @@ export function processStripeWebhookEvent(event = {}, { req = null, startBuilder
   });
 
   if (!normalized.paid) {
-    return { received: true, duplicate: false, eventId, normalized, paid: false };
+    const paymentFailure = isPaymentFailureStripeEvent(normalized.eventType, object);
+    const handoff = paymentFailure
+      ? createHandoffCaseFromPaymentFailure({ normalized, eventId, event })
+      : null;
+    if (handoff?.case) {
+      emit('stripe.payment_failed', {
+        worker: 'stripe',
+        leadId: normalized.leadId || null,
+        eventId,
+        invoiceId: normalized.invoiceId || null,
+        objectId: normalized.objectId || null,
+        handoffCaseId: handoff.case.id
+      });
+    }
+    return { received: true, duplicate: false, eventId, normalized, paid: false, paymentFailure, handoff: handoff?.case || null };
   }
 
-  const object = event.data?.object || {};
   const stripeId = normalized.invoiceId || normalized.sessionId || normalized.objectId || object.id;
   const paid = recordPaidPayment(
     stripeId,
@@ -127,6 +142,17 @@ export function isPaidStripeEvent(eventType, object = {}) {
   }
   if (eventType === 'invoice.paid' || eventType === 'invoice.payment_succeeded') return true;
   return false;
+}
+
+export function isPaymentFailureStripeEvent(eventType, object = {}) {
+  const type = String(eventType || '');
+  if ([
+    'invoice.payment_failed',
+    'payment_intent.payment_failed',
+    'checkout.session.async_payment_failed'
+  ].includes(type)) return true;
+  const status = String(object.status || object.payment_status || '').toLowerCase();
+  return ['failed', 'requires_payment_method', 'uncollectible', 'past_due'].includes(status);
 }
 
 function firstString(...values) {

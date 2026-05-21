@@ -348,6 +348,8 @@ export function classifyGeminiFailure(err) {
 
 function normalizedGeminiThrow(action, lastError) {
   return geminiError(`gemini.${action} failed: ${lastError?.message || 'all models failed'}`, {
+    provider: PROVIDER,
+    action,
     status: lastError?.status,
     code: lastError?.code,
     retryable: lastError?.retryable,

@@ -124,7 +124,7 @@ async function retrieveGlobalCompliance(intent, { topK = 2, alpha = 0.78, callId
     },
     {
       id: 'global.email_capture',
-      text: 'When the owner gives you an email for the invoice, capture it and tell them the invoice is sending now. Do NOT read it back or ask them to confirm — just send the invoice.',
+      text: 'When the owner gives you an email for the invoice, read it back exactly and ask them to confirm before saying the invoice is sending.',
       metadata: { kind: 'compliance', title: 'Email capture', complianceIntent: 'email_capture' }
     }
   ];

@@ -14,9 +14,11 @@ import {
   replyAgentMailMessage
 } from '../providers/agentmail.js';
 import { classifyGrowthReply } from '../growth/replyPolicy.js';
+import { classifyCommerceRequest, recordCommerceEmailRequest } from '../commerce/index.js';
 import { classifyScheduleRequest } from './scheduleClassifier.js';
 import { callingWindowStatus, markLeadConsentApproved } from '../compliance.js';
 import { createScheduledCall, cancelScheduledCall } from '../scheduledCalls.js';
+import { classifyHandoffRisk } from '../handoff.js';
 
 export { fetchAgentMailIncomingMessages };
 
@@ -29,7 +31,9 @@ const SUPPORTED_SCOPES = Object.freeze([
   'revisions',
   'pricing',
   'build progress',
+  'commerce setup',
   'opt-out',
+  'source provenance',
   'growth follow-up'
 ]);
 
@@ -37,6 +41,7 @@ const UNSUPPORTED_SCOPES = Object.freeze([
   'legal',
   'custom contract',
   'refund threat',
+  'refund/cancellation policy',
   'security issue',
   'tax',
   'guarantees',
@@ -50,7 +55,9 @@ const SUPPORTED_SCOPE = [
   'website revisions',
   'pricing',
   'build progress',
+  'commerce setup',
   'opt-out or unsubscribe',
+  'where we found the business/contact source',
   'post-delivery growth follow-up'
 ].join(', ');
 
@@ -195,11 +202,19 @@ const UNSUPPORTED_SCOPE_PATTERNS = Object.freeze([
   {
     scope: 'refund threat',
     patterns: [
-      /\brefund\b/i,
       /\bchargeback\b/i,
       /\bdispute\s+(?:the\s+)?(?:charge|payment|invoice)\b/i,
       /\bthreaten(?:ing)?\s+(?:a\s+)?refund\b/i,
-      /\bget\s+my\s+money\s+back\b/i
+      /\bget\s+my\s+money\s+back\b/i,
+      /\brefund\s+(?:me|us|now|or|if|unless)\b/i
+    ]
+  },
+  {
+    scope: 'refund/cancellation policy',
+    patterns: [
+      /\b(write|draft|create|generate|decide|advise|recommend|review).{0,80}\b(refund|return|cancellation)\b/i,
+      /\b(refund|return|cancellation).{0,80}\b(policy|terms).{0,80}\b(write|draft|legal|advise|recommend|review|what should|can you make)\b/i,
+      /\bwhat should.{0,80}\b(refund|return|cancellation)\b/i
     ]
   },
   {
@@ -348,6 +363,40 @@ const SUPPORTED_SCOPE_PATTERNS = Object.freeze([
     ]
   },
   {
+    scope: 'commerce setup',
+    patterns: [
+      /\bcommerce\b/i,
+      /\bproducts?\b/i,
+      /\bcatalog\b/i,
+      /\bmenu\b/i,
+      /\bprices?\b/i,
+      /\bprice\s+range\b/i,
+      /\bpackages?\b/i,
+      /\bservice\s+package\b/i,
+      /\bdeposit\b/i,
+      /\bpayment\s+link\b/i,
+      /\bcheckout\b/i,
+      /\bmembership\b/i,
+      /\bsubscription\b/i,
+      /\bdelivery\b/i,
+      /\bpickup\b/i,
+      /\bpick\s+up\b/i,
+      /\bfulfillment\b/i,
+      /\brefund\s+policy\s+(?:is|:)\b/i,
+      /\bcancellation\s+policy\s+(?:is|:)\b/i
+    ]
+  },
+  {
+    scope: 'source provenance',
+    patterns: [
+      /\bwhere\s+did\s+you\s+get\s+(?:my|our|this)\s+(?:number|phone|email|contact)\b/i,
+      /\bhow\s+did\s+you\s+(?:get|find)\s+(?:my|our|this)\s+(?:number|phone|email|contact)\b/i,
+      /\bwhy\s+(?:are|were)\s+you\s+(?:calling|emailing|contacting)\s+(?:me|us)\b/i,
+      /\bwhy\s+did\s+you\s+contact\s+(?:me|us)\b/i,
+      /\bwhere\s+did\s+you\s+find\s+(?:me|us|my business|our business)\b/i
+    ]
+  },
+  {
     scope: 'brief',
     patterns: [
       /\bbrief\b/i,
@@ -450,6 +499,32 @@ export async function handleAgentMailInbound(body = {}, {
     }
   }
 
+  let commerceOutcome = null;
+  if (
+    leadId &&
+    resolvedLead &&
+    classification?.scope === 'commerce setup' &&
+    classification?.kind === 'supported' &&
+    !classification?.operatorFlag
+  ) {
+    try {
+      commerceOutcome = await recordCommerceEmailRequest({
+        leadId,
+        subject: msg.subject || '',
+        text: bodyText || '',
+        threadId: msg.threadId || null,
+        providerId: msg.messageId || null
+      });
+      if (commerceOutcome?.planned) {
+        classification.replyText = fallbackSupportedReply('commerce setup');
+      }
+    } catch (err) {
+      log.warn('agentmail.commerce.handler_failed', {
+        leadId, threadId: msg.threadId, error: err?.message || String(err)
+      });
+    }
+  }
+
   const replyText = await draftReply({ lead: resolvedLead, msg, classification, forceFallbackReply });
   const sendResult = await sendReply({ msg, text: replyText, classification, forceMockSend, leadId });
   if (leadId) persistThreadForLead(leadId, sendResult.threadId || msg.threadId, resolvedLead);
@@ -487,10 +562,16 @@ export async function handleAgentMailInbound(body = {}, {
       scheduledCallId: scheduleOutcome.scheduledCallId || null,
       scheduledAtMs: scheduleOutcome.scheduledAtMs || null,
       reason: scheduleOutcome.reason || null
+    } : null,
+    commerce: commerceOutcome ? {
+      planned: !!commerceOutcome.planned,
+      type: commerceOutcome.plan?.type || commerceOutcome.classification?.type || null,
+      commercePlanId: commerceOutcome.row?.id || null,
+      handoffRequired: !!commerceOutcome.plan?.humanHandoff?.required
     } : null
   });
 
-  return { ignored: false, leadId, replyText, classification, sendResult, scheduleOutcome };
+  return { ignored: false, leadId, replyText, classification, sendResult, scheduleOutcome, commerceOutcome };
 }
 
 const MAX_FUTURE_DAYS = 7;
@@ -742,6 +823,8 @@ export function classifyMessage(input = '') {
   const unsupportedMatches = matchingScopePatterns(policyText, UNSUPPORTED_SCOPE_PATTERNS);
   const supportedMatches = matchingScopePatterns(policyText, SUPPORTED_SCOPE_PATTERNS);
   const growthReply = classifyGrowthReply({ subject, text });
+  const commerceRequest = classifyCommerceRequest({ subject, text });
+  const handoffRisk = classifyHandoffRisk({ subject, text, source: 'mailReply' });
 
   if (optOutMatches.length || growthReply.kind === 'unsubscribe') {
     return classificationResult({
@@ -756,25 +839,73 @@ export function classifyMessage(input = '') {
         supported: ['opt-out'],
         unsupported: unsupportedMatches.map((m) => m.scope)
       },
-      growthReply
+      growthReply,
+      commerceRequest
     });
   }
 
-  if (unsupportedMatches.length) {
+  if (unsupportedMatches.length || handoffRisk.caseRequired || commerceRequest.kind === 'handoff') {
     const scope = unsupportedMatches[0]?.scope;
+    const riskScope = handoffRisk.category ? handoffRisk.category.replace(/_/g, ' ') : null;
+    const commerceScope = commerceRequest.kind === 'handoff' ? commerceRequest.scope : null;
+    const allUnsupported = unique([
+      ...unsupportedMatches.map((m) => m.scope),
+      ...(riskScope ? [riskScope] : []),
+      ...(commerceScope ? [commerceScope] : [])
+    ]);
     return classificationResult({
       kind: 'handoff',
-      scope,
-      scopes: unique(unsupportedMatches.map((m) => m.scope)),
+      scope: scope || riskScope || commerceScope || 'weird request',
+      scopes: allUnsupported,
       supported: false,
       operatorFlag: true,
       replyMode: 'safe_handoff',
-      reason: `unsupported scope: ${scope}`,
+      reason: scope ? `unsupported scope: ${scope}` : commerceRequest.kind === 'handoff' ? commerceRequest.reason : handoffRisk.reason,
       matches: {
         supported: supportedMatches.map((m) => m.scope),
-        unsupported: unsupportedMatches.map((m) => m.scope)
+        unsupported: allUnsupported
       },
-      growthReply
+      growthReply,
+      commerceRequest
+    });
+  }
+
+  const nonCommerceSupportedMatches = supportedMatches.filter((m) => m.scope !== 'commerce setup');
+  if (nonCommerceSupportedMatches.length) {
+    const scope = nonCommerceSupportedMatches[0].scope;
+    const scopes = unique(nonCommerceSupportedMatches.map((m) => m.scope));
+    return classificationResult({
+      kind: 'supported',
+      scope,
+      scopes,
+      supported: true,
+      operatorFlag: false,
+      replyMode: 'autonomous_reply',
+      reason: `supported scope: ${scope}`,
+      matches: {
+        supported: scopes,
+        unsupported: []
+      },
+      growthReply,
+      commerceRequest
+    });
+  }
+
+  if (commerceRequest.kind === 'supported') {
+    return classificationResult({
+      kind: 'supported',
+      scope: 'commerce setup',
+      scopes: unique(['commerce setup', commerceRequest.type]),
+      supported: true,
+      operatorFlag: false,
+      replyMode: 'autonomous_reply',
+      reason: commerceRequest.reason,
+      matches: {
+        supported: unique(['commerce setup', commerceRequest.type]),
+        unsupported: []
+      },
+      growthReply,
+      commerceRequest
     });
   }
 
@@ -792,7 +923,8 @@ export function classifyMessage(input = '') {
         supported: [scope, 'growth follow-up'],
         unsupported: []
       },
-      growthReply
+      growthReply,
+      commerceRequest
     });
   }
 
@@ -811,7 +943,8 @@ export function classifyMessage(input = '') {
         supported: scopes,
         unsupported: []
       },
-      growthReply
+      growthReply,
+      commerceRequest
     });
   }
 
@@ -828,7 +961,8 @@ export function classifyMessage(input = '') {
         supported: [],
         unsupported: ['growth follow-up']
       },
-      growthReply
+      growthReply,
+      commerceRequest
     });
   }
 
@@ -844,7 +978,8 @@ export function classifyMessage(input = '') {
       supported: [],
       unsupported: ['weird request']
     },
-    growthReply
+    growthReply,
+    commerceRequest
   });
 }
 
@@ -879,7 +1014,8 @@ export async function decideEmailReply({
     `Supported autonomous scopes: ${SUPPORTED_SCOPE}.`,
     `Unsupported scopes: ${UNSUPPORTED_SCOPES.join(', ')}.`,
     `Opt-out requests must be kind="opt_out" and replyMode="opt_out_confirmation".`,
-    `Legal, custom contract, refund threats, security issues, tax, SEO/revenue guarantees, banking, medical, or weird requests must be safe handoff.`,
+    `Questions like "where did you get my number?" or "why did you contact me?" are supported source-provenance requests: answer from stored lead/source evidence and include opt-out language.`,
+    `Legal, custom contract, refund threats, refund/cancellation policy advice, security issues, tax, SEO/revenue guarantees, banking, medical, or weird requests must be safe handoff.`,
     `Reply text must be concise, no markdown, no subject line, no unsupported promises.`
   ].join('\n');
 
@@ -914,10 +1050,10 @@ async function draftReply({ lead, msg, classification, forceFallbackReply = fals
     return safeHandoffResponse();
   }
   if (forceFallbackReply) {
-    return fallbackSupportedReply(classification.scope);
+    return fallbackSupportedReply(classification.scope, lead);
   }
 
-  return fallbackSupportedReply(classification.scope);
+  return fallbackSupportedReply(classification.scope, lead);
 }
 
 async function sendReply({ msg, text, classification, forceMockSend = false, leadId = null }) {
@@ -988,7 +1124,7 @@ function matchingScopePatterns(text, scopePatterns) {
     .filter((entry) => entry.matched > 0);
 }
 
-function classificationResult({ kind, scope, scopes, supported, operatorFlag, replyMode, reason, matches, growthReply = null }) {
+function classificationResult({ kind, scope, scopes, supported, operatorFlag, replyMode, reason, matches, growthReply = null, commerceRequest = null }) {
   return {
     schemaVersion: CLASSIFICATION_SCHEMA_VERSION,
     kind,
@@ -1004,7 +1140,8 @@ function classificationResult({ kind, scope, scopes, supported, operatorFlag, re
     },
     supportedScopes: SUPPORTED_SCOPES,
     unsupportedScopes: UNSUPPORTED_SCOPES,
-    growthReply
+    growthReply,
+    commerceRequest
   };
 }
 
@@ -1042,6 +1179,8 @@ function normalizeModelEmailDecision(model, deterministic, { trace } = {}) {
     },
     supportedScopes: SUPPORTED_SCOPES,
     unsupportedScopes: UNSUPPORTED_SCOPES,
+    growthReply: deterministic.growthReply || null,
+    commerceRequest: deterministic.commerceRequest || null,
     replyText: cleanReplyText(model.replyText),
     confidence: model.confidence ?? 0.7,
     sourceEvidence: model.sourceEvidence || [],
@@ -1064,7 +1203,10 @@ function cleanReplyText(value) {
   return text.slice(0, 1200);
 }
 
-function fallbackSupportedReply(scope) {
+function fallbackSupportedReply(scope, lead = null) {
+  if (scope === 'source provenance') {
+    return sourceProvenanceReply(lead);
+  }
   if (scope === 'invoice') {
     return 'Thanks for the note. I can help with invoice and payment questions right here. Send over what you are seeing on the invoice or checkout page and I will keep it moving.';
   }
@@ -1083,11 +1225,23 @@ function fallbackSupportedReply(scope) {
   if (scope === 'build progress') {
     return 'Thanks for checking in. I can help with build progress, preview links, and launch status here. I will keep the next update focused on where the site stands.';
   }
-  return 'Thanks for the note. The invoice, scheduling, website brief, revisions, pricing, and build progress can all be handled right here in this thread. Send any details you want reflected on the site and I will keep the build moving.';
+  if (scope === 'commerce setup') {
+    return 'Got it. I captured those commerce details for the site plan. We can show an honest inquiry or request flow now; any real customer payment link, tax handling, refund policy, or regulated-commerce setup will stay with the operator until the business approves it.';
+  }
+  return 'Thanks for the note. The invoice, scheduling, website brief, revisions, pricing, build progress, commerce setup, source questions, and opt-outs can all be handled right here in this thread. Send any details you want reflected on the site and I will keep the build moving.';
+}
+
+function sourceProvenanceReply(lead) {
+  const source = lead?.source_url || lead?.website || null;
+  const business = lead?.business_name || 'your business';
+  const sourceLine = source
+    ? `The source attached to this contact is ${source}.`
+    : 'The source record attached to this contact does not include a public URL, so I have flagged the operator to review it before any further outreach.';
+  return `We contacted ${business} because our research marked it as a public business lead that might benefit from a clearer website/contact path. ${sourceLine} If you want us to stop, reply "unsubscribe" or "opt out" and we will stop calls and emails.`;
 }
 
 function safeHandoffResponse() {
-  return 'Thanks for asking. I can only handle invoice questions, scheduling, website briefs, revisions, pricing, build progress, and opt-outs in this automated thread. I have flagged the operator and paused the automated handling so a human can review this safely.';
+  return 'Thanks for asking. I can only handle invoice questions, scheduling, website briefs, revisions, pricing, commerce setup, build progress, and opt-outs in this automated thread. I have flagged the operator and paused the automated handling so a human can review this safely.';
 }
 
 function unique(values) {

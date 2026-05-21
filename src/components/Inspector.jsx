@@ -3,10 +3,12 @@ import Transcript from './Transcript.jsx';
 import MemoryDoc from './MemoryDoc.jsx';
 import MemoryConsole from './MemoryConsole.jsx';
 import GrowthConsole from './GrowthConsole.jsx';
+import CommerceConsole from './CommerceConsole.jsx';
+import AccountManagerConsole from './AccountManagerConsole.jsx';
 import BuildQAConsole from './BuildQAConsole.jsx';
 import { api } from '../api.js';
 
-const TABS = ['Memory', 'Caller', 'Moss', 'Analyst', 'Mailer', 'Builder', 'Growth'];
+const TABS = ['Handoff', 'Trust', 'Memory', 'Caller', 'Moss', 'Analyst', 'Mailer', 'Builder', 'Growth', 'Commerce', 'Aftercare'];
 
 function parseDoc(doc) {
   if (!doc) return null;
@@ -76,6 +78,11 @@ function sourceCandidates(lead, profile) {
       return true;
     })
     .map(([label, url]) => ({ label, url }));
+}
+
+function leadIntelligenceFromDetail(detail) {
+  const profile = profileFromDetail(detail);
+  return profile?.leadIntelligence || detail?.researchProfile?.leadIntelligence || null;
 }
 
 function isExternalUrl(value) {
@@ -330,6 +337,15 @@ export default function Inspector({
           </div>
         ) : (
           <>
+            {activeTab === 'Handoff' && (
+              <HandoffTab
+                detail={leadDetail}
+                focusedLeadId={focusedLeadId}
+                onLeadChanged={onLeadChanged}
+                onRetryBuild={onRetryBuild}
+              />
+            )}
+            {activeTab === 'Trust' && <TrustTab detail={leadDetail} outreach={outreach} />}
             {activeTab === 'Memory'  && <MemoryTab detail={leadDetail} />}
             {activeTab === 'Caller'  && (
               <CallerTab
@@ -358,6 +374,20 @@ export default function Inspector({
                 onLeadChanged={onLeadChanged}
               />
             )}
+            {activeTab === 'Commerce' && (
+              <CommerceConsole
+                detail={leadDetail}
+                focusedLeadId={focusedLeadId}
+                onLeadChanged={onLeadChanged}
+              />
+            )}
+            {activeTab === 'Aftercare' && (
+              <AccountManagerConsole
+                detail={leadDetail}
+                focusedLeadId={focusedLeadId}
+                onLeadChanged={onLeadChanged}
+              />
+            )}
           </>
         )}
       </div>
@@ -378,6 +408,7 @@ function LeadHero({ leadId, detail, builderInfo, builderAction, outreach, onStar
   const containerTag = lead.container_tag || '—';
   const phone = lead.phone || profile?.phone || '—';
   const busyBuild = builderAction?.running && builderAction?.leadId === leadId;
+  const openHandoffs = detail?.handoff?.openCases || [];
 
   return (
     <section className="lead-hero">
@@ -399,6 +430,7 @@ function LeadHero({ leadId, detail, builderInfo, builderAction, outreach, onStar
           <span className={`lead-hero-chip lead-hero-chip-${callability.tone}`}>{callability.label}</span>
           {busyBuild ? <span className="lead-hero-chip lead-hero-chip-warn">build starting</span> : null}
           {builderState.authNeeded ? <span className="lead-hero-chip lead-hero-chip-bad">auth needed</span> : null}
+          {openHandoffs.length ? <span className="lead-hero-chip lead-hero-chip-warn">{openHandoffs.length} handoff</span> : null}
           <ActionMenu
             leadId={leadId}
             detail={detail}
@@ -829,6 +861,231 @@ function buildProofMode(builderState) {
   return { label: 'not built', tone: 'muted', mode };
 }
 
+function TrustTab({ detail, outreach }) {
+  const trust = detail?.trust;
+  if (!trust) {
+    return (
+      <div className="empty-inspector">
+        <div className="hd">trust</div>
+        <div className="mono note">// trust ledger will appear after lead state loads.</div>
+      </div>
+    );
+  }
+  const throttle = trust.reputationThrottleState || {};
+  const operator = trust.operatorState || {};
+  const blockers = trust.blockers || [];
+  const events = trust.events || [];
+  const data = trust.privacySafeData || {};
+
+  return (
+    <div className="trust-panel">
+      <section className="trust-card">
+        <div className="trust-card-head">
+          <span className="hd">why contacted</span>
+          <span className={`decision ${blockers.length ? 'decision-blocked' : 'decision-callable'}`}>
+            {blockers.length ? `${blockers.length} blocker${blockers.length === 1 ? '' : 's'}` : 'clear'}
+          </span>
+        </div>
+        <p className="trust-copy">{trust.whyContacted}</p>
+        <div className="trust-source-list">
+          {(trust.sourceEvidence || []).slice(0, 4).map((item) => (
+            <div key={`${item.label}:${item.url || item.note}`} className="reason-row">
+              <span className="reason-code mono">{item.label}</span>
+              <span className="reason-text">{item.url ? <a href={item.url} target="_blank" rel="noreferrer">{item.host || item.url}</a> : item.note}</span>
+              <span className="reason-source mono">source</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="trust-grid">
+        <TrustCell label="consent" value={trust.consentStatus} />
+        <TrustCell label="opt-out" value={trust.optOutStatus?.optedOut ? 'recorded' : 'not recorded'} tone={trust.optOutStatus?.optedOut ? 'bad' : 'good'} />
+        <TrustCell label="invoice consent" value={trust.invoiceConsent?.recorded ? 'recorded' : 'missing'} tone={trust.invoiceConsent?.recorded ? 'good' : 'muted'} />
+        <TrustCell label="reputation" value={throttle.ok === false ? 'throttled' : 'ok'} tone={throttle.ok === false ? 'bad' : 'good'} />
+        <TrustCell label="pause state" value={operator.paused || outreach?.paused ? 'paused' : 'running/idle'} tone={operator.paused || outreach?.paused ? 'bad' : 'muted'} />
+        <TrustCell label="phone" value={`${data.phone || '—'} · ${data.phoneClassification || 'unknown'}`} />
+      </section>
+
+      <section className="operator-reasons trust-reasons">
+        {(blockers.length ? blockers : [{ code: 'TRUST_CLEAR', reason: 'No trust blocker is active for this lead.', source: 'trust' }]).map((blocker) => (
+          <div key={`${blocker.code}:${blocker.reason}`} className="reason-row">
+            <span className="reason-code mono">{blocker.code}</span>
+            <span className="reason-text">{blocker.reason}</span>
+            <span className="reason-source mono">{blocker.source}</span>
+          </div>
+        ))}
+      </section>
+
+      <section className="trust-card">
+        <div className="trust-card-head">
+          <span className="hd">receipts</span>
+          <span className="mono note">{events.length} ledger rows</span>
+        </div>
+        <div className="proof-events">
+          {events.slice(0, 10).map((event) => (
+            <div key={event.id} className="proof-event">
+              <span className="proof-event-time mono">{formatWhen(event.created_at)}</span>
+              <span className="proof-event-source proof-event-muted">{event.channel || event.actor || 'trust'}</span>
+              <span className="proof-event-label">{labelize(event.event_type)} · {event.summary}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="trust-card">
+        <div className="trust-card-head">
+          <span className="hd">customer answer</span>
+          <span className="mono note">privacy-safe</span>
+        </div>
+        <p className="trust-copy">
+          {trust.optOutStatus?.optedOut
+            ? 'This person is opted out. Do not call or email again.'
+            : 'If asked why Callan reached out, use the source evidence above, the disclosure below, and offer opt-out immediately.'}
+        </p>
+        <div className="trust-disclosure">{trust.lastDisclosure || 'No disclosure text recorded yet.'}</div>
+      </section>
+    </div>
+  );
+}
+
+function TrustCell({ label, value, tone = 'muted' }) {
+  return (
+    <div className={`trust-cell trust-cell-${tone}`}>
+      <span className="mono">{label}</span>
+      <strong>{value || '—'}</strong>
+    </div>
+  );
+}
+
+function HandoffTab({ detail, focusedLeadId, onLeadChanged, onRetryBuild }) {
+  const cases = detail?.handoff?.cases || [];
+  const open = detail?.handoff?.openCases || cases.filter((item) => !['resolved', 'closed'].includes(item.status));
+
+  if (!focusedLeadId) {
+    return (
+      <div className="empty-inspector">
+        <div className="hd">handoff</div>
+        <div className="mono note">// focus a lead to see operator cases.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="handoff-tab">
+      <div className="handoff-tab-head">
+        <div>
+          <div className="hd">operator copilot</div>
+          <div className="handoff-tab-copy">
+            {open.length ? `${open.length} open case${open.length === 1 ? '' : 's'} need human judgment.` : 'No open handoff cases for this lead.'}
+          </div>
+        </div>
+        <span className={`handoff-tab-count ${open.length ? 'is-hot' : ''}`}>{open.length}</span>
+      </div>
+      {cases.length ? (
+        <div className="handoff-case-list">
+          {cases.map((item) => (
+            <HandoffCaseCard
+              key={item.id}
+              item={item}
+              focusedLeadId={focusedLeadId}
+              onLeadChanged={onLeadChanged}
+              onRetryBuild={onRetryBuild}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="thread-empty mono">// legal, refund, auth-wall, QA, payment, and provider handoffs will appear here.</div>
+      )}
+    </div>
+  );
+}
+
+function HandoffCaseCard({ item, focusedLeadId, onLeadChanged, onRetryBuild }) {
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+  const [reply, setReply] = useState(item.copilot?.draftReply || '');
+
+  async function run(action, extra = {}) {
+    setBusy(action);
+    setError(null);
+    try {
+      await api.handoffAction(item.id, { action, ...extra });
+      onLeadChanged?.(focusedLeadId);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const citations = item.copilot?.evidenceCitations || (item.evidence || []).map((ev) => `${ev.source}:${ev.ref || ''}`);
+  return (
+    <article className={`handoff-case-card handoff-severity-${item.severity}`}>
+      <div className="handoff-case-top">
+        <div>
+          <div className="handoff-case-kicker mono">{item.severity} · {labelize(item.category)} · {item.status}</div>
+          <div className="handoff-case-title">{item.summary}</div>
+        </div>
+        <span className="handoff-case-id mono">{item.id}</span>
+      </div>
+
+      <div className="handoff-copilot">
+        <div>
+          <div className="outcome-key mono">safest next action</div>
+          <div className="handoff-copy">{item.copilot?.safestNextAction || item.recommended_action}</div>
+        </div>
+        <div>
+          <div className="outcome-key mono">why not autonomous</div>
+          <div className="handoff-copy">{item.copilot?.whyNotAutonomous || 'The case needs human judgment before automation continues.'}</div>
+        </div>
+      </div>
+
+      {citations.length ? (
+        <div className="handoff-evidence">
+          {citations.slice(0, 5).map((citation) => (
+            <span key={`${item.id}:${citation}`} className="growth-evidence-pill mono">{citation}</span>
+          ))}
+        </div>
+      ) : null}
+
+      {item.copilot?.draftReply ? (
+        <label className="handoff-rewrite">
+          <span className="outcome-key mono">draft reply</span>
+          <textarea value={reply} onChange={(event) => setReply(event.target.value)} />
+        </label>
+      ) : null}
+
+      <div className="handoff-actions">
+        {item.copilot?.draftReply ? (
+          <>
+            <button className="btn btn-mini" disabled={!!busy} onClick={() => run('approve_reply')}>approve reply</button>
+            <button className="btn btn-mini" disabled={!!busy || !reply.trim()} onClick={() => run('rewrite_send_reply', { body: reply })}>send rewrite</button>
+            <button className="btn btn-mini" disabled={!!busy} onClick={() => run('reject_reply')}>reject draft</button>
+          </>
+        ) : null}
+        <button className="btn btn-mini" disabled={!!busy} onClick={() => run('pause_automation')}>pause lead</button>
+        <button className="btn btn-mini" disabled={!!busy} onClick={() => run('assign_callback', { scheduledAtMs: Date.now() + 15 * 60_000 })}>callback</button>
+        <button className="btn btn-mini" disabled={!!busy} onClick={() => run('retry_build')}>retry build</button>
+        <button className="btn btn-mini btn-primary" disabled={!!busy} onClick={() => run('resolve', { resumeAutomation: true })}>resolve + resume</button>
+      </div>
+      {error ? <div className="operator-error mono">{error}</div> : null}
+
+      {item.actions?.length ? (
+        <div className="handoff-timeline">
+          {item.actions.map((action) => (
+            <div key={action.id} className="handoff-timeline-row">
+              <span className="mono">{formatWhen(action.created_at)}</span>
+              <span>{labelize(action.action)}</span>
+              <span className="mono">{action.actor}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function MemoryTab({ detail }) {
   const mem = detail?.memory;
   const lead = detailLead(detail);
@@ -852,6 +1109,7 @@ function MemoryTab({ detail }) {
           {mem ? (
             <>
               <MemoryDoc kind="profile"     doc={mem.business_profile?.[0] || mem.profile?.[0]}     defaultOpen />
+              <MemoryDoc kind="research_evidence" doc={mem.research_evidence?.[0]} />
               <MemoryDoc kind="pitch"       doc={mem.pitch?.[0]}       />
               <MemoryDoc kind="call_log"    doc={mem.call_transcript?.[0] || mem.call_log?.[0]}    />
               <MemoryDoc kind="post_mortem" doc={mem.call_analysis?.[0] || mem.post_mortem?.[0]} />
@@ -979,6 +1237,7 @@ function ResearchEvidencePanel({ detail }) {
   const presence = presenceFromEvidence(lead, profile);
   const callability = explainCallability(lead, profile);
   const sources = sourceCandidates(lead, profile);
+  const intelligence = leadIntelligenceFromDetail(detail);
   const businessName = profile?.businessName || lead.business_name || 'focused lead';
   const summary = profile?.onlinePresenceSummary || (
     profile?.hasWebsite === false
@@ -988,6 +1247,17 @@ function ResearchEvidencePanel({ detail }) {
   const sourceRows = sources.length ? sources : [{ label: 'source', url: null }];
   const signals = (profile?.signals || []).slice(0, 5);
   const needs = (profile?.needs || []).slice(0, 4);
+  const evidenceRows = intelligence?.evidence || [];
+  const reviewThemes = intelligence?.reviewThemes || [];
+  const competitorGaps = intelligence?.competitorComparison || [];
+  const websiteIssues = intelligence?.currentWebsiteIssues || [];
+  const scoreRows = [
+    ['presence weakness', intelligence?.scores?.presenceWeakness],
+    ['urgency', intelligence?.scores?.urgency],
+    ['website value', intelligence?.scores?.websiteValue],
+    ['contactability', intelligence?.scores?.contactability],
+    ['vertical fit', intelligence?.scores?.verticalFit]
+  ].filter(([, value]) => value);
 
   return (
     <section className={`research-panel research-panel-${callability.tone}`}>
@@ -1045,6 +1315,65 @@ function ResearchEvidencePanel({ detail }) {
         </div>
       </div>
 
+      {intelligence?.callOpener?.text ? (
+        <div className="research-opener">
+          <div className="research-key mono">exact evidence-based opener</div>
+          <div className="research-opener-text">"{intelligence.callOpener.text}"</div>
+          <div className="research-citation-row mono">
+            {(intelligence.callOpener.evidenceIds || []).map((id) => <span key={id}>{id}</span>)}
+          </div>
+        </div>
+      ) : null}
+
+      {scoreRows.length ? (
+        <div className="research-score-strip">
+          {scoreRows.map(([label, value]) => (
+            <div key={label} className="research-score">
+              <span className="research-score-label mono">{label}</span>
+              <strong>{value.score}</strong>
+              <small>{value.reason}</small>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {reviewThemes.length || competitorGaps.length || websiteIssues.length ? (
+        <div className="research-card-grid">
+          {reviewThemes.slice(0, 3).map((item) => (
+            <EvidenceCard key={item.id} type="review theme" item={item} />
+          ))}
+          {competitorGaps.slice(0, 3).map((item) => (
+            <EvidenceCard key={item.id} type="competitor gap" item={item} />
+          ))}
+          {websiteIssues.slice(0, 3).map((item) => (
+            <EvidenceCard key={item.id} type="website issue" item={item} />
+          ))}
+        </div>
+      ) : null}
+
+      {evidenceRows.length ? (
+        <details className="research-explorer">
+          <summary>
+            <span className="mono">evidence explorer</span>
+            <span>{evidenceRows.length} cited sources</span>
+          </summary>
+          <div className="research-explorer-body">
+            {evidenceRows.slice(0, 12).map((item) => (
+              <div key={item.id} className="research-explorer-row">
+                <div className="research-explorer-id mono">{item.id}</div>
+                <div>
+                  <div className="research-explorer-claim">{item.claim || item.quote}</div>
+                  <div className="research-explorer-meta mono">
+                    {item.sourceType} · conf {Math.round((item.confidence || 0) * 100)}%
+                    {item.sourceUrl ? <> · <a href={item.sourceUrl} target="_blank" rel="noreferrer">{item.sourceUrl}</a></> : null}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+
       {signals.length || needs.length ? (
         <div className="research-evidence-list">
           {signals.map((signal) => (
@@ -1059,6 +1388,19 @@ function ResearchEvidencePanel({ detail }) {
   );
 }
 
+function EvidenceCard({ type, item }) {
+  return (
+    <article className="research-card">
+      <div className="research-card-type mono">{type}</div>
+      <div className="research-card-title">{item.title || item.summary || item.claim}</div>
+      <div className="research-card-copy">{item.summary || item.claim}</div>
+      <div className="research-citation-row mono">
+        {(item.evidenceIds || []).slice(0, 4).map((id) => <span key={id}>{id}</span>)}
+      </div>
+    </article>
+  );
+}
+
 function CallerTab({ detail, liveTranscript, liveCallId, liveCallActive }) {
   const calls = detail?.calls || [];
   const latestCall = calls[0];
@@ -1068,6 +1410,7 @@ function CallerTab({ detail, liveTranscript, liveCallId, liveCallActive }) {
   const postMortem = useMemo(() => getPostMortem(detail), [detail]);
   const invoiceSignal = useMemo(() => invoiceEmailSignal(postMortem, mailEvents), [postMortem, mailEvents]);
   const questions = useMemo(() => uniqueQuestions(postMortem, mailEvents), [postMortem, mailEvents]);
+  const callState = detail?.callState || null;
 
   const [showPitch, setShowPitch] = useState(false);
 
@@ -1098,6 +1441,7 @@ function CallerTab({ detail, liveTranscript, liveCallId, liveCallActive }) {
           ) : 'no calls yet'}
         </div>
       </div>
+      <CallStatePanel callState={callState} />
       <Transcript turns={turns} live={showLive} empty="// awaiting first turn." />
       <CallOutcomePanel
         latestCall={latestCall}
@@ -1122,6 +1466,74 @@ function CallerTab({ detail, liveTranscript, liveCallId, liveCallActive }) {
         </div>
       )}
     </div>
+  );
+}
+
+function CallStatePanel({ callState }) {
+  if (!callState?.currentState && !callState?.timeline?.length) {
+    return (
+      <section className="call-state-panel call-state-empty">
+        <div className="call-state-head">
+          <div>
+            <div className="hd">sales state</div>
+            <div className="call-state-sub mono">waiting for caller.state</div>
+          </div>
+        </div>
+      </section>
+    );
+  }
+  const safety = callState.safety || {};
+  const safetyTone = safety.safe === false ? 'bad' : safety.code === 'blocked' || safety.code === 'opt-out' ? 'bad' : safety.safe ? 'good' : 'warn';
+  const snippet = callState.mossSnippet;
+  const compliance = callState.complianceState || {};
+  const detectors = callState.detectors || [];
+  return (
+    <section className="call-state-panel">
+      <div className="call-state-head">
+        <div>
+          <div className="hd">sales state</div>
+          <div className="call-state-sub mono">{callState.callId || 'no call'} · {callState.transitionReason || 'state machine'}</div>
+        </div>
+        <div className="call-state-chips">
+          <span className="proof-chip proof-chip-live">{labelize(callState.currentState || 'unknown')}</span>
+          <span className={`proof-chip proof-chip-${safetyTone}`}>{safety.safe === false ? 'unsafe' : safety.safe ? 'safe' : 'caution'}</span>
+        </div>
+      </div>
+      <div className="call-state-grid">
+        <div className="outcome-cell call-state-wide">
+          <div className="outcome-key mono">next line</div>
+          <div className="call-state-line">{callState.nextLine || 'No next line yet.'}</div>
+        </div>
+        <div className="outcome-cell">
+          <div className="outcome-key mono">objection</div>
+          <div className="call-state-line">{labelize(callState.objection || detectors[0]?.type || 'none')}</div>
+        </div>
+        <div className="outcome-cell">
+          <div className="outcome-key mono">compliance</div>
+          <div className="call-state-line">{labelize(compliance.state || (compliance.recordingDisclosed ? 'compliant' : 'unknown'))}</div>
+          <div className="outcome-note">{compliance.copy || (compliance.emailReadbackRequired ? 'email readback required' : 'no compliance copy')}</div>
+        </div>
+        <div className="outcome-cell">
+          <div className="outcome-key mono">moss snippet</div>
+          <div className="call-state-line">{snippet?.title || snippet?.id || 'none'}</div>
+          {snippet?.text ? <div className="outcome-note">{snippet.text}</div> : null}
+        </div>
+        <div className="outcome-cell">
+          <div className="outcome-key mono">lead safety</div>
+          <div className="call-state-line">{labelize(safety.code || 'unknown')}</div>
+          <div className="outcome-note">{safety.reason || 'No safety reason recorded yet.'}</div>
+        </div>
+      </div>
+      {detectors.length ? (
+        <div className="call-next-list">
+          {detectors.slice(0, 5).map((detector) => (
+            <span key={`${detector.type}:${detector.excerpt}`} className="lead-badge lead-badge-muted">
+              {labelize(detector.type)}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -1585,6 +1997,9 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
         <BuildStateCell label="started" value={state.startedAt ? formatWhen(state.startedAt) : '—'} />
         <BuildStateCell label="finished" value={state.finishedAt ? formatWhen(state.finishedAt) : '—'} />
         <BuildStateCell label="Browser Use liveUrl" value={state.target === 'v0' ? 'not used' : state.liveUrl ? 'ready' : 'waiting'} tone={state.liveUrl ? 'good' : 'muted'} />
+        <BuildStateCell label="launch" value={state.launchStatus || detail?.builderQa?.launchChecklist?.status || 'not_started'} tone={state.launchedAt ? 'good' : state.customerApprovedAt ? 'good' : state.operatorApprovedAt ? 'warn' : 'muted'} />
+        <BuildStateCell label="operator ok" value={state.operatorApprovedAt ? formatWhen(state.operatorApprovedAt) : 'pending'} tone={state.operatorApprovedAt ? 'good' : 'warn'} />
+        <BuildStateCell label="customer ok" value={state.customerApprovedAt ? formatWhen(state.customerApprovedAt) : 'pending'} tone={state.customerApprovedAt ? 'good' : 'warn'} />
         <BuildStateCell label="operation" value={mode.mode || 'pending'} tone={mode.tone === 'bad' ? 'bad' : mode.tone === 'good' ? 'good' : mode.tone === 'warn' ? 'warn' : 'muted'} />
       </div>
 
@@ -1592,7 +2007,10 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
       {state.error ? <div className="builder-error mono">{state.error}</div> : null}
 
       <BrowserUseBuildPanel state={browserUse} />
-      <BuildQAConsole qa={detail?.builderQa} />
+      <BuildQAConsole
+        qa={detail?.builderQa}
+        handoffCases={(detail?.handoff?.cases || []).filter((item) => ['qa_failure', 'build_auth_wall', 'provider_failure'].includes(item.category))}
+      />
 
       <div className="final-site-row">
         <div className="final-site-label mono">final site URL</div>
@@ -1780,6 +2198,10 @@ function mergeBuilderState(detail, builderInfo, focusedLeadId) {
     evidenceCount: local?.evidenceCount ?? read.evidenceCount ?? lastNumber(timeline, 'evidenceCount'),
     outputSchema: local?.outputSchema || read.outputSchema || lastValue(timeline, 'outputSchema'),
     target: local?.target || read.target || latest.target || lastValue(timeline, 'target') || 'lovable',
+    launchStatus: read.launchStatus || latest.launch_status || lastValue(timeline, 'launchStatus') || 'not_started',
+    operatorApprovedAt: read.operatorApprovedAt || latest.operator_approved_at || null,
+    customerApprovedAt: read.customerApprovedAt || latest.customer_approved_at || null,
+    launchedAt: read.launchedAt || latest.launched_at || null,
     submissionUrl: local?.submissionUrl || read.submissionUrl || latest.submission_url || latest.lovable_url || lastValue(timeline, 'submissionUrl'),
     providerProjectId: local?.providerProjectId || read.providerProjectId || latest.provider_project_id || lastValue(timeline, 'providerProjectId'),
     providerDeploymentId: local?.providerDeploymentId || read.providerDeploymentId || latest.provider_deployment_id || lastValue(timeline, 'providerDeploymentId'),

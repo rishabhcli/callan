@@ -113,14 +113,81 @@ export const EmailReplyDecision = z.object({
 }).strict().describe('EmailReplyDecision');
 
 export const WebsiteBrief = z.object({
+  schemaVersion: z.number().int().min(2).default(2),
   brief: z.string(),
   businessName: z.string(),
   targetCustomer: z.string(),
+  pages: z.array(z.object({
+    name: z.string(),
+    path: z.string(),
+    goal: z.string(),
+    sections: z.array(z.string()).min(1).max(8)
+  }).strict()).min(1).max(6),
+  hero: z.object({
+    headline: z.string(),
+    subheadline: z.string(),
+    primaryCta: z.string(),
+    secondaryCta: z.string().nullable().optional(),
+    proofLine: z.string().nullable().optional()
+  }).strict(),
   sections: z.array(z.object({
     name: z.string(),
     goal: z.string(),
     content: z.array(z.string()).min(1).max(6)
   }).strict()).min(3).max(8),
+  services: z.array(z.object({
+    name: z.string(),
+    description: z.string(),
+    cta: z.string().nullable().optional()
+  }).strict()).min(1).max(8),
+  reviewProof: z.object({
+    status: z.enum(['evidence_backed', 'limited']),
+    items: z.array(z.string()).max(6),
+    disclaimer: z.string()
+  }).strict(),
+  location: z.object({
+    city: z.string().nullable().optional(),
+    address: z.string().nullable().optional(),
+    serviceArea: z.string(),
+    hours: z.string().nullable().optional()
+  }).strict(),
+  cta: z.object({
+    primaryLabel: z.string(),
+    primaryHref: z.string(),
+    secondaryLabel: z.string().nullable().optional(),
+    secondaryHref: z.string().nullable().optional()
+  }).strict(),
+  contactMethods: z.array(z.object({
+    type: z.enum(['phone', 'email', 'form', 'booking', 'other']),
+    label: z.string(),
+    value: z.string(),
+    href: z.string().nullable().optional()
+  }).strict()).min(1).max(6),
+  commerceNeeds: z.array(z.object({
+    key: z.string(),
+    status: z.string(),
+    detail: z.string()
+  }).strict()).max(8),
+  commerceCta: z.object({
+    label: z.string(),
+    behavior: z.enum(['lead_form', 'operator_handoff', 'none']),
+    paymentLinkUrl: z.string().nullable(),
+    note: z.string()
+  }).strict().nullable().optional(),
+  commerceSections: z.array(z.object({
+    name: z.string(),
+    goal: z.string(),
+    content: z.array(z.string()).min(1).max(6),
+    noFakeCheckoutLinks: z.boolean()
+  }).strict()).max(6).optional(),
+  commerceRiskFlags: z.array(z.string()).max(10).optional(),
+  assets: z.array(z.object({
+    type: z.string(),
+    alt: z.string(),
+    url: z.string().nullable().optional(),
+    caption: z.string().nullable().optional()
+  }).strict()).min(1).max(8),
+  disclaimers: z.array(z.string()).max(10),
   style: z.object({
     tone: z.string(),
     palette: z.string(),

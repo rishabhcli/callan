@@ -6,9 +6,9 @@
  *    `research.session.*` / `research.evidence.captured` events so the
  *    dashboard's Scraper box and Memory box pulse like a real swarm is
  *    crawling the caller's phone.
- * 2. When the caller mentions a business name or domain mid-call, kick off
- *    an actual `startBrowserUseResearchJob` against that business. In mock
- *    mode this runs the existing 5-lane browser-use swarm and streams real
+ * 2. When the caller mentions a business name or domain mid-call, enqueue
+ *    a durable `research.browser_use` job against that business. In mock mode
+ *    the job still runs the same 5-lane Browser Use swarm and streams real
  *    events through the same SSE pipeline.
  *
  * Both layers are de-duped per call so we don't double-fire.
@@ -17,7 +17,10 @@
 import { env } from './env.js';
 import { log } from './logger.js';
 import { emit } from './sse.js';
-import { startBrowserUseResearchJob } from './research/browserUseSwarm.js';
+import { enqueueJob } from './jobs.js';
+import { createBrowserUseResearchJob } from './research/browserUseSwarm.js';
+
+export const INBOUND_BUSINESS_RESEARCH_JOB_TYPE = 'research.browser_use';
 
 const startedReverseLookupForCall = new Set();
 const kickedOffJobForCall = new Map(); // callId -> jobId
@@ -137,9 +140,10 @@ function synthesizeEvidence(lane, { fromNumber, businessName }) {
 
 /**
  * Fires when the inbound transcript reveals a business name we haven't researched yet.
- * Runs the existing 5-lane browser-use research job for real.
+ * Creates the existing Browser Use research job and hands execution to the
+ * durable job loop.
  */
-export async function maybeKickOffBusinessResearch({ callRow, businessName, city }) {
+export function maybeKickOffBusinessResearch({ callRow, businessName, city }) {
   if (!callRow?.id || !businessName) return null;
   if (kickedOffJobForCall.has(callRow.id)) return kickedOffJobForCall.get(callRow.id);
 
@@ -156,20 +160,45 @@ export async function maybeKickOffBusinessResearch({ callRow, businessName, city
   });
 
   try {
-    const job = await startBrowserUseResearchJob({
+    const job = createBrowserUseResearchJob({
       niche,
       city: city || 'unknown',
       maxLeads: 1,
       mode: env.runMode === 'mock' ? 'mock' : 'auto',
       idempotencyKey: `inbound-${callRow.id}-${niche.toLowerCase()}`
     });
-    kickedOffJobForCall.set(callRow.id, job?.id || job?.jobId);
-    log.info('inbound.research.business_kicked_off', {
-      callId: callRow.id, businessName, jobId: job?.id || job?.jobId
+    const durable = enqueueJob({
+      type: INBOUND_BUSINESS_RESEARCH_JOB_TYPE,
+      payload: { jobId: job.id, callId: callRow.id, leadId: callRow.lead_id || null, source: 'inbound_business_mention' },
+      idempotencyKey: `browser_research:${job.id}`
     });
-    return job;
+    const result = {
+      jobId: job.id,
+      durableJobId: durable.row?.id || null,
+      inserted: durable.inserted,
+      status: durable.row?.status || null
+    };
+    kickedOffJobForCall.set(callRow.id, result);
+    emit('caller.research_queued', {
+      worker: 'caller',
+      leadId: callRow.lead_id,
+      callId: callRow.id,
+      target: niche,
+      city: city || null,
+      jobId: job.id,
+      durableJobId: durable.row?.id || null,
+      trigger: 'business_mention'
+    });
+    log.info('inbound.research.business_queued', {
+      callId: callRow.id,
+      businessName,
+      jobId: job.id,
+      durableJobId: durable.row?.id || null,
+      inserted: durable.inserted
+    });
+    return result;
   } catch (err) {
-    log.warn('inbound.research.business_kick_off_failed', {
+    log.warn('inbound.research.business_enqueue_failed', {
       callId: callRow.id, businessName, error: err?.message || String(err)
     });
     return null;

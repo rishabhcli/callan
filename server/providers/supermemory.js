@@ -1,6 +1,7 @@
 import { env } from '../env.js';
 import { addDoc, containerTagFor, listKinds, MEMORY_KINDS, search } from '../memory.js';
 import { normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
+import { leads } from '../db.js';
 
 const PROVIDER = 'supermemory';
 
@@ -73,6 +74,9 @@ export async function smokeSupermemoryAddListSearch() {
   const mailMarker = `sm_mail_${stamp}`;
   const otherMarker = `sm_other_${stamp}`;
 
+  ensureSmokeLead(`smoke_${stamp}_a`, tagA, 'Smoke Check A');
+  ensureSmokeLead(`smoke_${stamp}_b`, tagB, 'Smoke Check B');
+
   const addedProfile = await addDoc(tagA, 'business_profile', {
     businessName: 'Smoke Check A',
     city: 'Smoke City',
@@ -141,6 +145,21 @@ export function supermemoryReadinessDetails() {
     supportedKinds: MEMORY_KINDS,
     smoke: env.smoke.supermemoryWrite ? 'enabled_by_SMOKE_SUPERMEMORY_WRITE' : 'disabled_by_default'
   };
+}
+
+function ensureSmokeLead(id, containerTag, businessName) {
+  leads.insert({
+    id,
+    container_tag: containerTag,
+    business_name: businessName,
+    phone: null,
+    address: 'Supermemory smoke fixture',
+    niche: 'local services',
+    city: 'Smoke City',
+    website: `https://example.test/${id}`,
+    source_url: `https://example.test/${id}`,
+    status: 'discovered'
+  });
 }
 
 async function searchUntilHit(containerTag, query, options) {

@@ -20,15 +20,27 @@ const RESEARCH_LANE_LABELS = {
 
 const EMPTY_INBOUND = {
   active: false,
+  channel: null,
+  sessionId: null,
   callId: null,
   leadId: null,
   fromNumber: null,
   callerName: null,
   email: null,
+  threadId: null,
+  subject: null,
   startedAt: null,
   transcript: [],
   lanes: [],
   evidence: [],
+  facts: null,
+  missingFields: [],
+  requiredMissingFields: [],
+  nextQuestion: null,
+  nextAction: null,
+  portalUrl: null,
+  invoiceUrl: null,
+  readyForQuote: false,
   context: null,
   demoMode: false,
   demoTarget: null
@@ -40,10 +52,46 @@ function reduceInbound(state, evt) {
     return {
       ...EMPTY_INBOUND,
       active: true,
+      channel: 'voice',
+      sessionId: evt.callId,
       callId: evt.callId,
       leadId: evt.leadId,
       fromNumber: evt.fromNumber,
       startedAt: evt.ts || Date.now()
+    };
+  }
+  if (t === 'inbound.intake.updated') {
+    const sameCall = evt.callId && state.callId === evt.callId;
+    const sameThread = evt.threadId && state.threadId === evt.threadId;
+    const sameSession = evt.sessionId && state.sessionId === evt.sessionId;
+    const base = sameCall || sameThread || sameSession ? state : {
+      ...EMPTY_INBOUND,
+      active: evt.channel === 'voice' && evt.stage !== 'terminal',
+      startedAt: evt.ts || Date.now(),
+      transcript: []
+    };
+    const transcript = appendInboundPreview(base.transcript, evt);
+    return {
+      ...base,
+      active: evt.channel === 'voice' ? evt.stage !== 'terminal' : false,
+      channel: evt.channel,
+      sessionId: evt.sessionId || base.sessionId,
+      callId: evt.callId || base.callId,
+      leadId: evt.leadId || base.leadId,
+      threadId: evt.threadId || base.threadId,
+      subject: evt.subject || base.subject,
+      email: evt.facts?.email || base.email,
+      fromNumber: evt.facts?.phone || base.fromNumber,
+      callerName: evt.facts?.businessName || base.callerName,
+      facts: evt.facts || base.facts,
+      missingFields: evt.missingFields || [],
+      requiredMissingFields: evt.requiredMissingFields || [],
+      nextQuestion: evt.nextQuestion || null,
+      nextAction: evt.nextAction || null,
+      portalUrl: evt.portalUrl || base.portalUrl,
+      invoiceUrl: evt.invoiceUrl || base.invoiceUrl,
+      readyForQuote: !!evt.readyForQuote,
+      transcript
     };
   }
   if (!state.callId || evt.callId !== state.callId) return state;
@@ -93,6 +141,26 @@ function reduceInbound(state, evt) {
     return { ...state, active: false };
   }
   return state;
+}
+
+function appendInboundPreview(transcript = [], evt = {}) {
+  const text = String(evt.preview || '').trim();
+  if (!text) return transcript;
+  const id = evt.messageId || evt.contactEventId || `${evt.sessionId || evt.threadId || evt.callId}:${evt.ts || ''}`;
+  const alreadyPresent = transcript.some((turn) => (
+    (id && turn.id === id) ||
+    (turn.text === text && (evt.ts ? Math.abs((turn.ts || 0) - evt.ts) < 1000 : true))
+  ));
+  if (alreadyPresent) return transcript;
+  return [
+    ...transcript,
+    {
+      id,
+      role: evt.channel === 'email' ? 'user' : 'caller',
+      text,
+      ts: evt.ts || Date.now()
+    }
+  ].slice(-MAX_TRANSCRIPT);
 }
 
 const TABS = [
@@ -227,6 +295,7 @@ function Console() {
   const [activeTab, setActiveTab] = useState('operations');
   const [focusedNodeId, setFocusedNodeId] = useState(null);
   const [outreach, setOutreach] = useState(null);
+  const [handoffCases, setHandoffCases] = useState([]);
 
   const [nodeStates, setNodeStates] = useState({
     scraper: 'idle', memory: 'idle', caller: 'idle',
@@ -302,6 +371,15 @@ function Console() {
     }
   }, []);
 
+  const refreshHandoffCases = useCallback(async () => {
+    try {
+      const data = await api.listHandoffCases({ status: 'open', limit: 80 });
+      setHandoffCases(data?.cases || []);
+    } catch {
+      // ignore — non-fatal
+    }
+  }, []);
+
   const cancelScheduledCall = useCallback(async (id) => {
     try {
       await api.cancelScheduledCall(id);
@@ -324,15 +402,18 @@ function Console() {
     refreshHealth();
     refreshLeads();
     refreshScheduledCalls();
+    refreshHandoffCases();
     const leadsId = setInterval(refreshLeads, 5000);
     const healthId = setInterval(refreshHealth, 8000);
     const schedId = setInterval(refreshScheduledCalls, 6000);
+    const handoffId = setInterval(refreshHandoffCases, 6000);
     return () => {
       clearInterval(leadsId);
       clearInterval(healthId);
       clearInterval(schedId);
+      clearInterval(handoffId);
     };
-  }, [refreshHealth, refreshLeads, refreshScheduledCalls]);
+  }, [refreshHealth, refreshLeads, refreshScheduledCalls, refreshHandoffCases]);
 
   useEffect(() => { refreshLeadDetail(focusedLeadId); }, [focusedLeadId, refreshLeadDetail]);
 
@@ -342,9 +423,10 @@ function Console() {
 
     // Inbound live panel state — listen to a tight set of types
     if (
-      t === 'caller.placed' || t === 'caller.context_loaded' || t === 'caller.transcript' ||
+      t === 'caller.placed' || t === 'caller.context_loaded' || t === 'caller.transcript' || t === 'caller.state' ||
       t === 'caller.done' || t === 'mailer.email_sent' ||
       t === 'caller.demo_mode.entered' ||
+      t === 'inbound.intake.updated' ||
       t === 'research.session.started' || t === 'research.evidence.captured' ||
       t === 'research.session.completed'
     ) {
@@ -407,6 +489,9 @@ function Console() {
         setLiveTranscript((prev) => [...prev, turn].slice(-MAX_TRANSCRIPT));
       }
     }
+    if (t === 'caller.state') {
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+    }
     if (t === 'caller.done' || t === 'caller.error') {
       setLiveCallActive(false);
       refreshLeadDetail(evt.leadId || focusedRef.current);
@@ -421,6 +506,12 @@ function Console() {
     }
     if (t.startsWith('mailer.')) {
       refreshLeadDetail(evt.leadId || focusedRef.current);
+    }
+    if (t.startsWith('handoff.')) {
+      refreshHandoffCases();
+      refreshLeads();
+      refreshLeadDetail(evt.leadId || focusedRef.current);
+      refreshHealth();
     }
     if (t.startsWith('outreach.')) {
       refreshLeads();
@@ -451,7 +542,7 @@ function Console() {
       refreshLeadDetail(evt.leadId || focusedRef.current);
       refreshHealth();
     }
-  }, [bumpActivity, refreshLeads, refreshLeadDetail, refreshHealth, refreshScheduledCalls, liveLeadId]);
+  }, [bumpActivity, refreshLeads, refreshLeadDetail, refreshHealth, refreshScheduledCalls, refreshHandoffCases, liveLeadId]);
 
   const sseStatus = useSSE(onEvent);
 
@@ -537,8 +628,9 @@ function Console() {
   const handleLeadChanged = useCallback((id) => {
     refreshLeads();
     refreshHealth();
+    refreshHandoffCases();
     refreshLeadDetail(id || focusedRef.current);
-  }, [refreshHealth, refreshLeadDetail, refreshLeads]);
+  }, [refreshHealth, refreshHandoffCases, refreshLeadDetail, refreshLeads]);
 
   const retryBuild = useCallback(async ({ target } = {}) => {
     if (!focusedLeadId) return;
@@ -597,6 +689,8 @@ function Console() {
               onStartAutonomy={startAutonomy}
               onStopAutonomy={stopAutonomy}
               onLeadChanged={handleLeadChanged}
+              handoffCases={handoffCases}
+              onFocusLead={handleLeadFocus}
               inbound={inbound}
               onDismissInbound={() => setInbound(EMPTY_INBOUND)}
             />
@@ -609,7 +703,11 @@ function Console() {
               onFocusLead={handleLeadFocus}
             />
           ) : activeTab === 'scraper' ? (
-            <ScraperView />
+            <ScraperView
+              focusedLeadId={focusedLeadId}
+              leadDetail={leadDetail}
+              onLeadChanged={handleLeadChanged}
+            />
           ) : activeTab === 'memory' ? (
             <MemoryView focusedLeadId={focusedLeadId} />
           ) : activeTab === 'settings' ? (
@@ -630,6 +728,7 @@ function Console() {
           queueCounts={queueCounts}
           sseStatus={sseStatus}
           scheduledCalls={scheduledCalls}
+          handoffCases={handoffCases}
           onCancelScheduled={cancelScheduledCall}
           onFireScheduled={fireScheduledCallNow}
         />

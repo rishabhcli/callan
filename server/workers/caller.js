@@ -34,15 +34,24 @@ import {
   verifyAgentPhoneVoice,
   waitForAgentPhoneFinalTranscript
 } from '../providers/agentphone.js';
-import { shouldTransfer, transferCallToOperator, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
+import { shouldTransfer, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
+import { enqueueOperatorTransferJob } from '../operatorTransferQueue.js';
 import { applyPackToPitch, pickPack } from '../verticalPacks/index.js';
 import { applyPitchExperiment } from '../experimentArms.js';
 import { recordOutcome as recordExperimentOutcome } from '../experiments.js';
 import { recordAgentPhoneCallCost } from '../costs.js';
+import { enqueueCallAnalysis } from '../analysisQueue.js';
+import {
+  advanceCallState,
+  createInitialCallState,
+  emitCallState,
+  persistCallbackPromise,
+  terminalCallState
+} from '../callState.js';
 
 const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human. Output only JSON that matches the supplied schema exactly.`;
 
-const MOCK_TRANSCRIPT_SYSTEM = `You are simulating a realistic cold sales call transcript for demo purposes. Output a believable agent<->owner exchange. The agent represents callmemaybe (sells small-business websites for a $500 flat fee). Start with the pitch beginMessage exactly, including the recording disclosure. Make the owner skeptical for a few turns, then convinced. End with the agent asking for the best email, the owner spelling it, the agent reading it back, the owner confirming, and the agent saying the invoice will arrive from AgentMail and they can reply there with questions. 10 to 12 total turns, alternating roles, starting with the agent.`;
+const MOCK_TRANSCRIPT_SYSTEM = `You are simulating a realistic cold sales call transcript for demo purposes. Output a believable agent<->owner exchange. The agent represents callmemaybe (sells small-business websites for a flat fee). Start with the pitch beginMessage exactly, including the recording disclosure. Make the owner skeptical, ask whether this is AI, ask price, then get convinced. End with the agent asking for the best email, the owner giving or correcting it, the agent reading it back, the owner confirming, and the agent saying the invoice will arrive from AgentMail and they can reply there with questions. 12 to 16 total turns, alternating roles, starting with the agent.`;
 
 const MOCK_TRANSCRIPT_SCHEMA = {
   type: 'object',
@@ -50,7 +59,7 @@ const MOCK_TRANSCRIPT_SCHEMA = {
     turns: {
       type: 'array',
       minItems: 10,
-      maxItems: 12,
+      maxItems: 16,
       items: {
         type: 'object',
         properties: {
@@ -87,7 +96,9 @@ function pitchToSystemPrompt(pitch, lead, hotContext = null) {
     `If they give positive intent, ask for the best invoice email exactly like this: ${pitch.emailAsk}`,
     `Email readback rule: ${pitch.emailReadbackInstruction}`,
     `Do not say the invoice is coming until the owner confirms the read-back email. If the readback is wrong, ask them to repeat the address and read it back again.`,
+    `State discipline: follow opener -> permission_check -> discovery -> value_pitch -> objection/pricing -> close -> email_capture -> readback_confirm. If they ask whether this is AI, disclose plainly and continue only if useful. If they ask where the number came from, say it came from public business listing/research evidence and offer opt-out.`,
     `Invoice handoff: ${pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.'}`,
+    `If they ask "where did you get my number?" or "why are you contacting me?", answer calmly: "We found ${lead.business_name || 'your business'} while reviewing public business listings/online-presence signals${lead.source_url ? `; the source attached here is ${lead.source_url}` : ''}. I can stop all future calls and emails right now if you want." Then offer opt-out.`,
     formatMossPrompt(hotContext),
     `Be warm, brief, and concrete. If the owner says any variant of "stop", "remove me", "do not call", or "take me off", acknowledge politely and end the call.`
   ].filter(Boolean).join('\n\n');
@@ -236,21 +247,22 @@ async function synthesizeMockTranscript({ pitch, profile, hotContext }) {
   const invoiceEmail = mockEmailForProfile(profile);
   return [
     { role: 'agent', text: pitch.beginMessage },
-    { role: 'user', text: 'Who is this? I am in the middle of something.' },
-    { role: 'agent', text: pitch.openingLine },
-    { role: 'user', text: pitch.objections?.[0]?.objection || 'I do not really need a website.' },
-    { role: 'agent', text: pitch.objections?.[0]?.response || pitch.valueProp },
+    { role: 'user', text: 'Wait, what is this and why are you calling me? Is this AI?' },
+    { role: 'agent', text: `Fair question. I am Callan from callmemaybe, an AI voice operator. ${pitch.openingLine}` },
+    { role: 'user', text: 'I am busy, so make it quick.' },
+    { role: 'agent', text: pitch.valueProp },
     { role: 'user', text: 'How much?' },
     { role: 'agent', text: pitch.close },
     { role: 'user', text: 'Okay, send me the invoice.' },
     { role: 'agent', text: pitch.emailAsk || 'Perfect. What is the best email for the invoice?' },
-    { role: 'user', text: invoiceEmail },
-    { role: 'agent', text: `${invoiceEmail}, is that right? ${pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.'}` },
-    { role: 'user', text: 'Yes, that is right.' }
+    { role: 'user', text: `Use owner at ${String(profile.businessName || 'business').toLowerCase().replace(/[^a-z0-9]+/g, '')} dot com. Actually, sorry, use ${invoiceEmail}.` },
+    { role: 'agent', text: `I have ${invoiceEmail}. Is that right?` },
+    { role: 'user', text: 'Yes, that is right.' },
+    { role: 'agent', text: pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.' }
   ];
 }
 
-async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, hotContext, experimentAssignment = null }) {
+async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, hotContext, verticalPack = null, experimentAssignment = null }) {
   const callId = `call_${Date.now().toString(36)}`;
   const turns = await synthesizeMockTranscript({ pitch, profile, hotContext });
   const armReason = experimentAssignment?.arm ? `arm=${experimentAssignment.arm}` : null;
@@ -265,13 +277,42 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, ho
   emit('caller.placed', { worker: 'caller', leadId, runId, callId, providerCallId: null, mock: true });
 
   const transcript = [];
+  let callState = createInitialCallState({
+    lead,
+    profile,
+    pitch,
+    verticalPack,
+    hotContext,
+    callId,
+    runId,
+    disclosureText
+  });
+  emitCallState(callState, { leadId, callId, runId, mock: true });
   for (const turn of turns) {
     await new Promise((r) => setTimeout(r, MOCK_TURN_DELAY_MS));
     const ts = Date.now();
     const chunk = { role: turn.role, text: turn.text, ts };
     transcript.push(chunk);
     emit('caller.transcript', { worker: 'caller', leadId, callId, role: chunk.role, text: chunk.text, ts, mock: true });
-    if (chunk.role === 'user') await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: true });
+    const retrievals = chunk.role === 'user'
+      ? await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: true })
+      : [];
+    callState = advanceCallState(callState, chunk, {
+      lead,
+      profile,
+      pitch,
+      verticalPack,
+      hotContext,
+      retrievals,
+      disclosureText,
+      callId,
+      runId,
+      now: ts
+    });
+    emitCallState(callState, { leadId, callId, runId, mock: true, turn: chunk });
+    if (callState.currentState === 'callback' && callState.callback?.scheduledAtMs) {
+      persistCallbackPromise({ leadId, callId, state: callState, turn: chunk });
+    }
   }
 
   calls.finish(callId, { outcome: 'demo-yes', transcript });
@@ -301,20 +342,26 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, ho
   }
   emit('caller.done', { worker: 'caller', leadId, runId, callId, outcome: 'demo-yes', mock: true });
 
-  setTimeout(() => {
-    import('./analyst.js').then(({ runAnalyst }) => runAnalyst({ leadId, callId })).catch((err) => {
-      log.warn('analyst.fire.failed', { leadId, callId, error: err?.message });
-    });
-  }, 0);
+  fireAnalyst(leadId, callId, 'caller.mock');
   return { callId };
 }
 
-function fireAnalyst(leadId, callId) {
-  setTimeout(() => {
-    import('./analyst.js').then(({ runAnalyst }) => runAnalyst({ leadId, callId })).catch((err) => {
-      log.warn('analyst.fire.failed', { leadId, callId, error: err?.message });
+function fireAnalyst(leadId, callId, source = 'caller') {
+  try {
+    const result = enqueueCallAnalysis({ leadId, callId, source });
+    emit('analyst.queued', {
+      worker: 'analyst',
+      leadId,
+      callId,
+      source,
+      jobId: result.row?.id || null,
+      duplicate: !result.inserted
     });
-  }, 0);
+    return result.row || null;
+  } catch (err) {
+    log.warn('analyst.queue.failed', { leadId, callId, source, error: err?.message || String(err) });
+    return null;
+  }
 }
 
 async function maybeRetrieveMossForTurn({ leadId, callId, turn, mock }) {
@@ -327,6 +374,8 @@ async function maybeRetrieveMossForTurn({ leadId, callId, turn, mock }) {
         retrieved.push(await getPricingSnippet(leadId, { callId, query: need.query, source: 'transcript_stream' }));
       } else if (need.kind === 'customer_need') {
         retrieved.push(await getCustomerNeedSnippet(leadId, need.query, { callId, source: 'transcript_stream' }));
+      } else if (need.kind === 'compliance') {
+        retrieved.push(await getComplianceSnippet(need.reason || need.query, { leadId, callId, source: 'transcript_stream' }));
       } else {
         retrieved.push(await getObjectionSnippet(leadId, need.query, { callId, source: 'transcript_stream' }));
       }
@@ -398,7 +447,7 @@ function computeCallDurationSeconds(callRow) {
   return Math.round((ended - started) / 1000);
 }
 
-async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, experimentAssignment = null }) {
+async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, verticalPack = null, experimentAssignment = null }) {
   const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
@@ -408,6 +457,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
   const streamedTurns = [];
   const seenTurns = new Set();
   let optedOut = false;
+  let callState = null;
 
   const emitTurn = async (turn, source = 'stream') => {
     const role = turn.role === 'user' ? 'user' : 'agent';
@@ -420,7 +470,27 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     const chunk = { role, text, ts };
     streamedTurns.push(chunk);
     emit('caller.transcript', { worker: 'caller', leadId, callId, role, text, ts, mock: false, source });
-    if (role === 'user') await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: false });
+    const retrievals = role === 'user'
+      ? await maybeRetrieveMossForTurn({ leadId, callId, turn: chunk, mock: false })
+      : [];
+    if (callState) {
+      callState = advanceCallState(callState, chunk, {
+        lead,
+        profile,
+        pitch,
+        verticalPack,
+        hotContext,
+        retrievals,
+        disclosureText,
+        callId,
+        runId,
+        now: ts
+      });
+      emitCallState(callState, { leadId, callId, runId, mock: false, turn: chunk });
+      if (callState.currentState === 'callback' && callState.callback?.scheduledAtMs) {
+        persistCallbackPromise({ leadId, callId, state: callState, turn: chunk });
+      }
+    }
     // Live operator warm-transfer check. Per-call dedupe lives in
     // operatorTransfer.js, so it's safe to evaluate on every user turn. Only
     // fires when OPERATOR_TRANSFER_NUMBER is set; otherwise the transfer
@@ -428,16 +498,23 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     if (role === 'user' && OPERATOR_TRANSFER_NUMBER) {
       const decision = shouldTransfer(streamedTurns);
       if (decision.transfer) {
-        transferCallToOperator({
+        const transfer = enqueueOperatorTransferJob({
           providerCallId,
           leadId,
           callId,
-          reason: decision.reason
-        }).catch((err) => log.warn('operator.transfer.outbound_failed', {
+          reason: decision.reason,
+          source: 'caller.worker',
+          eventId: `${callId}:${streamedTurns.length}`
+        });
+        emit('operator.transfer.queued', {
+          worker: 'caller',
           callId,
+          leadId,
           providerCallId,
-          error: err?.message || String(err)
-        }));
+          reason: decision.reason,
+          jobId: transfer.row?.id,
+          source: 'caller.worker'
+        });
       }
     }
     if (role === 'user' && transcriptHasOptOut(text)) {
@@ -528,6 +605,17 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       disclosure_text: disclosureText,
       decision_reason: liveReasonWithArm
     });
+    callState = createInitialCallState({
+      lead,
+      profile,
+      pitch,
+      verticalPack,
+      hotContext,
+      callId,
+      runId,
+      disclosureText
+    });
+    emitCallState(callState, { leadId, callId, runId, mock: false });
     emit('caller.placed', {
       worker: 'caller',
       leadId,
@@ -575,6 +663,17 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     const transcriptForStorage = finalTranscript || { turns: streamedTurns, source: 'agentphone-stream-fallback' };
     const outcome = optedOut ? 'opt-out' : 'ended';
     calls.finish(callId, { outcome, transcript: transcriptForStorage });
+    if (callState) {
+      callState = terminalCallState(callState, outcome, {
+        lead,
+        profile,
+        pitch,
+        verticalPack,
+        hotContext,
+        disclosureText
+      });
+      emitCallState(callState, { leadId, callId, runId, mock: false });
+    }
     try {
       const finishedRow = calls.get(callId);
       const durationSeconds = computeCallDurationSeconds(finishedRow);
@@ -618,6 +717,17 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
         outcome: failure.outcome,
         transcript: streamedTurns.length ? { turns: streamedTurns, error: failure.reason } : { error: failure.reason }
       });
+      if (callState) {
+        callState = terminalCallState(callState, failure.outcome, {
+          lead,
+          profile,
+          pitch,
+          verticalPack,
+          hotContext,
+          disclosureText
+        });
+        emitCallState(callState, { leadId, callId, runId, mock: false });
+      }
       try {
         const finishedRow = calls.get(callId);
         const durationSeconds = computeCallDurationSeconds(finishedRow);
@@ -748,8 +858,8 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
       });
     }
     const result = live
-      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, experimentAssignment })
-      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext, experimentAssignment });
+      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment })
+      : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment });
 
     runs.finish(runId, { state: 'completed', detail: { ...result, mock: !live } });
     return result;

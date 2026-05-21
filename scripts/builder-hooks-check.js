@@ -31,6 +31,7 @@ try {
     hooksApi,
     revisionApi,
     browserUseApi,
+    portalApi,
     builderApi
   ] = await Promise.all([
     import('../server/db.js'),
@@ -38,6 +39,7 @@ try {
     import('../server/fulfillment/hooks/index.js'),
     import('../server/fulfillment/hooks/revision.js'),
     import('../server/providers/browserUse.js'),
+    import('../server/customerPortal.js'),
     import('../server/workers/builder.js')
   ]);
 
@@ -97,7 +99,7 @@ try {
     return { errors: flawed.errors, revisionPromptChars: plan.prompt.length };
   });
 
-  await check('passing site marks shipped', async () => {
+  await check('passing site becomes launch-ready, then customer approval is separate', async () => {
     const leadId = insertLead(dbApi, memoryApi.containerTagFor, {
       id: `lead_hooks_ship_${Date.now().toString(36)}`
     });
@@ -106,12 +108,34 @@ try {
     const build = dbApi.builds.listByLead(leadId)[0];
     const qa = dbApi.buildQaResults.listByBuild(build.id)[0];
     const hooks = dbApi.buildHooks.listByBuild(build.id);
+    const readModel = hooksApi.buildQaReadModel({ leadId, buildId: build.id });
     assert(result.projectUrl, 'builder result should include projectUrl');
-    assert(lead.status === 'shipped', `lead should be shipped, got ${lead.status}`);
+    assert(lead.status === 'awaiting_launch_approval', `lead should wait for launch approval, got ${lead.status}`);
     assert(build.status === 'completed', `build should be completed, got ${build.status}`);
+    assert(build.launch_status === 'ready_for_customer', `launch status should be ready_for_customer, got ${build.launch_status}`);
     assert(qa?.passed, 'latest QA result should pass');
+    assert(readModel.launchChecklist?.status === 'ready_for_customer', `read model launch status wrong: ${readModel.launchChecklist?.status}`);
+    assert(readModel.launchChecklist?.launchBlocking?.includes('customer_approval'), 'customer approval should remain a separate launch gate');
     assert(hooks.some((hook) => hook.hook === 'finalAccept' && hook.output?.accepted === true), 'finalAccept hook should accept');
-    return { leadStatus: lead.status, buildStatus: build.status, qaScore: qa.score, hookCount: hooks.length };
+    const approval = await portalApi.approveLaunch({ leadId });
+    const approvedBuild = dbApi.builds.get(build.id);
+    assert(approval.ok, 'customer approval should be recorded');
+    assert(approvedBuild.launch_status === 'customer_approved', `expected customer_approved, got ${approvedBuild.launch_status}`);
+    return { leadStatus: lead.status, buildStatus: build.status, launchStatus: approvedBuild.launch_status, qaScore: qa.score, hookCount: hooks.length };
+  });
+
+  await check('customer edit request creates deduped revision prompt', async () => {
+    const leadId = insertLead(dbApi, memoryApi.containerTagFor, {
+      id: `lead_hooks_revision_${Date.now().toString(36)}`
+    });
+    await builderApi.runBuilder({ leadId, buildId: `bld_hooks_revision_${Date.now().toString(36)}` });
+    const first = await portalApi.requestEdit({ leadId, note: 'Please make the contact form ask for the neighborhood.' });
+    const duplicate = await portalApi.requestEdit({ leadId, note: 'Please make the contact form ask for the neighborhood.' });
+    const revisions = dbApi.buildRevisions.listByLead(leadId);
+    assert(first.revision?.ok, 'first customer edit should create a revision prompt');
+    assert(duplicate.revision?.deduped, 'duplicate customer edit should reuse revision prompt');
+    assert(revisions.some((row) => row.status === 'requested' && row.prompt.includes('Customer note')), 'requested revision prompt should be persisted');
+    return { firstRevisionId: first.revision.revisionId, duplicateRevisionId: duplicate.revision.revisionId, revisionCount: revisions.length };
   });
 
   const ok = results.every((result) => result.ok);

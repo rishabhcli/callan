@@ -1,9 +1,10 @@
-import React, { Suspense, lazy, useEffect, useMemo } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react';
 import MemoryConsole from '../components/MemoryConsole.jsx';
 import BrowserUseConsole from '../components/BrowserUseConsole.jsx';
 import BrowserResearchConsole from '../components/BrowserResearchConsole.jsx';
 import Inspector from '../components/Inspector.jsx';
 import LiveInboundPanel from '../components/LiveInboundPanel.jsx';
+import { api } from '../api.js';
 
 const AgentScene = lazy(() => import('../components/AgentScene.jsx'));
 
@@ -46,6 +47,8 @@ export default function OperationsView({
   onStartAutonomy,
   onStopAutonomy,
   onLeadChanged,
+  handoffCases = [],
+  onFocusLead,
   inbound,
   onDismissInbound
 }) {
@@ -61,6 +64,8 @@ export default function OperationsView({
         <div className="nyna-stage-headline-line">we sell the agency, not the agent.</div>
       </div>
 
+      <ProductionCommandCenter />
+
       <div className="nyna-stage-scene">
         <Suspense fallback={<SceneFallback />}>
           <AgentScene
@@ -72,9 +77,11 @@ export default function OperationsView({
         </Suspense>
       </div>
 
-      {inbound && (inbound.active || inbound.callId) ? (
+      {inbound && (inbound.active || inbound.callId || inbound.threadId || inbound.sessionId) ? (
         <LiveInboundPanel inbound={inbound} onClose={onDismissInbound} />
       ) : null}
+
+      <HandoffQueueOverlay cases={handoffCases} onFocusLead={onFocusLead} />
 
       {node ? (
         <NodeDetailOverlay
@@ -100,6 +107,459 @@ export default function OperationsView({
   );
 }
 
+function ProductionCommandCenter() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [action, setAction] = useState('');
+  const [actionResult, setActionResult] = useState('');
+  const [resetReady, setResetReady] = useState(false);
+  const [adminToken, setAdminToken] = useState(() => api.getAdminToken());
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const next = await api.opsCommandCenter();
+      setData(next);
+      setError('');
+    } catch (err) {
+      setError(err?.message || String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let live = true;
+    const tick = async () => {
+      if (!live) return;
+      await load();
+    };
+    tick();
+    const id = setInterval(tick, 15000);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, [load]);
+
+  const safe = data?.safeToSellToday;
+  const blockers = safe?.stillBlocked || data?.readiness?.productionBlockers || [];
+  const nextActions = safe?.nextActions || data?.readiness?.nextActions || [];
+  const dryRunVerified = safe?.dryRunVerified || [];
+  const liveSmokeVerified = safe?.liveSmokeVerified || [];
+  const evalSummary = safe?.evals?.summary || data?.evals?.summary;
+  const economics = safe?.economics || data?.observability?.dailyEconomics || {};
+  const queue = safe?.queue || {};
+  const stuck = data?.observability?.stuck || {};
+  const backup = safe?.backup || data?.backups || null;
+  const providerHistory = data?.observability?.providerHistory || [];
+  const providerIssues = providerIssueCount(providerHistory);
+  const providerLatency = providerAverageLatency(providerHistory);
+  const safeHistory = data?.observability?.safeToSellHistory || {};
+  const schedulerHealth = safe?.schedulerHealth || data?.observability?.schedulerHealth || null;
+  const economicsHealth = safe?.economicsHealth || data?.observability?.economicsHealth || null;
+  const providerHealthSlo = safe?.providerHealthSlo || data?.observability?.providerHealthSlo || null;
+  const workerHealthSlo = safe?.workerHealthSlo || data?.observability?.workerHealthSlo || null;
+  const durableSnapshot = safe?.durableSnapshot || null;
+  const providerProof = safe?.providerProof?.length ? safe.providerProof : data?.providerProof || [];
+  const providerRows = useMemo(() => providerRowsFrom(data?.providers), [data?.providers]);
+  const providerPreview = providerRows.slice(0, 8);
+  const promotionGates = safe?.promotionGates || data?.promotionGates || data?.readiness?.promotionGates || {};
+  const reviewStage = promotionGates.productionReview || null;
+  const liveStage = promotionGates.productionLive || null;
+  const decisionReceipt = safe?.decisionReceipt || null;
+  const receiptHistory = data?.safeToSellReceipts || safe?.receiptHistory || data?.observability?.safeToSellReceiptHistory || null;
+
+  const runAction = async (label, fn) => {
+    setAction(label);
+    setActionResult('');
+    setError('');
+    try {
+      const result = await fn();
+      setActionResult(formatAdminActionResult(label, result));
+      if (label === 'reset-scan') setResetReady(result?.ok === true);
+      if (label === 'reset-apply') setResetReady(false);
+      await load();
+    } catch (err) {
+      setError(err?.message || String(err));
+    } finally {
+      setAction('');
+    }
+  };
+
+  const saveAdminToken = useCallback(() => {
+    api.setAdminToken(adminToken);
+    setAdminToken(api.getAdminToken());
+    setError('');
+    void load();
+  }, [adminToken, load]);
+
+  return (
+    <section className="prod-command-center" aria-label="production command center">
+      <div className="prod-command-head">
+        <div>
+          <div className="prod-command-kicker">safe to sell today</div>
+          <div className={`prod-command-status ${safe?.ok ? 'is-good' : 'is-blocked'}`}>
+            {safe?.ok ? 'yes' : 'no'}
+          </div>
+        </div>
+        <div className="prod-command-mode">
+          <span>{data?.mode || 'checking'}</span>
+          <strong>{loading ? 'syncing' : 'live view'}</strong>
+        </div>
+      </div>
+
+      <div className="prod-command-grid">
+        <Metric label="evals" value={formatEvalSummary(evalSummary)} tone={data?.evals?.ok ? 'good' : 'warm'} />
+        <Metric label="backup" value={backup?.ok ? 'fresh' : 'blocked'} tone={backup?.ok ? 'good' : 'bad'} />
+        <Metric label="queue" value={`${queue.due || 0}/${queue.staleRunning || 0}`} tone={queue.staleRunning ? 'bad' : 'good'} />
+        <Metric label="margin" value={formatUsd(economics.marginUsd)} tone={(economics.marginUsd || 0) >= 0 ? 'good' : 'warm'} />
+        <Metric label="budget" value={formatEconomicsHealth(economicsHealth)} tone={economicsHealth?.ok === false ? 'bad' : 'good'} />
+        <Metric label="provider SLO" value={formatProviderSlo(providerHealthSlo)} tone={providerHealthSlo?.ok === false ? 'bad' : 'good'} />
+        <Metric label="worker SLO" value={formatWorkerSlo(workerHealthSlo)} tone={workerHealthSlo?.ok === false ? 'bad' : 'good'} />
+        <Metric label="receipt" value={formatSnapshotStatus(durableSnapshot)} tone={durableSnapshot?.ok ? 'good' : 'bad'} />
+      </div>
+
+      <div className={`prod-snapshot-strip ${durableSnapshot?.ok ? 'is-good' : 'is-blocked'}`}>
+        <span>{safe?.source || 'inline'}</span>
+        <strong>{durableSnapshot?.id || 'no receipt'}</strong>
+        <em>{formatSnapshotAge(durableSnapshot)}</em>
+      </div>
+
+      <div className="prod-promotion-strip">
+        <PromotionStage label="review" stage={reviewStage} />
+        <PromotionStage label="live" stage={liveStage} />
+      </div>
+
+      <div className="prod-command-split">
+        <div className="prod-command-mini">
+          <span>dry-run</span>
+          <strong>{dryRunVerified.length}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>live-smoke</span>
+          <strong>{liveSmokeVerified.length}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>errors</span>
+          <strong>{providerIssues}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>latency</span>
+          <strong>{providerLatency}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>checks</span>
+          <strong>{safeHistory.total || 0}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>decision</span>
+          <strong>{formatDecisionReceipt(decisionReceipt)}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>providers</span>
+          <strong>{formatReceiptProviders(decisionReceipt)}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>ops jobs</span>
+          <strong>{formatSchedulerHealth(schedulerHealth)}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>stuck</span>
+          <strong>{(stuck.jobs || 0) + (stuck.builds?.length || 0) + (stuck.calls?.length || 0)}</strong>
+        </div>
+      </div>
+
+      <div className="prod-provider-strip">
+        {providerPreview.map((row) => (
+          <span key={row.provider} className={`prod-provider-pill is-${row.tone}`} title={row.title}>
+            {row.provider}
+          </span>
+        ))}
+      </div>
+
+      {providerProof.length ? (
+        <div className="prod-proof-table" aria-label="provider proof matrix">
+          <div className="prod-proof-head">
+            <span>provider</span>
+            <span>dry</span>
+            <span>live</span>
+            <span>cost</span>
+            <span>health</span>
+            <span>next</span>
+          </div>
+          {providerProof.slice(0, 9).map((row) => (
+            <div key={row.provider} className={`prod-proof-row is-${proofTone(row)}`}>
+              <strong>{row.provider}</strong>
+              <span>{formatProofSmoke(row.dryRun)}</span>
+              <span>{formatProofSmoke(row.liveSmoke)}</span>
+              <span>{formatUsd(row.cost?.costUsd24h || 0)}</span>
+              <span>{formatProofHealth(row)}</span>
+              <em title={row.nextAction || ''}>{row.nextAction || 'monitor'}</em>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {receiptHistory?.recent?.length ? (
+        <div className="prod-receipt-list" aria-label="safe-to-sell receipt history">
+          <div className="prod-receipt-head">
+            <span>receipt history</span>
+            <strong>{receiptHistory.blockedCount || 0} holds</strong>
+          </div>
+          {receiptHistory.recent.slice(0, 4).map((row) => (
+            <div key={row.id} className={`prod-receipt-row ${row.ok ? 'is-good' : 'is-blocked'}`}>
+              <strong>{row.decision || (row.ok ? 'sell' : 'hold')}</strong>
+              <span>{formatReceiptProof(row)}</span>
+              <em>{formatReceiptAge(row.generatedAt)}</em>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="prod-blocker-list">
+        {error ? <div className="prod-command-error">{error}</div> : null}
+        {blockers.length ? blockers.slice(0, 6).map((blocker) => (
+          <div key={blocker} className="prod-blocker-row">{blocker}</div>
+        )) : (
+          <div className="prod-blocker-row is-clear">no production blockers</div>
+        )}
+        {actionResult ? <div className="prod-command-note">{actionResult}</div> : null}
+        {blockers.length > 6 ? <div className="prod-blocker-more">+{blockers.length - 6} more</div> : null}
+      </div>
+
+      {nextActions.length ? (
+        <div className="prod-next-action-list">
+          {nextActions.slice(0, 4).map((action) => (
+            <div key={action} className="prod-next-action-row">{action}</div>
+          ))}
+          {nextActions.length > 4 ? <div className="prod-blocker-more">+{nextActions.length - 4} more actions</div> : null}
+        </div>
+      ) : null}
+
+      <div className="prod-command-actions">
+        <button type="button" onClick={load} disabled={loading || !!action}>refresh</button>
+        <button type="button" onClick={() => runAction('backup', () => api.backupOps())} disabled={loading || !!action}>
+          {action === 'backup' ? 'backing up' : 'backup'}
+        </button>
+        <button type="button" onClick={() => runAction('self-check', () => api.enqueueOpsSelfCheck({ reason: 'operator' }))} disabled={loading || !!action}>
+          {action === 'self-check' ? 'checking' : 'self-check'}
+        </button>
+        <button type="button" onClick={() => runAction('recover', () => api.recoverStuckOps({ dryRun: false }))} disabled={loading || !!action}>
+          {action === 'recover' ? 'recovering' : 'recover'}
+        </button>
+        <button type="button" onClick={() => runAction('export', async () => {
+          const payload = await api.exportOps({ includePII: false, limit: 500 });
+          downloadJson(payload, `callan-export-${Date.now()}.json`);
+          return payload;
+        })} disabled={loading || !!action}>
+          {action === 'export' ? 'exporting' : 'export'}
+        </button>
+        <button type="button" onClick={() => runAction('reset-scan', () => api.resetMockData({ dryRun: true }))} disabled={loading || !!action}>
+          {action === 'reset-scan' ? 'scanning' : 'reset scan'}
+        </button>
+        <button type="button" onClick={() => runAction('reset-apply', () => api.resetMockData({ dryRun: false }))} disabled={loading || !!action || !resetReady}>
+          {action === 'reset-apply' ? 'resetting' : 'reset demo'}
+        </button>
+      </div>
+
+      <div className="prod-admin-token">
+        <input
+          type="password"
+          value={adminToken}
+          onChange={(event) => setAdminToken(event.target.value)}
+          onBlur={saveAdminToken}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') saveAdminToken();
+          }}
+          placeholder="admin token"
+          aria-label="admin token"
+          autoComplete="off"
+        />
+        <button type="button" onClick={saveAdminToken} disabled={loading || !!action}>
+          {adminToken ? 'save' : 'clear'}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function PromotionStage({ label, stage }) {
+  const ok = stage?.ok === true;
+  const count = stage?.blockerCount ?? stage?.blockers?.length ?? null;
+  return (
+    <div className={`prod-promotion-card ${ok ? 'is-good' : 'is-blocked'}`} title={(stage?.blockers || []).slice(0, 4).join('\n')}>
+      <span>{label}</span>
+      <strong>{stage ? (ok ? 'ready' : `${count || 0} blocked`) : 'pending'}</strong>
+    </div>
+  );
+}
+
+function Metric({ label, value, tone = 'muted' }) {
+  return (
+    <div className={`prod-command-metric is-${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function providerRowsFrom(providers = {}) {
+  return Object.entries(providers || {}).map(([provider, row]) => {
+    const smokeStatus = row?.smokeStatus || row?.smoke?.status || 'unknown';
+    const liveSmoke = row?.liveSmoke || {};
+    const dryRunSmoke = row?.dryRunSmoke || {};
+    const live = liveSmoke.live === true && liveSmoke.status === 'ok' && liveSmoke.fresh === true;
+    const dry = dryRunSmoke.dryRun === true && ['configured', 'ok'].includes(dryRunSmoke.status);
+    const configured = row?.providerConfigured ?? row?.configured ?? false;
+    let tone = 'muted';
+    if (live) tone = 'good';
+    else if (dry || smokeStatus === 'ok' || smokeStatus === 'configured') tone = 'warm';
+    else if (!configured || smokeStatus === 'failed' || smokeStatus === 'missing') tone = 'bad';
+    return {
+      provider,
+      tone,
+      title: `${provider}: dry=${dryRunSmoke.status || 'not_run'} live=${liveSmoke.status || 'not_run'}${liveSmoke.fresh ? ' fresh' : liveSmoke.checkedAt ? ' stale' : ''}`
+    };
+  }).sort((a, b) => a.provider.localeCompare(b.provider));
+}
+
+function proofTone(row) {
+  if (!row?.configured || row?.status === 'missing_credentials') return 'bad';
+  if ((row.blockers || []).length) return 'bad';
+  if (row.liveSmoke?.verified && row.liveSmoke?.fresh) return 'good';
+  if (row.dryRun?.verified) return 'warm';
+  return 'muted';
+}
+
+function formatProofSmoke(smoke) {
+  if (!smoke) return 'n/a';
+  if (smoke.verified && smoke.fresh) return 'fresh';
+  if (smoke.verified) return smoke.live ? 'ok' : 'ready';
+  if (smoke.status === 'not_run') return 'none';
+  return smoke.status || 'n/a';
+}
+
+function formatProofHealth(row) {
+  if ((row.blockers || []).length) return `${row.blockers.length} block`;
+  if (row.slo?.issueRatePct) return `${row.slo.issueRatePct}%`;
+  if (row.slo?.ok === false) return 'blocked';
+  return 'ok';
+}
+
+function formatEvalSummary(summary) {
+  if (!summary) return 'pending';
+  const skipped = summary.skipped ? `/${summary.skipped}s` : '';
+  return `${summary.passed || 0}/${summary.total || 0}${skipped}`;
+}
+
+function formatUsd(value) {
+  const n = Number(value || 0);
+  const sign = n < 0 ? '-' : '';
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+
+function providerIssueCount(rows = []) {
+  return rows.reduce((sum, row) => sum + (row.failedCount || 0) + (row.blockedCount || 0) + (row.degradedCount || 0), 0);
+}
+
+function providerAverageLatency(rows = []) {
+  const totals = rows.reduce((acc, row) => {
+    if (row.avgDurationMs === null || row.avgDurationMs === undefined || !row.total) return acc;
+    acc.ms += row.avgDurationMs * row.total;
+    acc.events += row.total;
+    return acc;
+  }, { ms: 0, events: 0 });
+  if (!totals.events) return 'n/a';
+  return `${Math.round(totals.ms / totals.events)}ms`;
+}
+
+function formatSchedulerHealth(health) {
+  if (!health) return 'n/a';
+  return `${health.healthy || 0}/${health.enabled || 0}`;
+}
+
+function formatEconomicsHealth(health) {
+  if (!health) return 'n/a';
+  return health.ok === false ? 'blocked' : 'healthy';
+}
+
+function formatProviderSlo(slo) {
+  if (!slo) return 'n/a';
+  return slo.ok === false ? `${slo.blockers?.length || 0} blocked` : 'healthy';
+}
+
+function formatWorkerSlo(slo) {
+  if (!slo) return 'n/a';
+  return slo.ok === false ? `${slo.blockers?.length || 0} blocked` : 'healthy';
+}
+
+function formatSnapshotStatus(snapshot) {
+  if (!snapshot) return 'missing';
+  if (snapshot.ok) return 'fresh';
+  return snapshot.reason?.includes('stale') ? 'stale' : 'missing';
+}
+
+function formatSnapshotAge(snapshot) {
+  if (!snapshot?.ageMs && snapshot?.ageMs !== 0) return snapshot?.reason || 'missing';
+  const minutes = Math.round(snapshot.ageMs / 60_000);
+  if (minutes < 60) return `${minutes}m old`;
+  return `${Math.round(minutes / 60)}h old`;
+}
+
+function formatDecisionReceipt(receipt) {
+  if (!receipt) return 'pending';
+  return receipt.ok ? 'sell' : 'hold';
+}
+
+function formatReceiptProviders(receipt) {
+  const proof = receipt?.proof;
+  if (!proof) return 'n/a';
+  return `${proof.requiredLiveReady || 0}/${proof.requiredProviders || 0}`;
+}
+
+function formatReceiptProof(row) {
+  if (!row) return 'n/a';
+  const required = row.requiredProviders || 0;
+  const liveReady = row.requiredLiveReady ?? row.liveSmokeCount ?? 0;
+  const blockers = row.blockerCount || 0;
+  return `${liveReady}/${required || 'n/a'} live, ${blockers} blocks`;
+}
+
+function formatReceiptAge(generatedAt) {
+  const ts = Number(generatedAt || 0);
+  if (!ts) return 'pending';
+  const ageMs = Math.max(0, Date.now() - ts);
+  const minutes = Math.round(ageMs / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.round(minutes / 60)}h`;
+}
+
+function formatAdminActionResult(label, result) {
+  if (!result) return '';
+  if (label === 'backup') return `backup ${result.ok ? 'ready' : 'blocked'} (${result.files?.length || 0} files)`;
+  if (label === 'self-check') return result.report?.snapshot?.id || result.jobId || 'self-check queued';
+  if (label === 'recover') return `recovered ${result.jobs?.recovered || 0} jobs, ${result.calls?.recovered || 0} calls`;
+  if (label === 'export') return `exported ${Object.keys(result.tables || {}).length} tables`;
+  if (label === 'reset-scan') return `reset scan found ${result.totalMatched || 0} rows`;
+  if (label === 'reset-apply') return `reset changed ${result.totalChanged || 0} rows after backup`;
+  return result.ok ? 'done' : 'blocked';
+}
+
+function downloadJson(payload, filename) {
+  if (typeof document === 'undefined' || typeof URL === 'undefined' || typeof Blob === 'undefined') return;
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function SceneFallback() {
   return (
     <div style={{
@@ -112,6 +572,36 @@ function SceneFallback() {
       conjuring the floor…
     </div>
   );
+}
+
+function HandoffQueueOverlay({ cases = [], onFocusLead }) {
+  const open = cases.filter((item) => !['resolved', 'closed'].includes(item.status)).slice(0, 4);
+  if (!open.length) return null;
+  return (
+    <div className="handoff-stage-queue">
+      <div className="handoff-stage-head">
+        <span>handoff queue</span>
+        <strong>{open.length}</strong>
+      </div>
+      <div className="handoff-stage-list">
+        {open.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`handoff-stage-card handoff-severity-${item.severity}`}
+            onClick={() => item.lead_id && onFocusLead?.(item.lead_id)}
+          >
+            <span className="handoff-stage-meta">{item.severity} · {labelize(item.category)}</span>
+            <span className="handoff-stage-summary">{item.summary}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function labelize(value) {
+  return String(value || '').replace(/_/g, ' ');
 }
 
 function NodeDetailOverlay({

@@ -1,9 +1,8 @@
 import React, { useEffect, useMemo, useRef } from 'react';
 
 /**
- * Shown only when an inbound call is active.
  * Renders next to the 3D scene in the Operations stage so the operator can
- * watch transcripts stream in AND see research evidence land in parallel.
+ * watch inbound call/email intake, extracted facts, and research evidence.
  */
 export default function LiveInboundPanel({ inbound, onClose }) {
   const transcriptEndRef = useRef(null);
@@ -19,15 +18,17 @@ export default function LiveInboundPanel({ inbound, onClose }) {
   const seconds = Math.floor((ringingMs % 60000) / 1000).toString().padStart(2, '0');
 
   const demo = inbound.demoMode ? inbound.demoTarget : null;
+  const isEmail = inbound.channel === 'email';
   const pulseClass = demo
     ? 'is-demo'
     : inbound.active ? 'is-live' : 'is-done';
   const eyebrowText = demo
     ? 'DEMO MODE — outbound cold-call simulation'
-    : inbound.active ? 'live inbound call' : 'last inbound call';
+    : isEmail ? 'inbound email session'
+      : inbound.active ? 'live inbound call' : 'last inbound call';
   const titleText = demo
     ? `${demo.business} · ${demo.owner}`
-    : (inbound.callerName || maskPhone(inbound.fromNumber) || 'Inbound caller');
+    : (inbound.callerName || inbound.subject || maskPhone(inbound.fromNumber) || inbound.email || 'Inbound customer');
 
   return (
     <div className={`nyna-inbound-panel${demo ? ' is-demo' : ''}`}>
@@ -75,6 +76,13 @@ export default function LiveInboundPanel({ inbound, onClose }) {
             ].filter(Boolean).join(' · ') || 'context loaded from supermemory'}
           </span>
         </div>
+      ) : isEmail && (inbound.threadId || inbound.email) ? (
+        <div className="nyna-inbound-banner">
+          <span className="nyna-inbound-banner-eyebrow">thread</span>
+          <span className="nyna-inbound-banner-body">
+            {[inbound.email, inbound.threadId, inbound.subject].filter(Boolean).join(' · ')}
+          </span>
+        </div>
       ) : null}
 
       <div className="nyna-inbound-cols">
@@ -99,10 +107,47 @@ export default function LiveInboundPanel({ inbound, onClose }) {
 
         <section className="nyna-inbound-col">
           <div className="nyna-inbound-col-head">
-            <span className="nyna-inbound-col-eyebrow">live research</span>
-            <span className="nyna-inbound-col-count">{inbound.evidence?.length || 0} captures</span>
+            <span className="nyna-inbound-col-eyebrow">intake state</span>
+            <span className="nyna-inbound-col-count">{inbound.readyForQuote ? 'quote ready' : `${inbound.requiredMissingFields?.length || 0} needed`}</span>
           </div>
           <div className="nyna-inbound-research">
+            {inbound.facts ? (
+              <div className="nyna-inbound-facts">
+                <div className="nyna-inbound-fact-grid">
+                  {factRows(inbound.facts).map((row) => (
+                    <div key={row.key} className="nyna-inbound-fact">
+                      <span>{row.label}</span>
+                      <strong>{row.value}</strong>
+                    </div>
+                  ))}
+                </div>
+                <div className="nyna-inbound-next">
+                  <span>next</span>
+                  <strong>{inbound.nextQuestion || inbound.nextAction || 'ready'}</strong>
+                </div>
+                {inbound.requiredMissingFields?.length ? (
+                  <div className="nyna-inbound-missing">
+                    {inbound.requiredMissingFields.map((field) => (
+                      <span key={field}>{fieldLabel(field)}</span>
+                    ))}
+                  </div>
+                ) : null}
+                {inbound.portalUrl ? (
+                  <a className="nyna-inbound-link" href={inbound.portalUrl} target="_blank" rel="noreferrer">
+                    portal
+                  </a>
+                ) : null}
+                {inbound.invoiceUrl ? (
+                  <a className="nyna-inbound-link is-invoice" href={inbound.invoiceUrl} target="_blank" rel="noreferrer">
+                    quote
+                  </a>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="nyna-inbound-col-head is-inline">
+              <span className="nyna-inbound-col-eyebrow">live research</span>
+              <span className="nyna-inbound-col-count">{inbound.evidence?.length || 0} captures</span>
+            </div>
             {(inbound.lanes || []).map((lane) => (
               <div key={lane.lane} className={`nyna-research-lane nyna-research-lane-${lane.status}`}>
                 <span className="nyna-research-lane-dot" />
@@ -139,4 +184,26 @@ function maskPhone(p) {
   const digits = String(p).replace(/\D/g, '');
   if (digits.length < 7) return p;
   return `(${digits.slice(-10, -7) || '—'}) ${digits.slice(-7, -4)} ${digits.slice(-4)}`;
+}
+
+function factRows(facts) {
+  const rows = [
+    ['businessName', 'business', facts.businessName],
+    ['niche', 'niche', facts.niche],
+    ['city', 'city', facts.city],
+    ['phone', 'phone', facts.phone],
+    ['email', 'email', facts.email],
+    ['services', 'services', Array.isArray(facts.services) ? facts.services.slice(0, 3).join(', ') : null],
+    ['desiredCta', 'cta', facts.desiredCta],
+    ['hours', 'hours', facts.hours]
+  ];
+  return rows
+    .filter(([, , value]) => value)
+    .map(([key, label, value]) => ({ key, label, value }));
+}
+
+function fieldLabel(field) {
+  return String(field || '')
+    .replace(/([A-Z])/g, ' $1')
+    .toLowerCase();
 }

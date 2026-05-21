@@ -26,6 +26,7 @@ export default function GrowthConsole({ detail, focusedLeadId, onLeadChanged }) 
   const next = offers?.nextRecommendedService || null;
   const lastFollowup = followups[0] || null;
   const unsupported = plan?.unsupportedFlags || [];
+  const handoffCases = (detail?.handoff?.cases || []).filter((item) => !['resolved', 'closed'].includes(item.status));
 
   async function run(action) {
     if (!focusedLeadId) return;
@@ -72,6 +73,19 @@ export default function GrowthConsole({ detail, focusedLeadId, onLeadChanged }) 
       </div>
 
       {error ? <div className="growth-error mono">{error}</div> : null}
+
+      {handoffCases.length ? (
+        <section className="growth-risk">
+          <div className="growth-risk-title mono">operator cases</div>
+          <div className="growth-risk-flags">
+            {handoffCases.slice(0, 4).map((item) => (
+              <span key={item.id} className={`thread-flag thread-flag-${item.severity === 'high' ? 'bad' : 'warn'}`}>
+                {labelize(item.category)}
+              </span>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       {next ? (
         <section className="growth-next">
@@ -186,6 +200,10 @@ function priorityTone(priority) {
   if (priority === 'high') return 'warn';
   if (priority === 'low') return 'muted';
   return 'info';
+}
+
+function labelize(value) {
+  return String(value || '').replace(/_/g, ' ');
 }
 
 function formatWhen(ts) {

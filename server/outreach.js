@@ -11,10 +11,13 @@ import { callAttempts, contactEvents, db, leads } from './db.js';
 import { env } from './env.js';
 import { emit } from './sse.js';
 import { liveReadiness } from './readiness.js';
+import { enqueueJob } from './jobs.js';
 import { runCaller } from './workers/caller.js';
 import { scoreOnlinePresence } from './presenceScorer.js';
 import { applyPriorityToLead, refreshAllPriorityScores } from './leadPriority.js';
 import { executeDueChannel, listDueCadenceLeads } from './cadence.js';
+
+export const OUTREACH_LEAD_JOB_TYPE = 'outreach.lead';
 
 export const OUTREACH_STATES = Object.freeze({
   QUEUED: 'queued',
@@ -278,6 +281,55 @@ export function canRouteCallLead(leadId, options = {}) {
   return explanation.callable ? { ok: true, explanation } : { ok: false, explanation };
 }
 
+export function enqueueOutreachLeadJob({
+  leadId,
+  agentId = null,
+  phoneClassification = null,
+  source = 'outreach.loop',
+  runAt = Date.now(),
+  idempotencyKey = null,
+  maxAttempts = 3
+} = {}) {
+  if (!leadId) throw new Error('enqueueOutreachLeadJob requires leadId');
+  return enqueueJob({
+    type: OUTREACH_LEAD_JOB_TYPE,
+    payload: {
+      leadId,
+      agentId,
+      phoneClassification,
+      source
+    },
+    idempotencyKey: idempotencyKey || `${OUTREACH_LEAD_JOB_TYPE}:${leadId}:${source}:${runAt}`,
+    runAt,
+    maxAttempts
+  });
+}
+
+export async function handleOutreachLeadJob(payload = {}) {
+  const leadId = payload.leadId;
+  if (!leadId) return { ok: false, skipped: true, reason: 'missing_leadId' };
+  const lead = leads.get(leadId);
+  if (!lead) return { ok: false, skipped: true, reason: 'lead_not_found', leadId };
+  if (SKIP_OUTREACH_STATES.has(lead.outreach_status) || ['completed', 'called', 'paid'].includes(lead.outreach_status)) {
+    return { ok: true, skipped: true, reason: `state:${lead.outreach_status}`, leadId };
+  }
+  const job = {
+    agentId: payload.agentId || nextAgentId(),
+    leadId,
+    businessName: lead.business_name,
+    startedAt: Date.now(),
+    phoneClassification: payload.phoneClassification || lead.phone_classification || null,
+    durable: true
+  };
+  const explanation = explainCallabilityForLead(lead, {
+    ignoreQueueState: true,
+    ignoreRetryBackoff: true,
+    ignorePause: true
+  });
+  const result = await runLeadOutreach(lead, explanation, { job });
+  return { ok: true, leadId, source: payload.source || 'durable_job', ...(result || {}) };
+}
+
 async function processOutreachBatch() {
   if (processingBatch) return;
   processingBatch = true;
@@ -366,9 +418,32 @@ async function processOutreachBatchOnce() {
       mode: env.runMode
     });
     emit('outreach.agent_claimed', { ...job, active: activeJobs.size, concurrency: outreachConcurrency() });
-    runLeadOutreach(claim.row, explanation, { check, job }).catch((err) => {
+    try {
+      const queued = enqueueOutreachLeadJob({
+        leadId: claim.row.id,
+        agentId: job.agentId,
+        phoneClassification: check.phoneClassification,
+        source: 'outreach.loop',
+        runAt: now,
+        idempotencyKey: `${OUTREACH_LEAD_JOB_TYPE}:${claim.row.id}:${now}`
+      });
+      emit('outreach.job_queued', {
+        worker: 'caller',
+        leadId: claim.row.id,
+        jobId: queued.row?.id || null,
+        jobStatus: queued.row?.status || null,
+        duplicate: !queued.inserted
+      });
+    } catch (err) {
+      activeJobs.delete(claim.row.id);
+      leads.update(claim.row.id, {
+        outreach_status: OUTREACH_STATES.QUEUED,
+        risk_status: 'job_enqueue_failed',
+        next_action: 'call'
+      });
       emit('outreach.error', { worker: 'caller', leadId: claim.row.id, error: err?.message || String(err) });
-    });
+      continue;
+    }
     started += 1;
   }
 
@@ -386,7 +461,7 @@ async function drainDueCadence() {
   if (!dueLeads.length) return;
 
   for (const lead of dueLeads) {
-    if (activeJob && lead.attempt_channel === 'call_retry') continue;
+    if (activeJobs.size > 0 && lead.attempt_channel === 'call_retry') continue;
     const channel = lead.attempt_channel;
     if (!channel) {
       try {
@@ -420,7 +495,7 @@ async function runLeadOutreach(lead, explanation, { check = null, job = null } =
       blockers: [{ name: 'callability', reason: check.reason, terminal: true }],
       gates: [...(explanation.gates || []), { name: 'callability', ok: false, reason: check.reason, terminal: true }]
     });
-    return;
+    return { ok: false, blocked: true, reason: check.reason };
   }
 
   const now = Date.now();
@@ -453,25 +528,27 @@ async function runLeadOutreach(lead, explanation, { check = null, job = null } =
     emit('outreach.running', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
     emit('outreach.calling', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
 
-    await runCaller({ leadId: lead.id, toPhone: check.phone });
+    const callResult = await runCaller({ leadId: lead.id, toPhone: check.phone });
 
     const latest = leads.get(lead.id);
     if (latest && (BLOCKED_STATES.has(latest.outreach_status) || latest.risk_status === 'opt-out')) {
       markLeadBlockedVisible(latest, latest.risk_status || 'blocked_after_call', { next_action: latest.next_action || 'blocked' });
-      return;
+      return { ok: true, outcome: 'blocked_after_call', callId: callResult?.callId || null };
     }
     leads.update(lead.id, { outreach_status: OUTREACH_STATES.COMPLETED, next_action: 'await_analysis' });
     recordOutreachEvent(lead.id, 'outreach_completed', 'caller completed', { mode: env.runMode });
     emit('outreach.completed', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null });
+    return { ok: true, outcome: 'completed', callId: callResult?.callId || null };
   } catch (err) {
     const latest = leads.get(lead.id) || lead;
     if (BLOCKED_STATES.has(latest.outreach_status) || latest.risk_status === 'opt-out') {
       markLeadBlockedVisible(latest, latest.risk_status || 'call_refused', {
         next_action: latest.next_action || 'blocked'
       }, { error: err?.message || String(err) });
-      return;
+      return { ok: false, outcome: 'blocked_after_error', error: err?.message || String(err) };
     }
     scheduleRetryOrFail(latest, err);
+    return { ok: false, outcome: 'retry_or_failed', error: err?.message || String(err) };
   } finally {
     activeJobs.delete(lead.id);
     emit('outreach.agent_released', { leadId: lead.id, businessName: lead.business_name, active: activeJobs.size, concurrency: outreachConcurrency() });

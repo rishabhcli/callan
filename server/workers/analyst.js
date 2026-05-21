@@ -5,8 +5,10 @@ import { generateStructured } from '../reasoning/geminiReasoner.js';
 import { CallAnalysis } from '../reasoning/schemas.js';
 import { env } from '../env.js';
 import { log } from '../logger.js';
-import { generateGrowthPlanForLead } from '../growth/index.js';
+import { enqueueGrowthPlanJob } from '../growthQueue.js';
 import { applyMossAnalystFeedback } from '../moss/analysis.js';
+import { enqueueJob } from '../jobs.js';
+import { assertProviderOperational } from '../providerIncidents.js';
 
 const OUTCOME_TO_STATUS = {
   won: 'closing',
@@ -25,6 +27,11 @@ export async function runAnalyst({ leadId, callId }) {
   try {
     const lead = leads.get(leadId);
     if (!lead) throw new Error(`lead not found: ${leadId}`);
+    assertProviderOperational('gemini', {
+      worker: 'analyst',
+      leadId,
+      eventId: callId || runId
+    });
     const tag = containerTagFor(leadId);
 
     const [profileDoc, pitchDoc] = await Promise.all([
@@ -96,9 +103,18 @@ export async function runAnalyst({ leadId, callId }) {
     }
     if (Object.keys(leadPatch).length) leads.update(leadId, leadPatch);
 
-    let growthPlan = null;
+    let growthPlanJob = null;
     try {
-      growthPlan = await generateGrowthPlanForLead({ leadId, source: 'analyst' });
+      const queued = enqueueGrowthPlanJob({ leadId, source: 'analyst' });
+      growthPlanJob = queued.row || null;
+      emit(queued.inserted ? 'analyst.growth_queued' : 'analyst.growth_duplicate', {
+        worker: 'analyst',
+        leadId,
+        callId,
+        runId,
+        jobId: growthPlanJob?.id || null,
+        duplicate: !queued.inserted
+      });
     } catch (err) {
       log.warn('analyst.growth_plan_skipped', { leadId, callId, error: err?.message || String(err) });
       emit('analyst.growth_skipped', {
@@ -119,16 +135,13 @@ export async function runAnalyst({ leadId, callId }) {
       failureReason: postMortem.failureReason,
       nextBestAction: postMortem.nextBestAction?.code,
       confirmedEmail: postMortem.confirmedEmail,
-      growthPlanId: growthPlan?.row?.id || null,
-      growthNextService: growthPlan?.offers?.nextRecommendedService?.id || null
+      growthPlanJobId: growthPlanJob?.id || null
     });
 
     if (postMortem.outcome === 'won') {
       const toEmail = resolveMailerEmail(lead, postMortem);
       if (toEmail) {
-        import('./mailer.js')
-          .then((m) => m.runMailer({ leadId, toEmail }))
-          .catch((err) => log.warn('analyst.mailer.fire_failed', { leadId, err: err?.message }));
+        enqueueWonFollowupEmail({ leadId, callId, toEmail, runId });
       } else {
         emit('analyst.mailer.skipped', {
           worker: 'analyst',
@@ -152,18 +165,61 @@ export async function runAnalyst({ leadId, callId }) {
         customerQuestions: postMortem.customerQuestions,
         mossSnippetFeedback: postMortem.mossSnippetFeedback,
         reasoningTraceId: trace?.id || null,
-        growthPlan: growthPlan ? {
-          id: growthPlan.row?.id || null,
-          nextRecommendedService: growthPlan.offers?.nextRecommendedService?.id || null,
-          unsupportedFlags: growthPlan.plan?.unsupportedFlags || []
-        } : null
+        growthPlanJobId: growthPlanJob?.id || null
       }
     });
     return { postMortem };
   } catch (err) {
-    runs.finish(runId, { state: 'failed', error: err?.message || String(err) });
-    emit('analyst.error', { worker: 'analyst', leadId, runId, error: err?.message || String(err) });
+    const blocked = err?.operationalState === 'blocked';
+    runs.finish(runId, blocked
+      ? {
+          state: 'blocked',
+          detail: {
+            blocker: err?.blocker || err?.message || String(err),
+            provider: err?.provider || null,
+            code: err?.code || null
+          }
+        }
+      : { state: 'failed', error: err?.message || String(err) });
+    emit(blocked ? 'analyst.blocked' : 'analyst.error', {
+      worker: 'analyst',
+      leadId,
+      runId,
+      error: err?.message || String(err),
+      provider: err?.provider || null,
+      code: err?.code || null
+    });
     throw err;
+  }
+}
+
+function enqueueWonFollowupEmail({ leadId, callId, toEmail, runId }) {
+  try {
+    const normalizedEmail = String(toEmail || '').trim().toLowerCase();
+    const result = enqueueJob({
+      type: 'mail.followup',
+      payload: {
+        leadId,
+        toEmail: normalizedEmail,
+        source: 'analyst',
+        callId: callId || null
+      },
+      idempotencyKey: `mail.followup:analyst:${callId || leadId}:${normalizedEmail}`,
+      maxAttempts: 5
+    });
+    emit('analyst.mailer.queued', {
+      worker: 'analyst',
+      leadId,
+      callId,
+      runId,
+      toEmail: normalizedEmail,
+      jobId: result.row?.id || null,
+      duplicate: !result.inserted
+    });
+    return result.row || null;
+  } catch (err) {
+    log.warn('analyst.mailer.queue_failed', { leadId, callId, runId, error: err?.message || String(err) });
+    return null;
   }
 }
 
@@ -283,6 +339,8 @@ function normalizeAnalysis({ modelAnalysis, lead, call, transcript }) {
     invoiceEmail: emailConfirmation.confirmed ? emailConfirmation.email : null,
     confirmedEmail: emailConfirmation.confirmed,
     emailConfirmation,
+    invoiceEmailConfidence: emailConfirmation.confidence,
+    invoiceEmailSourceExcerpt: emailConfirmation.sourceExcerpt,
     customerQuestions,
     nextBestAction,
     followupEmailDraft: outcome === 'won' ? cleanText(modelAnalysis?.followupEmailDraft) : null,
@@ -302,6 +360,8 @@ function eventAnalysis(postMortem) {
     failureReason: postMortem.failureReason,
     invoiceEmail: postMortem.invoiceEmail,
     confirmedEmail: postMortem.confirmedEmail,
+    invoiceEmailConfidence: postMortem.invoiceEmailConfidence,
+    invoiceEmailSourceExcerpt: postMortem.invoiceEmailSourceExcerpt,
     customerQuestions: postMortem.customerQuestions,
     replayMoments: postMortem.replayMoments,
     nextBestAction: postMortem.nextBestAction
@@ -495,6 +555,8 @@ export function extractConfirmedInvoiceEmail({ transcript, modelEmail }) {
         email: candidate,
         confirmed: true,
         source: 'transcript_readback',
+        confidence: 0.98,
+        sourceExcerpt: excerpt(`${turn.text} ${readBack.turn.text} ${confirmation.turn.text}`, 320),
         providedTurnIndex: i,
         readBackTurnIndex: readBack.index,
         confirmationTurnIndex: confirmation.index,
@@ -512,6 +574,8 @@ export function extractConfirmedInvoiceEmail({ transcript, modelEmail }) {
     email: unconfirmed,
     confirmed: false,
     source: unconfirmed ? 'unconfirmed_candidate' : 'none',
+    confidence: unconfirmed ? 0.42 : 0,
+    sourceExcerpt: unconfirmed ? excerpt(transcriptText(transcript), 320) : null,
     providedTurnIndex: null,
     readBackTurnIndex: null,
     confirmationTurnIndex: null,
@@ -617,7 +681,8 @@ function joinEmailTokens(tokens) {
 const EMAIL_STOP_WORDS = new Set([
   'email', 'mail', 'address', 'invoice', 'send', 'sent', 'is', 'it', 'to', 'for', 'me', 'my', 'the',
   'a', 'an', 'best', 'would', 'be', 'please', 'thanks', 'thank', 'you', 'yes', 'yeah', 'yep',
-  'right', 'correct', 'confirm', 'confirmed', 'use', 'using', 'with', 'on', 'at'
+  'right', 'correct', 'confirm', 'confirmed', 'use', 'using', 'with', 'on', 'at', 'its', 's',
+  'no', 'nope', 'wrong', 'incorrect', 'actually', 'correction', 'not', 'that'
 ]);
 
 function extractCustomerQuestions(turns) {

@@ -15,6 +15,7 @@ import { env } from './env.js';
 import { log } from './logger.js';
 import { emit } from './sse.js';
 import { transferAgentPhoneCall, updateAgentPhoneAgent } from './providers/agentphone.js';
+import { createHandoffCaseFromCallTransfer } from './handoff.js';
 
 export const OPERATOR_TRANSFER_NUMBER = process.env.OPERATOR_TRANSFER_NUMBER || '';
 
@@ -31,6 +32,16 @@ const HUMAN_INTENT_PATTERNS = [
 // these, so we surface them and let the caller gate via OPERATOR_TRANSFER_NUMBER.
 const OBJECTION_PATTERNS = [
   /\b(i need to think|this is too expensive|i can'?t afford|too pricey|too much money)\b/i
+];
+
+const CONSENT_UNCERTAINTY_PATTERNS = [
+  /\bdid(?:n'?t| not)\s+consent\b/i,
+  /\bdo\s+not\s+record\b/i,
+  /\bstop\s+recording\b/i,
+  /\bare\s+you\s+recording\b/i,
+  /\bwhere\s+did\s+you\s+get\s+my\s+number\b/i,
+  /\bhow\s+did\s+you\s+get\s+my\s+number\b/i,
+  /\btake\s+me\s+off\s+(?:your\s+)?call\s+list\b/i
 ];
 
 // Per-process dedupe so we never warm-transfer the same call twice — keyed by
@@ -57,6 +68,10 @@ export function shouldTransfer(transcript) {
       const m = text.match(rx);
       if (m) return { transfer: true, reason: `human_intent:${m[0].toLowerCase()}` };
     }
+    for (const rx of CONSENT_UNCERTAINTY_PATTERNS) {
+      const m = text.match(rx);
+      if (m) return { transfer: true, reason: `uncertain_consent:${m[0].toLowerCase()}` };
+    }
     for (const rx of OBJECTION_PATTERNS) {
       const m = text.match(rx);
       if (m) return { transfer: true, reason: `objection:${m[0].toLowerCase()}` };
@@ -78,12 +93,20 @@ export async function transferCallToOperator({ providerCallId, leadId, callId, r
   // both fire a transfer for the same call.
   transferredCallIds.add(dedupeKey);
 
+  const handoff = createHandoffCaseFromCallTransfer({
+    leadId,
+    callId,
+    providerCallId,
+    reason
+  });
+
   emit('caller.transfer_requested', {
     worker: 'caller',
     leadId,
     callId,
     providerCallId,
     reason,
+    handoffCaseId: handoff?.case?.id || null,
     to: OPERATOR_TRANSFER_NUMBER ? maskTail(OPERATOR_TRANSFER_NUMBER) : null
   });
 

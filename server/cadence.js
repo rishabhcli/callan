@@ -6,6 +6,7 @@ import { env } from './env.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
 import { generateText } from './gemini.js';
 import { addDoc, containerTagFor } from './memory.js';
+import { enqueueJob } from './jobs.js';
 
 /**
  * Cadence ladder for unresponsive leads.
@@ -199,9 +200,24 @@ function clearCadenceSchedule(leadId, { keepCount = true } = {}) {
 
 async function executeCallRetry({ leadId, lead }) {
   emit('cadence.executing', { leadId, channel: 'call_retry', businessName: lead.business_name });
-  const { runCaller } = await import('./workers/caller.js');
-  cadenceFire('caller', { leadId, toPhone: lead.phone || null, source: 'cadence_retry' }, runCaller);
-  return { ok: true, fired: 'caller' };
+  const result = enqueueJob({
+    type: 'call.followup',
+    payload: {
+      leadId,
+      toPhone: lead.phone || null,
+      source: 'cadence_retry'
+    },
+    idempotencyKey: `call.followup:cadence:${leadId}:${lead.next_attempt_at || Date.now()}`,
+    maxAttempts: 5
+  });
+  emit('cadence.call_retry_queued', {
+    leadId,
+    channel: 'call_retry',
+    jobId: result.row?.id || null,
+    jobStatus: result.row?.status || null,
+    duplicate: !result.inserted
+  });
+  return { ok: true, fired: 'call.followup', jobId: result.row?.id || null, duplicate: !result.inserted };
 }
 
 async function executeEmailNudge({ leadId, lead }) {
@@ -364,17 +380,4 @@ export async function executeDueChannel({ leadId, channel } = {}) {
   } finally {
     if (chosenChannel !== 'archive') clearCadenceSchedule(leadId);
   }
-}
-
-/**
- * Fire helper mirroring server/index.js's `fire`. Local so cadence.js has no
- * dependency on the express handler module.
- */
-function cadenceFire(worker, args, fn) {
-  Promise.resolve()
-    .then(() => fn(args))
-    .catch((err) => {
-      log.error(`${worker}.unhandled`, { error: err?.message || String(err) });
-      emit(`${worker}.error`, { worker, error: err?.message || String(err), ...args });
-    });
 }

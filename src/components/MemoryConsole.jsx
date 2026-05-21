@@ -12,6 +12,7 @@ const MEMORY_KINDS = [
   'build_brief',
   'build_result',
   'growth_plan',
+  'commerce_plan',
   'compliance_decision'
 ];
 

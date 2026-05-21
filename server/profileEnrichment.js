@@ -1,4 +1,5 @@
 import { BusinessProfile } from './reasoning/schemas.js';
+import { buildLeadIntelligence } from './research/leadIntelligence.js';
 
 const PRESENCE = new Set(['none', 'weak', 'mixed', 'strong']);
 const PROFILE_SOURCES = new Set(['live_browser', 'gemini_mock', 'provided', 'memory_write', 'memory_repair', 'unknown']);
@@ -167,6 +168,19 @@ export function enrichBusinessProfile(input, context = {}) {
       address: addressProvenance
     }
   };
+  profile.leadIntelligence = buildLeadIntelligence({
+    profile,
+    raw,
+    sourceEvidence: raw.sourceEvidence,
+    reviews: raw.reviews
+  }, {
+    businessName,
+    niche,
+    city,
+    sourceUrl: sourceUrl || yelpUrl,
+    sourceType: profileSource,
+    capturedAt
+  });
 
   const parsed = BusinessProfile.safeParse(profile);
   if (parsed.success) {

@@ -40,6 +40,19 @@
       "response": "Understood. The page does not have to take bookings; it can simply send people to call, text, or DM you, so you still gatekeep who sits in the chair."
     }
   ],
+  "objectionMap": {
+    "skeptical": "Fair question. I am Callan from callmemaybe. I was checking public barber and salon listings for whether new clients can quickly see cuts, hours, location, and how to book.",
+    "ai_disclosure": "Yes, I am an AI voice operator for callmemaybe, and this call is automated and recorded. I can keep it quick or remove you if you do not want the call.",
+    "number_source": "I used public business listing research for the shop, not a private contact list. If you want no more calls, say stop and I will mark it.",
+    "pricing": "It is a flat $450 for a photo-led page with hours, location, booking or DM link, and proof from your work. Nothing starts unless you choose to pay the invoice.",
+    "send_info": "I can send the short version through AgentMail. What email should I use? I will read it back before anything goes out.",
+    "call_later": "No problem. What exact time works around clients? I do not want to interrupt you mid-cut again."
+  },
+  "reviewValueProps": [
+    "Turn review mentions of clean fades, friendly service, and loyal clients into proof beside the booking CTA.",
+    "Make hours, chair location, price feel, and booking or DM link obvious for first-time clients.",
+    "Use existing Instagram or review photos as the first visual proof instead of a generic salon page."
+  ],
   "siteTemplateHint": "Use a warm, photo-led barber template: dark, masculine palette with one bold accent, big hero image of the chair or a finished cut, services with simple price tier copy, hours, and a sticky tap-to-call button.",
   "customerPersonaHint": "Local clients searching for a new barber or stylist, scrolling fast on a phone, looking for photos of work, a price feel, hours, and a quick way to call or DM."
 }

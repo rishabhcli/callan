@@ -43,6 +43,19 @@
       "response": "Fair. The difference here is a single page focused on the emergency homeowner search, with the phone number and the service area first, not a brochure site no one ever scrolls."
     }
   ],
+  "objectionMap": {
+    "skeptical": "Fair question. I am Callan from callmemaybe. I was checking public HVAC listings for whether homeowners can quickly see service area, urgent repair coverage, and a number to call.",
+    "ai_disclosure": "Yes, I am an AI voice operator for callmemaybe, and this call is automated and recorded. I can keep it to the HVAC website offer or remove you if it is not useful.",
+    "number_source": "I used public business listing research for your HVAC company, not a private contact list. Say stop if you want no more calls.",
+    "pricing": "It is a flat $600 because the page has to make service area, heating/cooling work, emergency intent, and tap-to-call obvious. Nothing starts unless you choose to pay the invoice.",
+    "send_info": "I can send the short version through AgentMail. If you want that, what email should I use? I will read it back before sending.",
+    "call_later": "No problem. What exact day and time should I call? I do not want to interrupt you on a job twice."
+  },
+  "reviewValueProps": [
+    "Use review language about fast response, honest diagnosis, and emergency AC or furnace fixes as trust proof.",
+    "Put service area, repair/install categories, and tap-to-call before any long copy.",
+    "Reflect repeated review mentions of same-day service, seasonal maintenance, and no-heat/no-AC emergencies."
+  ],
   "siteTemplateHint": "Use the dependable HVAC/contractor template: white background with deep navy and a safety yellow accent, hero with service area and a huge tap-to-call CTA, short repair vs install service grid, license note if confirmed, and trust proof from existing reviews.",
   "customerPersonaHint": "Homeowners in an urgent moment (no AC, no heat, leak) Googling on a phone, looking for a real local number to call and confirmation that the company covers their town."
 }

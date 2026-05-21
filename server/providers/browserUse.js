@@ -33,12 +33,18 @@ const TERMINAL_STATUSES = new Set(['stopped', 'timed_out', 'error']);
 const LOVABLE_PROJECT_RE = /\bhttps:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.lovable\.app(?:\/[^\s"'<>]*)?/ig;
 const AUTH_WALL_RE = /\b(BLOCKED_AUTH|auth(?:entication)? (?:needed|required)|login required|log in|login|sign in|sign-in|signin|continue with (?:google|github|email)|create an account|session expired)\b/i;
 const CLAIM_PATTERNS = [
-  { code: 'online_booking', pattern: /\b(book online|online booking|schedule online|appointment booking|booking system)\b/i },
-  { code: 'online_payment', pattern: /\b(pay online|online payment|checkout|deposit|financing|payment plan)\b/i },
-  { code: 'guarantee', pattern: /\b(guaranteed|satisfaction guarantee|money back)\b/i },
-  { code: 'license_or_insurance', pattern: /\b(licensed|insured|bonded)\b/i },
-  { code: 'reviews_or_awards', pattern: /\b(5[- ]?star|five[- ]?star|award[- ]winning|best rated|top rated)\b/i },
-  { code: 'same_day_or_emergency', pattern: /\b(same[- ]day|24\/7|24-7|emergency service)\b/i }
+  { code: 'online_booking', allowKey: 'booking', pattern: /\b(book online|online booking|schedule online|appointment booking|booking system)\b/i },
+  { code: 'online_payment', allowKey: 'payments', pattern: /\b(pay online|online payment|checkout|deposit|financing|payment plan)\b/i },
+  { code: 'guarantee', allowKey: 'guarantee', pattern: /\b(guaranteed|satisfaction guarantee|money back)\b/i },
+  { code: 'license_or_insurance', allowKey: 'license_or_insurance', pattern: /\b(licensed|insured|bonded)\b/i },
+  { code: 'reviews_or_awards', allowKey: 'reviews_or_awards', pattern: /\b(5[- ]?star|five[- ]?star|award[- ]winning|best rated|top rated)\b/i },
+  { code: 'same_day_or_emergency', allowKey: 'same_day_or_emergency', pattern: /\b(same[- ]day|24\/7|24-7|emergency service|emergency repair)\b/i }
+];
+const INTERNAL_PUBLIC_COPY_PATTERNS = [
+  { code: 'internal_source_marker', pattern: /\b(source:|presence:|memory_write|lead intelligence|evidence\/source)\b/i },
+  { code: 'internal_research_instruction', pattern: /\b(customer supplied|use it as context|existing website|current website|conversion path|call should ask|not captured yet)\b/i },
+  { code: 'sales_diagnosis_leak', pattern: /\b(no owned|weak owned|owned service page|tap-to-call mobile cta)\b/i },
+  { code: 'provider_or_payment_leak', pattern: /\b(agentmail|stripe|browser-use cloud)\b/i }
 ];
 
 export function browserUseConfigured(config = env.browserUse) {
@@ -179,13 +185,26 @@ export async function inspectGeneratedSite({ url, html, brief, lead, mock = fals
   }
 
   const visibleText = visibleTextFromHtml(sourceHtml || '');
+  const links = linksFromHtml(sourceHtml || '');
+  const screenshotEvidence = await maybePlaywrightScreenshots({ url: inspectedUrl, html: sourceHtml, mock });
   const checklist = [
     checkBusinessName({ visibleText, brief, lead }),
     checkPhone({ visibleText, html: sourceHtml, brief, lead }),
     checkServices({ visibleText, brief }),
     checkCta({ visibleText, html: sourceHtml, brief }),
     checkMobile({ html: sourceHtml }),
-    checkHallucinatedClaims({ visibleText, brief })
+    checkDesktop({ html: sourceHtml }),
+    checkContactPaths({ html: sourceHtml, visibleText, brief, lead }),
+    checkLocalBusinessSchema({ html: sourceHtml, brief, lead }),
+    checkLocationDetails({ visibleText, brief, lead }),
+    checkImageAltText({ html: sourceHtml }),
+    checkBrokenLinks({ links, html: sourceHtml }),
+    checkNoInternalPublicCopy({ visibleText }),
+    checkHallucinatedClaims({ visibleText, brief }),
+    checkInvoicePaymentState({ brief, lead }),
+    checkOperatorApproval({ brief }),
+    checkCustomerApproval({ brief }),
+    ...screenshotEvidence.checklist
   ];
 
   if (fetchError) {
@@ -198,9 +217,19 @@ export async function inspectGeneratedSite({ url, html, brief, lead, mock = fals
     });
   }
 
-  const errors = checklist.filter((item) => !item.passed).map((item) => item.key);
+  const errors = checklist.filter((item) => !item.passed && item.blocksBuild !== false).map((item) => item.key);
   const passed = errors.length === 0;
-  const score = Math.round((checklist.filter((item) => item.passed).length / checklist.length) * 100);
+  const buildChecks = checklist.filter((item) => item.blocksBuild !== false);
+  const score = Math.round((buildChecks.filter((item) => item.passed).length / Math.max(buildChecks.length, 1)) * 100);
+  const launchChecklist = checklist.map((item) => ({
+    key: item.key,
+    label: item.label,
+    category: item.category || 'site',
+    passed: item.passed,
+    severity: item.severity || 'warn',
+    blocksBuild: item.blocksBuild !== false,
+    detail: item.detail || ''
+  }));
 
   return {
     provider: html ? 'html' : 'fetch',
@@ -212,10 +241,29 @@ export async function inspectGeneratedSite({ url, html, brief, lead, mock = fals
     checklist,
     errors,
     warnings: checklist.filter((item) => !item.passed && item.severity !== 'blocker').map((item) => item.key),
-    claims: claimReport(visibleText),
+    claims: {
+      ...claimReport(visibleText, { brief }),
+      links,
+      launchChecklist,
+      screenshots: screenshotEvidence.screenshots,
+      screenshotChecks: screenshotEvidence.checklist,
+      inspectedUrl: inspectedUrl || url || null
+    },
+    launchChecklist,
+    launchReadiness: {
+      status: passed ? 'ready_for_approval' : 'qa_failed',
+      buildPassed: passed,
+      approvalState: approvalStateFromBrief(brief),
+      launchReady: passed && launchChecklist.every((item) => item.passed),
+      pendingApproval: launchChecklist.filter((item) => item.category === 'approval' && !item.passed).map((item) => item.key)
+    },
+    screenshots: screenshotEvidence.screenshots,
     mobile: {
       viewportMeta: /<meta[^>]+name=["']viewport["'][^>]*>/i.test(sourceHtml || ''),
       responsiveHint: /width=device-width|@media|\bclamp\(|max-width:\s*100%/i.test(sourceHtml || '')
+    },
+    desktop: {
+      maxWidthHint: /max-width|grid-template-columns|minmax\(|repeat\(auto-fit|@media/i.test(sourceHtml || '')
     },
     inspectedAt: Date.now(),
     durationMs: Date.now() - startedAt,
@@ -950,8 +998,118 @@ function checkMobile({ html }) {
   };
 }
 
-function checkHallucinatedClaims({ visibleText }) {
-  const claims = claimReport(visibleText);
+function checkDesktop({ html }) {
+  const source = html || '';
+  const passed = /grid-template-columns|repeat\(auto-fit|minmax\(|max-width:\s*(?:min\(|\d{3,4}px)|@media/i.test(source);
+  return {
+    key: 'desktop_sanity',
+    label: 'Desktop sanity',
+    passed,
+    severity: 'warn',
+    detail: passed ? 'Desktop layout constraints found.' : 'No desktop layout/grid constraints were detected.'
+  };
+}
+
+function checkContactPaths({ html, visibleText, brief, lead }) {
+  const source = html || '';
+  const expectedPhone = brief?.phone || lead?.phone || '';
+  const phoneDigits = normalizeDigits(expectedPhone);
+  const hasTel = phoneDigits ? normalizeDigits(source.match(/href=["']tel:([^"']+)/i)?.[1] || source).includes(phoneDigits.slice(-10)) : false;
+  const expectedEmail = brief?.sourceFacts?.email || (brief?.contactMethods || []).find((method) => method.type === 'email')?.value || '';
+  const hasEmail = expectedEmail ? includesLoose(`${visibleText} ${source}`, expectedEmail) || new RegExp(`mailto:${escapeRegExp(expectedEmail)}`, 'i').test(source) : false;
+  const hasForm = /<form\b/i.test(source) || /href=["']#contact-form["']/i.test(source);
+  const passed = Boolean(hasTel && (hasEmail || hasForm));
+  return {
+    key: 'contact_paths',
+    label: 'Phone/email/form paths',
+    passed,
+    severity: 'blocker',
+    detail: passed
+      ? 'Tap-to-call plus email or form fallback are present.'
+      : `Contact path incomplete: tel=${hasTel ? 'yes' : 'no'}, email=${hasEmail ? 'yes' : 'no'}, form=${hasForm ? 'yes' : 'no'}.`
+  };
+}
+
+function checkLocalBusinessSchema({ html, brief, lead }) {
+  const schemas = jsonLdFromHtml(html || '');
+  const local = schemas.find((item) => {
+    const type = item?.['@type'];
+    return type === 'LocalBusiness' || (Array.isArray(type) && type.includes('LocalBusiness'));
+  });
+  const expectedName = brief?.businessName || lead?.business_name || '';
+  const expectedPhone = brief?.phone || lead?.phone || '';
+  const hasName = local && includesLoose(local.name || '', expectedName);
+  const hasPhone = local && normalizeDigits(searchableText(local)).includes(normalizeDigits(expectedPhone).slice(-10));
+  const passed = Boolean(local && hasName && hasPhone);
+  return {
+    key: 'localbusiness_schema',
+    label: 'LocalBusiness schema',
+    passed,
+    severity: 'warn',
+    detail: passed ? 'LocalBusiness JSON-LD includes name and phone.' : 'Missing LocalBusiness JSON-LD with confirmed name and phone.'
+  };
+}
+
+function checkLocationDetails({ visibleText, brief, lead }) {
+  const expected = [
+    brief?.location?.serviceArea,
+    brief?.locationOrServiceArea,
+    brief?.location?.address || brief?.sourceFacts?.address || lead?.address,
+    brief?.location?.hours || brief?.sourceFacts?.hours
+  ].filter(Boolean);
+  const found = expected.filter((value) => includesLoose(visibleText, value));
+  const required = Math.min(expected.length || 1, expected.length >= 3 ? 2 : 1);
+  const passed = expected.length > 0 && found.length >= required;
+  return {
+    key: 'hours_address_area',
+    label: 'Hours/address/area',
+    passed,
+    severity: 'warn',
+    detail: passed ? `${found.length}/${expected.length} location facts visible.` : `Only ${found.length}/${expected.length} location facts were visible.`
+  };
+}
+
+function checkImageAltText({ html }) {
+  const source = html || '';
+  const imageMatches = [...source.matchAll(/<img\b[^>]*>/gi)].map((m) => m[0]);
+  if (!imageMatches.length) {
+    return {
+      key: 'image_alt_text',
+      label: 'Image alt text',
+      passed: false,
+      severity: 'warn',
+      detail: 'No images were found; include at least one visual with alt text.'
+    };
+  }
+  const missing = imageMatches.filter((tag) => !/\balt=["'][^"']{3,}["']/i.test(tag));
+  return {
+    key: 'image_alt_text',
+    label: 'Image alt text',
+    passed: missing.length === 0,
+    severity: 'warn',
+    detail: missing.length === 0 ? `${imageMatches.length} image(s) include alt text.` : `${missing.length}/${imageMatches.length} image(s) missing useful alt text.`
+  };
+}
+
+function checkBrokenLinks({ links, html }) {
+  const ids = new Set([...String(html || '').matchAll(/\bid=["']([^"']+)["']/gi)].map((match) => `#${match[1]}`));
+  const broken = (links || []).filter((href) => {
+    if (/^(tel:|mailto:|https?:\/\/)/i.test(href)) return false;
+    if (/^#[a-z][\w-]*$/i.test(href)) return !ids.has(href);
+    if (href === '#') return false;
+    return true;
+  });
+  return {
+    key: 'no_broken_links',
+    label: 'No broken links',
+    passed: broken.length === 0,
+    severity: 'blocker',
+    detail: broken.length ? `Suspicious links: ${broken.slice(0, 4).join(', ')}` : `${(links || []).length} link(s) look valid.`
+  };
+}
+
+function checkHallucinatedClaims({ visibleText, brief }) {
+  const claims = claimReport(visibleText, { brief });
   const passed = claims.found.length === 0;
   return {
     key: 'no_hallucinated_claims',
@@ -962,13 +1120,151 @@ function checkHallucinatedClaims({ visibleText }) {
   };
 }
 
-function claimReport(text) {
+function checkNoInternalPublicCopy({ visibleText }) {
+  const found = [];
+  for (const item of INTERNAL_PUBLIC_COPY_PATTERNS) {
+    const match = String(visibleText || '').match(item.pattern);
+    if (match) found.push({ code: item.code, match: match[0] });
+  }
+  return {
+    key: 'no_internal_research_copy',
+    label: 'No internal research copy',
+    passed: found.length === 0,
+    severity: 'blocker',
+    detail: found.length ? `Detected internal copy: ${found.map((item) => item.code).join(', ')}.` : 'No internal source markers or operator notes detected.'
+  };
+}
+
+function checkInvoicePaymentState({ brief, lead }) {
+  const invoiceStatus = String(brief?.sourceFacts?.invoiceStatus || brief?.commerceNeeds?.find?.((item) => item.key === 'invoice')?.status || '').toLowerCase();
+  const leadPaid = ['paid', 'built', 'ready_for_approval', 'shipped'].includes(String(lead?.status || '').toLowerCase()) ||
+    String(lead?.outreach_status || '').toLowerCase() === 'paid';
+  const passed = invoiceStatus === 'paid' || leadPaid;
+  return {
+    key: 'invoice_payment_state',
+    label: 'Invoice/payment state',
+    category: 'launch',
+    passed,
+    severity: 'warn',
+    blocksBuild: false,
+    detail: passed ? 'Paid or paid-equivalent state is recorded.' : 'Payment is not confirmed yet; do not launch publicly.'
+  };
+}
+
+function checkOperatorApproval({ brief }) {
+  const approval = approvalStateFromBrief(brief);
+  const passed = Boolean(approval.operatorApprovedAt || approval.operatorApproved);
+  return {
+    key: 'operator_approval',
+    label: 'Operator approval',
+    category: 'approval',
+    passed,
+    severity: 'warn',
+    blocksBuild: false,
+    detail: passed ? 'Operator approval recorded.' : 'Pending operator approval before launch.'
+  };
+}
+
+function checkCustomerApproval({ brief }) {
+  const approval = approvalStateFromBrief(brief);
+  const passed = Boolean(approval.customerApprovedAt || approval.customerApproved);
+  return {
+    key: 'customer_approval',
+    label: 'Customer approval',
+    category: 'approval',
+    passed,
+    severity: 'warn',
+    blocksBuild: false,
+    detail: passed ? 'Customer approval recorded.' : 'Pending customer approval before launch.'
+  };
+}
+
+function approvalStateFromBrief(brief) {
+  const source = brief?.launchApproval || brief?.approval || {};
+  return {
+    operatorApproved: Boolean(source.operatorApproved || source.operatorApprovedAt),
+    customerApproved: Boolean(source.customerApproved || source.customerApprovedAt),
+    operatorApprovedAt: source.operatorApprovedAt || null,
+    customerApprovedAt: source.customerApprovedAt || null,
+    launchedAt: source.launchedAt || null
+  };
+}
+
+function claimReport(text, { brief } = {}) {
   const found = [];
   for (const item of CLAIM_PATTERNS) {
     const match = String(text || '').match(item.pattern);
-    if (match) found.push({ code: item.code, match: match[0] });
+    if (!match) continue;
+    if (claimAllowed(item, match[0], brief)) continue;
+    found.push({ code: item.code, match: match[0] });
   }
   return { found };
+}
+
+function claimAllowed(item, match, brief) {
+  const confirmed = brief?.confirmedCapabilities || {};
+  if (item.allowKey && confirmed[item.allowKey]) return true;
+  if (item.allowKey === 'booking' || item.allowKey === 'payments') return false;
+  const evidence = searchableText({
+    sourceFacts: brief?.sourceFacts,
+    reviewProof: brief?.reviewProof
+  });
+  if (!evidence) return false;
+  const needle = normalizeText(match);
+  if (!needle) return false;
+  return normalizeText(evidence).includes(needle);
+}
+
+async function maybePlaywrightScreenshots({ url, html, mock }) {
+  const enabled = bool(process.env.BUILDER_QA_PLAYWRIGHT) || bool(process.env.SMOKE_BUILDER_QA_PLAYWRIGHT);
+  if (!enabled) {
+    return {
+      screenshots: [],
+      checklist: [{
+        key: 'playwright_screenshots',
+        label: 'Optional screenshot QA',
+        category: 'evidence',
+        passed: true,
+        severity: 'info',
+        blocksBuild: false,
+        detail: 'Playwright screenshot QA skipped by default.'
+      }]
+    };
+  }
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    if (url && /^https?:\/\//i.test(url)) await page.goto(url, { waitUntil: 'networkidle', timeout: 15_000 });
+    else await page.setContent(html || '<!doctype html><html><body></body></html>', { waitUntil: 'networkidle' });
+    const title = await page.title().catch(() => '');
+    await browser.close();
+    return {
+      screenshots: [{ viewport: 'mobile', captured: true, title, mock: !!mock }],
+      checklist: [{
+        key: 'playwright_screenshots',
+        label: 'Optional screenshot QA',
+        category: 'evidence',
+        passed: true,
+        severity: 'info',
+        blocksBuild: false,
+        detail: `Rendered mobile viewport${title ? ` for "${title}"` : ''}.`
+      }]
+    };
+  } catch (err) {
+    return {
+      screenshots: [],
+      checklist: [{
+        key: 'playwright_screenshots',
+        label: 'Optional screenshot QA',
+        category: 'evidence',
+        passed: false,
+        severity: 'warn',
+        blocksBuild: false,
+        detail: `Optional Playwright screenshot QA skipped: ${err?.message || String(err)}`
+      }]
+    };
+  }
 }
 
 function normalizeBrowserQa(value, { url, lastSummary }) {
@@ -1004,6 +1300,24 @@ function parseLooseJson(text) {
     try { return JSON.parse(cleaned.slice(start, end + 1)); } catch {}
   }
   return null;
+}
+
+function linksFromHtml(html) {
+  return [...String(html || '').matchAll(/\bhref=["']([^"']+)["']/gi)]
+    .map((match) => cleanUrl(match[1]))
+    .filter(Boolean)
+    .slice(0, 80);
+}
+
+function jsonLdFromHtml(html) {
+  const out = [];
+  const re = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  for (const match of String(html || '').matchAll(re)) {
+    const parsed = parseLooseJson(match[1]);
+    if (Array.isArray(parsed)) out.push(...parsed);
+    else if (parsed) out.push(parsed);
+  }
+  return out;
 }
 
 function mockAsyncTask(messages, result, delayMs) {
@@ -1093,6 +1407,10 @@ function normalizeText(value) {
 
 function normalizeDigits(value) {
   return String(value || '').replace(/\D/g, '');
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function numberOr(...values) {

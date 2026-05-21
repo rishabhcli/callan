@@ -3,7 +3,9 @@
 // Deterministic reliability/backpressure drill.
 // Uses the real readiness, DB, and outreach helpers against an isolated data dir.
 
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -76,7 +78,7 @@ try {
   scenarios.push(await scenarioQueueRetryBackoff(context, leadIds.backoff));
   scenarios.push(await scenarioQueueDailyQuota(context, leadIds.quota));
   scenarios.push(await scenarioStrongPresenceBlocked(context, leadIds.strong));
-  scenarios.push(await scenarioRouteChecks(context, routeBaseUrl(args)));
+  scenarios.push(await scenarioRouteChecks(context, routeBaseUrl(args), args));
 
   const summary = summarize(scenarios);
   const finishedAt = Date.now();
@@ -149,6 +151,7 @@ function configureIsolatedEnv(dir) {
     SMOKE_AGENTMAIL_SEND: 'false',
     SMOKE_STRIPE_INVOICE: 'false',
     SMOKE_BROWSER_USE: 'false',
+    SMOKE_LOVABLE_NAVIGATION: 'false',
     OUTREACH_DAILY_CALL_QUOTA: '1',
     DAILY_CALL_QUOTA: '1',
     OUTREACH_INTERVAL_MS: '50',
@@ -527,37 +530,116 @@ async function scenarioStrongPresenceBlocked(ctx, leadId) {
   });
 }
 
-async function scenarioRouteChecks(ctx, baseUrl) {
+async function scenarioRouteChecks(ctx, baseUrl, parsedArgs = {}) {
   if (!baseUrl) {
-    return {
-      name: 'route_checks',
-      category: 'api_routes',
-      ok: true,
-      skipped: true,
-      skipReason: 'no --base-url or RELIABILITY_DRILL_BASE_URL was provided; this drill does not require or start a server',
-      expected: 'route checks are optional and self-report skipped state when no server is supplied',
-      observed: {
-        staticRoutes: ctx.outreachRouteSmoke()
-      },
-      assertions: [],
-      sideEffects: {
-        kind: 'none',
-        network: 'none'
-      }
-    };
+    if (parsedArgs.noServer) {
+      return {
+        name: 'route_checks',
+        category: 'api_routes',
+        ok: true,
+        skipped: true,
+        skipReason: '--no-server was provided; route checks stayed static',
+        expected: 'route checks can be explicitly skipped for environments that cannot bind a local port',
+        observed: {
+          staticRoutes: ctx.outreachRouteSmoke()
+        },
+        assertions: [],
+        sideEffects: {
+          kind: 'none',
+          network: 'none'
+        }
+      };
+    }
+
+    return scenarioAutoStartedRouteChecks(ctx, parsedArgs);
   }
 
   const checks = [];
   for (const route of [
+    { name: 'ping', method: 'GET', path: '/api/ping' },
     { name: 'health', method: 'GET', path: '/api/health' },
+    { name: 'jobs_health', method: 'GET', path: '/api/jobs/health?limit=8' },
+    { name: 'ops_command_center', method: 'GET', path: '/api/ops/command-center' },
+    { name: 'economics_by_niche', method: 'GET', path: '/api/economics/by-niche' },
+    { name: 'admin_export', method: 'GET', path: '/api/admin/export?limit=10' },
+    { name: 'admin_backups', method: 'GET', path: '/api/admin/backups' },
     { name: 'outreach_status', method: 'GET', path: '/api/outreach/status' },
     { name: 'outreach_routes', method: 'GET', path: '/api/outreach/routes' }
   ]) {
     checks.push(await fetchRoute(baseUrl, route));
   }
+  const jobsHealth = checks.find((item) => item.name === 'jobs_health');
+  const commandCenter = checks.find((item) => item.name === 'ops_command_center');
+  const economics = checks.find((item) => item.name === 'economics_by_niche');
+  const adminExport = checks.find((item) => item.name === 'admin_export');
+  const adminBackups = checks.find((item) => item.name === 'admin_backups');
+  const jobCounts = jobsHealth?.sample?.countsByType || {};
+  const evalSummary = commandCenter?.sample?.evals || {};
   const assertions = [
     assertion('all route checks returned JSON 2xx', checks.every((c) => c.ok), checks),
-    assertion('route checks are GET-only', checks.every((c) => c.method === 'GET'), checks)
+    assertion('route checks are GET-only', checks.every((c) => c.method === 'GET'), checks),
+    assertion(
+      'startup durable jobs completed before command-center route check',
+      ['ops.backup:completed', 'ops.provider_posture:completed', 'ops.recover_stuck:completed', 'ops.safe_to_sell:completed', 'account_manager.run:completed']
+        .every((key) => Number(jobCounts[key] || 0) >= 1),
+      jobCounts
+    ),
+    assertion(
+      'startup durable handler registry includes browser research, lead priority, builder, hosting upsell, email callback, growth, aftercare, operator transfer, inbound memory, inbound follow-up, mail, call analysis, outreach, and scheduled callbacks',
+      Array.isArray(jobsHealth?.sample?.handlers)
+        && jobsHealth.sample.handlers.includes('research.browser_use')
+        && jobsHealth.sample.handlers.includes('lead.priority_score')
+        && jobsHealth.sample.handlers.includes('builder.build')
+        && jobsHealth.sample.handlers.includes('hosting.upsell')
+        && jobsHealth.sample.handlers.includes('email.callback_call')
+        && jobsHealth.sample.handlers.includes('growth.plan')
+        && jobsHealth.sample.handlers.includes('growth.followup')
+        && jobsHealth.sample.handlers.includes('account_manager.run')
+        && jobsHealth.sample.handlers.includes('account_manager.task')
+        && jobsHealth.sample.handlers.includes('operator.transfer')
+        && jobsHealth.sample.handlers.includes('inbound.memory_hydrate')
+        && jobsHealth.sample.handlers.includes('inbound.voice_followup')
+        && jobsHealth.sample.handlers.includes('mail.reply')
+        && jobsHealth.sample.handlers.includes('call.analysis')
+        && jobsHealth.sample.handlers.includes('outreach.lead')
+        && jobsHealth.sample.handlers.includes('call.scheduled'),
+      jobsHealth?.sample
+    ),
+    assertion(
+      'command-center serves safe-to-sell snapshot with fresh backup and full evals',
+      commandCenter?.sample?.source === 'safe_to_sell_snapshot'
+        && commandCenter?.sample?.durableSnapshot?.ok === true
+        && commandCenter?.sample?.backupOk === true
+        && Number(evalSummary.total || 0) === 6
+        && Number(evalSummary.passed || 0) === 6
+        && Number(evalSummary.failed || 0) === 0
+        && Number(commandCenter?.sample?.providerProofCount || 0) >= 8
+        && ['hold', 'safe_to_sell'].includes(commandCenter?.sample?.decision)
+        && Number(commandCenter?.sample?.receiptRequiredProviders || 0) >= 8
+        && Number(commandCenter?.sample?.receiptHistoryCount || 0) >= 1
+        && ['hold', 'safe_to_sell'].includes(commandCenter?.sample?.latestReceiptDecision)
+        && commandCenter?.sample?.queueOk === true
+        && commandCenter?.sample?.promotion?.liveOk === false,
+      commandCenter?.sample
+    ),
+    assertion(
+      'economics-by-niche route returns totals and niche array',
+      economics?.sample?.hasTotals === true && economics?.sample?.hasNiches === true,
+      economics?.sample
+    ),
+    assertion(
+      'admin export is redacted sqlite operations data',
+      adminExport?.sample?.includePII === false
+        && adminExport?.sample?.redactionStrategy === 'pii_secrets_and_local_paths'
+        && adminExport?.sample?.persistenceKind === 'sqlite'
+        && Number(adminExport?.sample?.tableCount || 0) >= 6,
+      adminExport?.sample
+    ),
+    assertion(
+      'admin backups route sees boot SQLite backup',
+      adminBackups?.sample?.hasBackup === true,
+      adminBackups?.sample
+    )
   ];
   return scenario('route_checks', 'api_routes', assertions, {
     expected: 'optional server route checks use GET-only requests and report JSON health/backpressure surfaces',
@@ -573,13 +655,80 @@ async function scenarioRouteChecks(ctx, baseUrl) {
   });
 }
 
+async function scenarioAutoStartedRouteChecks(ctx, parsedArgs = {}) {
+  let server = null;
+  try {
+    server = await startIsolatedRouteServer({ keepData: parsedArgs.keepData });
+    await waitForServer(server);
+    await waitForStartupJobs(server);
+    const result = await scenarioRouteChecks(ctx, server.baseUrl, { ...parsedArgs, noServer: true });
+    return {
+      ...result,
+      observed: {
+        ...result.observed,
+        autoStarted: true,
+        server: {
+          baseUrl: server.baseUrl,
+          port: server.port,
+          dataDir: server.dataDir,
+          removed: !parsedArgs.keepData,
+          mode: 'mock',
+          liveSideEffects: 'disabled'
+        }
+      },
+      sideEffects: {
+        kind: 'read_only_http_against_isolated_mock_server',
+        network: 'loopback',
+        liveProviderRequests: 0,
+        outboundCalls: 0,
+        outboundEmails: 0,
+        invoicesCreated: 0,
+        browserSessionsCreated: 0
+      }
+    };
+  } catch (err) {
+    const assertions = [
+      assertion('isolated route server starts and returns JSON routes', false, {
+        error: err?.message || String(err),
+        server: server ? {
+          baseUrl: server.baseUrl,
+          port: server.port,
+          dataDir: server.dataDir,
+          exited: server.exited || null,
+          logs: server.logs.slice(-20)
+        } : null
+      })
+    ];
+    return scenario('route_checks', 'api_routes', assertions, {
+      expected: 'normal reliability drill auto-starts an isolated mock server and verifies API command surfaces',
+      observed: {
+        autoStarted: true,
+        staticRoutes: ctx.outreachRouteSmoke()
+      },
+      sideEffects: {
+        kind: 'failed_isolated_server_start',
+        network: 'loopback',
+        liveProviderRequests: 0
+      }
+    });
+  } finally {
+    if (server) {
+      await stopIsolatedRouteServer(server);
+      if (!parsedArgs.keepData) cleanupTempData(server.dataDir, false);
+    }
+  }
+}
+
 async function fetchRoute(baseUrl, route) {
   const url = new URL(route.path, baseUrl).toString();
   const started = Date.now();
   try {
+    const headers = { Accept: 'application/json' };
+    const adminToken = process.env.RELIABILITY_DRILL_ADMIN_TOKEN || process.env.ADMIN_API_TOKEN || '';
+    if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
     const res = await fetch(url, {
       method: route.method,
-      headers: { Accept: 'application/json' },
+      headers,
       signal: AbortSignal.timeout(1500)
     });
     const text = await res.text();
@@ -680,12 +829,14 @@ function parseArgs(argv) {
   const out = {
     baseUrl: '',
     keepData: false,
+    noServer: false,
     help: false
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') out.help = true;
     else if (arg === '--keep-data') out.keepData = true;
+    else if (arg === '--no-server') out.noServer = true;
     else if (arg === '--base-url') out.baseUrl = argv[++i] || '';
     else if (arg.startsWith('--base-url=')) out.baseUrl = arg.slice('--base-url='.length);
   }
@@ -695,10 +846,11 @@ function parseArgs(argv) {
 function helpPayload() {
   return {
     ok: true,
-    usage: 'npm run drill:reliability -- [--base-url http://127.0.0.1:8787] [--keep-data]',
+    usage: 'npm run drill:reliability -- [--base-url http://127.0.0.1:8787] [--no-server] [--keep-data]',
     description: 'Runs an isolated reliability/backpressure drill and emits JSON only.',
     flags: {
-      '--base-url': 'Optional running server base URL for GET-only route checks. Omit to self-report route checks as skipped.',
+      '--base-url': 'Optional running server base URL for GET-only route checks. Omit to auto-start an isolated mock server.',
+      '--no-server': 'Skip auto-starting a local server and report static route metadata only.',
       '--keep-data': 'Keep the temporary SQLite data dir for manual inspection.'
     }
   };
@@ -855,12 +1007,77 @@ function compactRouteSample(name, json) {
       readinessReady: json.readiness?.ready
     };
   }
+  if (name === 'jobs_health') {
+    return {
+      ok: json.ok,
+      queueOk: json.queue?.ok,
+      countsByType: json.queue?.countsByType || {},
+      handlers: json.queue?.handlers || [],
+      recentCount: Array.isArray(json.recent) ? json.recent.length : 0
+    };
+  }
+  if (name === 'ops_command_center') {
+    const promotion = json.safeToSellToday?.promotionGates || json.promotionGates || json.readiness?.promotionGates || {};
+    return {
+      ok: json.ok,
+      mode: json.mode,
+      source: json.safeToSellToday?.source || 'inline',
+      durableSnapshot: json.safeToSellToday?.durableSnapshot || null,
+      evals: json.safeToSellToday?.evals?.summary || json.evals?.summary || null,
+      backupOk: json.safeToSellToday?.backup?.ok ?? json.backups?.ok ?? null,
+      providerProofCount: Array.isArray(json.safeToSellToday?.providerProof)
+        ? json.safeToSellToday.providerProof.length
+        : Array.isArray(json.providerProof)
+          ? json.providerProof.length
+          : 0,
+      decision: json.safeToSellToday?.decisionReceipt?.decision || null,
+      receiptRequiredProviders: json.safeToSellToday?.decisionReceipt?.proof?.requiredProviders || 0,
+      receiptLiveReadyProviders: json.safeToSellToday?.decisionReceipt?.proof?.requiredLiveReady || 0,
+      receiptHistoryCount: Array.isArray(json.safeToSellReceipts?.recent) ? json.safeToSellReceipts.recent.length : 0,
+      latestReceiptDecision: json.safeToSellReceipts?.latest?.decision || null,
+      queueOk: json.queue?.ok,
+      promotion: {
+        reviewOk: promotion.productionReview?.ok ?? null,
+        reviewBlockers: promotion.productionReview?.blockerCount ?? null,
+        liveOk: promotion.productionLive?.ok ?? null,
+        liveBlockers: promotion.productionLive?.blockerCount ?? null
+      }
+    };
+  }
   if (name === 'outreach_status') {
     return {
       running: json.running,
       paused: json.paused,
       queue: json.queue,
       quota: json.quota
+    };
+  }
+  if (name === 'economics_by_niche') {
+    return {
+      generatedAt: json.generatedAt || null,
+      since: json.since ?? null,
+      hasTotals: Boolean(json.totals && typeof json.totals === 'object'),
+      hasNiches: Array.isArray(json.niches),
+      nicheCount: Array.isArray(json.niches) ? json.niches.length : null,
+      totals: json.totals || null
+    };
+  }
+  if (name === 'admin_export') {
+    return {
+      version: json.version || null,
+      includePII: json.includePII,
+      redactionStrategy: json.redaction?.strategy || null,
+      persistenceKind: json.persistence?.kind || null,
+      tableCount: json.tables && typeof json.tables === 'object' ? Object.keys(json.tables).length : 0,
+      counts: json.counts || {}
+    };
+  }
+  if (name === 'admin_backups') {
+    const files = Array.isArray(json.files) ? json.files : [];
+    return {
+      fileCount: files.length,
+      hasBackup: files.some((file) => Number(file.bytes || 0) > 0),
+      latest: files[0]?.file || null
     };
   }
   if (name === 'outreach_routes') {
@@ -871,6 +1088,155 @@ function compactRouteSample(name, json) {
     };
   }
   return json;
+}
+
+async function startIsolatedRouteServer({ keepData = false } = {}) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'callan-reliability-server-'));
+  const port = await findOpenPort();
+  const env = {
+    PATH: process.env.PATH || '',
+    HOME: process.env.HOME || '',
+    NODE_ENV: 'test',
+    RUN_MODE: 'mock',
+    PORT: String(port),
+    DATA_DIR: dataDir,
+    DOTENV_CONFIG_PATH: '/dev/null',
+    SAFE_TO_SELL_SELF_CHECK_ENABLED: 'true',
+    SAFE_TO_SELL_SELF_CHECK_INTERVAL_MS: '60000',
+    OPS_BACKUP_ENABLED: 'true',
+    OPS_BACKUP_INTERVAL_MS: '3600000',
+    OPS_RECOVERY_ENABLED: 'true',
+    OPS_RECOVERY_INTERVAL_MS: '60000',
+    ACCOUNT_MANAGER_ENABLED: 'true',
+    ACCOUNT_MANAGER_INTERVAL_MS: '60000',
+    ACCOUNT_MANAGER_LIVE_SENDS: 'false',
+    LIVE_CALLS: 'false',
+    LIVE_EMAILS: 'false',
+    LIVE_PAYMENTS: 'false',
+    LIVE_BROWSER_SESSIONS: 'false',
+    LIVE_PUBLIC_OUTREACH: 'false',
+    LIVE_BUILDS: 'false',
+    SMOKE_GEMINI: 'false',
+    SMOKE_SUPERMEMORY_WRITE: 'false',
+    SMOKE_MOSS_INDEX: 'false',
+    SMOKE_LIVE_CALL: 'false',
+    SMOKE_AGENTMAIL_SEND: 'false',
+    SMOKE_STRIPE_INVOICE: 'false',
+    SMOKE_BROWSER_USE: 'false',
+    SMOKE_LOVABLE_NAVIGATION: 'false'
+  };
+  const child = spawn(process.execPath, [join(repoRoot, 'server/index.js')], {
+    cwd: repoRoot,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  const server = {
+    child,
+    port,
+    baseUrl: `http://127.0.0.1:${port}`,
+    dataDir,
+    keepData,
+    logs: [],
+    exited: null
+  };
+  const capture = (chunk) => {
+    for (const line of String(chunk || '').split(/\r?\n/).filter(Boolean)) {
+      server.logs.push(line.slice(0, 500));
+      if (server.logs.length > 40) server.logs.shift();
+    }
+  };
+  child.stdout.on('data', capture);
+  child.stderr.on('data', capture);
+  child.on('exit', (code, signal) => {
+    server.exited = { code, signal };
+  });
+  return server;
+}
+
+async function waitForServer(server, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    if (server.exited) {
+      throw new Error(`isolated server exited before health check: ${JSON.stringify(server.exited)}; logs=${server.logs.slice(-8).join(' | ')}`);
+    }
+    try {
+      const res = await fetch(new URL('/api/ping', server.baseUrl), {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(400)
+      });
+      if (res.ok) return true;
+      lastError = new Error(`ping returned HTTP ${res.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+    await sleep(120);
+  }
+  throw new Error(`isolated server did not become healthy: ${lastError?.message || 'timeout'}; logs=${server.logs.slice(-8).join(' | ')}`);
+}
+
+async function waitForStartupJobs(server, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  const required = [
+    'ops.backup:completed',
+    'ops.provider_posture:completed',
+    'ops.recover_stuck:completed',
+    'ops.safe_to_sell:completed',
+    'account_manager.run:completed'
+  ];
+  let lastHealth = null;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    if (server.exited) {
+      throw new Error(`isolated server exited before startup jobs completed: ${JSON.stringify(server.exited)}; logs=${server.logs.slice(-8).join(' | ')}`);
+    }
+    try {
+      const res = await fetch(new URL('/api/jobs/health?limit=12', server.baseUrl), {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(600)
+      });
+      const json = await res.json();
+      lastHealth = json;
+      const counts = json.queue?.countsByType || {};
+      if (res.ok && required.every((key) => Number(counts[key] || 0) >= 1)) return json;
+    } catch (err) {
+      lastError = err;
+    }
+    await sleep(150);
+  }
+  const counts = lastHealth?.queue?.countsByType || null;
+  throw new Error(`startup jobs did not complete before route checks: ${lastError?.message || JSON.stringify(counts)}; logs=${server.logs.slice(-8).join(' | ')}`);
+}
+
+async function stopIsolatedRouteServer(server) {
+  if (!server?.child || server.child.killed || server.exited) return;
+  await new Promise((resolvePromise) => {
+    const timer = setTimeout(() => {
+      if (!server.exited && !server.child.killed) server.child.kill('SIGKILL');
+      resolvePromise();
+    }, 2500);
+    server.child.once('exit', () => {
+      clearTimeout(timer);
+      resolvePromise();
+    });
+    server.child.kill('SIGTERM');
+  });
+}
+
+async function findOpenPort() {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const srv = createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      srv.close(() => resolvePromise(port));
+    });
+    srv.on('error', rejectPromise);
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
 function cleanupTempData(dir, keepData) {

@@ -16,37 +16,32 @@ import {
   renderMockGeneratedSite,
   runBuildQaGate
 } from '../fulfillment/hooks/index.js';
-import { sendHostingUpsellEmail } from '../hostingSubscription.js';
+import { enqueueHostingUpsell } from '../hostingUpsellQueue.js';
 import { recordBrowserUseSteps } from '../costs.js';
+import {
+  createHandoffCaseFromBuilderAuthWall,
+  createHandoffCaseFromProviderFailure,
+  createHandoffCaseFromQaFailure
+} from '../handoff.js';
 
-// builder.done -> $29/mo hosting + edits upsell. Idempotent against
-// lead.subscription_id (rechecked inside sendHostingUpsellEmail against the
-// subscriptions table). Never blocks the builder — failures only log.warn.
-async function fireHostingUpsell({ lead, leadId, buildId, runId, projectUrl, target, mock = false }) {
+// builder.done -> durable $29/mo hosting + edits upsell. The actual AgentMail
+// send is retried by the jobs table so builder completion does not hide outages.
+function queueHostingUpsell({ lead, leadId, buildId, runId, projectUrl, target, mock = false }) {
   try {
     if (!lead) return;
     if (lead.subscription_id) {
       log.info('builder.hosting_upsell_skipped', { leadId, buildId, reason: 'already_subscribed' });
       return;
     }
-    const result = await sendHostingUpsellEmail({ leadId, lead });
-    if (result?.sent) {
-      emit('builder.hosting_upsell_sent', {
-        worker: 'builder',
-        leadId,
-        runId,
-        buildId,
-        target,
-        projectUrl,
-        mock,
-        messageId: result.messageId || null,
-        threadId: result.threadId || null
-      });
-    } else {
-      log.info('builder.hosting_upsell_skipped', { leadId, buildId, reason: result?.reason || 'unknown' });
-    }
+    const result = enqueueHostingUpsell({ leadId, buildId, runId, projectUrl, target, mock });
+    log.info(result.inserted ? 'builder.hosting_upsell_queued' : 'builder.hosting_upsell_duplicate', {
+      leadId,
+      buildId,
+      jobId: result.row?.id || null,
+      duplicate: !result.inserted
+    });
   } catch (err) {
-    log.warn('builder.hosting_upsell_failed', {
+    log.warn('builder.hosting_upsell_enqueue_failed', {
       leadId,
       buildId,
       error: err?.message || String(err)
@@ -129,6 +124,13 @@ export async function runBuilder({ leadId, buildId, target, images = [], onLiveU
     const failure = classifyFulfillmentFailure(err);
     const message = failure.message || String(err);
     builds.update(buildId, { status: 'failed', finished_at: Date.now(), error: message });
+    createHandoffCaseFromProviderFailure({
+      leadId,
+      provider: failure.provider || 'builder',
+      sourceId: buildId,
+      error: message,
+      severity: failure.retryable === false ? 'high' : 'medium'
+    });
     runs.finish(runId, { state: 'failed', error: message, detail: { failure } });
     emit('builder.error', { worker: 'builder', leadId, runId, buildId, error: message, failure });
     throw err;
@@ -140,13 +142,15 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
   const liveUrl = `/api/leads/${encodeURIComponent(leadId)}/build-preview`;
   const fallbackProjectUrl = target === 'v0'
     ? `https://${slugify(lead.business_name)}.vercel.app`
-    : `https://${slugify(lead.business_name)}.lovable.app`;
+    : target === 'anything'
+      ? `https://${slugify(lead.business_name)}.anything.app`
+      : `https://${slugify(lead.business_name)}.lovable.app`;
   let projectUrl = null;
   let providerProjectId = null;
   let providerDeploymentId = null;
   let sessionId = `mock-${target}-${buildId}`;
   const buildTarget = assertBuildTarget(createBuildTarget(target));
-  const adapter = target === 'lovable'
+  const adapter = target === 'lovable' || target === 'anything'
     ? new MockBrowserUseAdapter({ liveUrl, projectUrl: fallbackProjectUrl, sessionId })
     : null;
 
@@ -210,6 +214,8 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     provider_deployment_id: providerDeploymentId,
     status: 'qa_review'
   });
+  const initialMockHtml = renderMockGeneratedSite({ brief: websiteBrief });
+  builds.update(buildId, { preview_html: initialMockHtml });
   const qaGate = await runBuildQaGate({
     lead,
     buildId,
@@ -217,7 +223,7 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     websiteBrief,
     brief,
     candidateUrl: projectUrl,
-    candidateHtml: renderMockGeneratedSite({ brief: websiteBrief }),
+    candidateHtml: initialMockHtml,
     mock: true
   });
   if (!qaGate.accepted) {
@@ -225,6 +231,14 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     const qaError = `Build QA failed${errors.length ? `: ${errors.join(', ')}` : ''}`;
     builds.update(buildId, { status: 'failed', finished_at: Date.now(), error: qaError });
     leads.update(leadId, { next_action: 'builder_qa_failed' });
+    createHandoffCaseFromQaFailure({
+      leadId,
+      buildId,
+      qaResultId: qaGate.qa?.id || null,
+      errors,
+      maxRevisions: qaGate.finalAccept?.attempt ?? qaGate.revisions?.length ?? null,
+      projectUrl
+    });
     runs.finish(runId, { state: 'failed', error: qaError, detail: { mock: true, target, liveUrl, projectUrl, qa: qaGate.qa } });
     emit('builder.error', { worker: 'builder', leadId, runId, buildId, target, liveUrl, projectUrl, error: qaError, category: 'build_qa', qaResultId: qaGate.qa?.id || null, mock: true });
     return { liveUrl, projectUrl, brief, target, qa: qaGate.qa, qaFailed: true, mock: true };
@@ -235,13 +249,16 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     provider_project_id: providerProjectId,
     provider_deployment_id: providerDeploymentId,
     status: 'completed',
+    launch_status: 'ready_for_customer',
+    launch_readiness_json: safeJsonText({ ...(qaGate.qa?.launchReadiness || {}), finalAccept: qaGate.finalAccept || null }),
+    operator_approved_at: Date.now(),
     finished_at: Date.now()
   });
-  leads.update(leadId, { website: projectUrl, status: 'shipped' });
+  leads.update(leadId, { website: projectUrl, status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
   safeRecordBuilderSteps({ leadId, sessionId, steps: estimateMockBuilderSteps(buildTarget?.name || target) });
   runs.finish(runId, { state: 'completed', detail: { mock: true, target, liveUrl, projectUrl, providerProjectId, providerDeploymentId, qa: qaGate.qa } });
-  emit('builder.done', { worker: 'builder', leadId, runId, buildId, target, liveUrl, projectUrl, providerProjectId, providerDeploymentId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null, mock: true });
-  await fireHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target, mock: true });
+  emit('builder.done', { worker: 'builder', leadId, runId, buildId, target, liveUrl, projectUrl, providerProjectId, providerDeploymentId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null, launchStatus: 'ready_for_customer', mock: true });
+  queueHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target, mock: true });
   return { liveUrl, projectUrl, brief, target, qa: qaGate.qa, mock: true };
 }
 
@@ -327,6 +344,14 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
         builds.update(buildId, { status: 'blocked_auth', finished_at: Date.now() });
         leads.update(leadId, { next_action: `${buildTarget.name}_auth_needed` });
         await recordLiveBuilderSteps({ leadId, sessionId, adapter });
+        createHandoffCaseFromBuilderAuthWall({
+          leadId,
+          buildId,
+          sessionId,
+          target: buildTarget.name,
+          reason: event.reason,
+          liveUrl
+        });
         runs.finish(runId, { state: 'blocked', detail: { liveUrl, projectUrl, sessionId, reason: event.reason, target: buildTarget.name } });
         emit('builder.blocked_auth', { worker: 'builder', leadId, runId, buildId, target: buildTarget.name, liveUrl, sessionId, reason: event.reason, phase: event.phase });
         return { liveUrl, projectUrl: null, brief, sessionId, blockedAuth: true, reason: event.reason };
@@ -355,6 +380,14 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
       builds.update(buildId, { status: 'failed', finished_at: Date.now(), error: qaError });
       leads.update(leadId, { next_action: 'builder_qa_failed' });
       await recordLiveBuilderSteps({ leadId, sessionId, adapter });
+      createHandoffCaseFromQaFailure({
+        leadId,
+        buildId,
+        qaResultId: qaGate.qa?.id || null,
+        errors,
+        maxRevisions: qaGate.finalAccept?.attempt ?? qaGate.revisions?.length ?? null,
+        projectUrl
+      });
       runs.finish(runId, { state: 'failed', error: qaError, detail: { liveUrl, projectUrl, sessionId, target: buildTarget.name, qa: qaGate.qa, revisions: qaGate.revisions } });
       emit('builder.error', { worker: 'builder', leadId, runId, buildId, target: buildTarget.name, liveUrl, projectUrl, sessionId, error: qaError, category: 'build_qa', qaResultId: qaGate.qa?.id || null });
       return { liveUrl, projectUrl, brief, sessionId, target: buildTarget.name, qa: qaGate.qa, qaFailed: true };
@@ -365,13 +398,16 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
       provider_project_id: providerProjectId,
       provider_deployment_id: providerDeploymentId,
       status: 'completed',
+      launch_status: 'ready_for_customer',
+      launch_readiness_json: safeJsonText({ ...(qaGate.qa?.launchReadiness || {}), finalAccept: qaGate.finalAccept || null }),
+      operator_approved_at: Date.now(),
       finished_at: Date.now()
     });
-    leads.update(leadId, { website: projectUrl, status: 'shipped', next_action: null });
+    leads.update(leadId, { website: projectUrl, status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
     await recordLiveBuilderSteps({ leadId, sessionId, adapter });
     runs.finish(runId, { state: 'completed', detail: { liveUrl, projectUrl, providerProjectId, providerDeploymentId, sessionId, target: buildTarget.name, qa: qaGate.qa } });
-    emit('builder.done', { worker: 'builder', leadId, runId, buildId, target: buildTarget.name, liveUrl, projectUrl, providerProjectId, providerDeploymentId, sessionId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null });
-    await fireHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target: buildTarget.name, mock: false });
+    emit('builder.done', { worker: 'builder', leadId, runId, buildId, target: buildTarget.name, liveUrl, projectUrl, providerProjectId, providerDeploymentId, sessionId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null, launchStatus: 'ready_for_customer' });
+    queueHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target: buildTarget.name, mock: false });
     return { liveUrl, projectUrl, brief, sessionId, target: buildTarget.name, qa: qaGate.qa };
   } finally {
     try { await buildTarget.cleanup(); } catch (err) {
@@ -383,9 +419,11 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
 export async function runPreviewBuilder({ leadId, onLiveUrl, target } = {}) {
   if (!leadId) throw new Error('runPreviewBuilder requires leadId');
   const buildId = `bld_preview_${leadId}`;
-  // Default target = 'anything' (anything.com). Lovable still callable via
-  // explicit target='lovable' override. See server/fulfillment/targets.js.
-  return runBuilder({ leadId, buildId, target: target || 'anything', onLiveUrl });
+  // Live preview defaults to anything.com, but the deterministic mock adapter
+  // currently produces Lovable-shaped project URLs. Keep dry-run proof green by
+  // using Lovable unless the anything.com live gate is actually open.
+  const defaultTarget = canRunLiveBuildTarget('anything').ok ? 'anything' : 'lovable';
+  return runBuilder({ leadId, buildId, target: target || defaultTarget, onLiveUrl });
 }
 
 function safeRecordBuilderSteps({ leadId, sessionId, steps }) {
@@ -420,6 +458,10 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 40) || 'site';
+}
+
+function safeJsonText(value) {
+  try { return value == null ? null : JSON.stringify(value); } catch { return null; }
 }
 
 function delay(ms) {

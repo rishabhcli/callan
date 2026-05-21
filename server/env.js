@@ -87,6 +87,9 @@ export const env = {
   publicUrl: process.env.APP_PUBLIC_URL || 'http://localhost:8787',
   dataDir: process.env.DATA_DIR || '.data',
   nodeEnv: process.env.NODE_ENV || 'development',
+  admin: {
+    apiToken: process.env.ADMIN_API_TOKEN || ''
+  },
 
   runMode: process.env.RUN_MODE || 'mock',
   productionLiveAck: process.env.PRODUCTION_LIVE_ACK || '',
@@ -107,6 +110,7 @@ export const env = {
     agentmailSend: bool(process.env.SMOKE_AGENTMAIL_SEND),
     stripeInvoice: bool(process.env.SMOKE_STRIPE_INVOICE),
     browserUse: bool(process.env.SMOKE_BROWSER_USE),
+    lovableNavigation: bool(process.env.SMOKE_LOVABLE_NAVIGATION),
     testPhone: process.env.SMOKE_TEST_PHONE || '',
     testEmail: process.env.SMOKE_TEST_EMAIL || ''
   },
@@ -127,6 +131,41 @@ export const env = {
     quietHoursStart: num(process.env.QUIET_HOURS_START, 20),
     quietHoursEnd: num(process.env.QUIET_HOURS_END, 9),
     timezone: process.env.OUTREACH_TIMEZONE || 'America/Los_Angeles'
+  },
+
+  accountManager: {
+    enabled: process.env.ACCOUNT_MANAGER_ENABLED === undefined && process.env.AFTERCARE_ENABLED === undefined
+      ? true
+      : bool(process.env.ACCOUNT_MANAGER_ENABLED || process.env.AFTERCARE_ENABLED),
+    dryRun: !bool(process.env.ACCOUNT_MANAGER_LIVE_SENDS),
+    intervalMs: num(process.env.ACCOUNT_MANAGER_INTERVAL_MS, 60_000),
+    frequencyCapHours: num(process.env.ACCOUNT_MANAGER_FREQUENCY_CAP_HOURS, 120),
+    previewCapHours: num(process.env.ACCOUNT_MANAGER_PREVIEW_CAP_HOURS, 6),
+    timezone: process.env.ACCOUNT_MANAGER_TIMEZONE || process.env.OUTREACH_TIMEZONE || 'America/Los_Angeles'
+  },
+
+  ops: {
+    safeToSellCheckEnabled: process.env.SAFE_TO_SELL_SELF_CHECK_ENABLED !== 'false',
+    safeToSellCheckIntervalMs: num(process.env.SAFE_TO_SELL_SELF_CHECK_INTERVAL_MS, 24 * 60 * 60 * 1000),
+    backupEnabled: process.env.OPS_BACKUP_ENABLED !== 'false',
+    backupIntervalMs: num(process.env.OPS_BACKUP_INTERVAL_MS, 12 * 60 * 60 * 1000),
+    providerPostureEnabled: process.env.OPS_PROVIDER_POSTURE_ENABLED !== 'false',
+    providerPostureIntervalMs: num(process.env.OPS_PROVIDER_POSTURE_INTERVAL_MS, 6 * 60 * 60 * 1000),
+    recoveryEnabled: process.env.OPS_RECOVERY_ENABLED !== 'false',
+    recoveryIntervalMs: num(process.env.OPS_RECOVERY_INTERVAL_MS, 5 * 60 * 1000),
+    recoveryMaxCallAgeMs: num(process.env.OPS_RECOVERY_MAX_CALL_AGE_MS, 45 * 60 * 1000),
+    recoveryMaxScheduledCallAgeMs: num(process.env.OPS_RECOVERY_MAX_SCHEDULED_CALL_AGE_MS, 60 * 1000),
+    recoveryMaxBuildAgeMs: num(process.env.OPS_RECOVERY_MAX_BUILD_AGE_MS, 10 * 60 * 1000),
+    economicsMaxDailyCostUsd: num(process.env.OPS_MAX_DAILY_COST_USD, 25),
+    economicsMaxDailyLossUsd: num(process.env.OPS_MAX_DAILY_LOSS_USD, 25),
+    economicsMinMarginPct: num(process.env.OPS_MIN_MARGIN_PCT, 20),
+    providerMaxIssueRatePct: num(process.env.OPS_PROVIDER_MAX_ISSUE_RATE_PCT, 20),
+    providerMinEventsForIssueRate: num(process.env.OPS_PROVIDER_MIN_EVENTS_FOR_ISSUE_RATE, 3),
+    providerMaxAvgLatencyMs: num(process.env.OPS_PROVIDER_MAX_AVG_LATENCY_MS, 15_000),
+    workerMaxFailuresPer24h: num(process.env.OPS_WORKER_MAX_FAILURES_24H, 3),
+    workerMaxFailureRatePct: num(process.env.OPS_WORKER_MAX_FAILURE_RATE_PCT, 25),
+    workerMinRunsForFailureRate: num(process.env.OPS_WORKER_MIN_RUNS_FOR_FAILURE_RATE, 4),
+    jobMaxIssuesPer24h: num(process.env.OPS_JOB_MAX_ISSUES_24H, 5)
   },
 
   hackathon: {
@@ -185,6 +224,12 @@ export const env = {
     productName: process.env.STRIPE_PRODUCT_NAME || 'Website by callmemaybe',
     successUrl: process.env.STRIPE_SUCCESS_URL || 'http://localhost:8787/success',
     cancelUrl: process.env.STRIPE_CANCEL_URL || 'http://localhost:8787/cancel'
+  },
+
+  customerCommerce: {
+    sandboxLinks: bool(process.env.CUSTOMER_COMMERCE_SANDBOX_LINKS),
+    liveStripeLinks: bool(process.env.CUSTOMER_COMMERCE_LIVE_STRIPE_LINKS),
+    stripeAccountId: process.env.CUSTOMER_COMMERCE_STRIPE_ACCOUNT_ID || ''
   }
 };
 

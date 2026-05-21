@@ -3,6 +3,7 @@ import { leads, payments, mossHotIndexes, mossRetrievals, mossSnippets } from '.
 import { recordingDisclosure } from '../compliance.js';
 import { containerTagFor } from '../memory.js';
 import { buildPitchHotStrategy } from '../pitch.js';
+import { compactLeadIntelligence, evidenceTraceText } from '../research/leadIntelligence.js';
 import { emit } from '../sse.js';
 import {
   deleteMossDocs,
@@ -120,7 +121,7 @@ export function buildLeadHotIndexDocs({ lead, profile = null, pitch = null }) {
     doc('compliance.opt_out', 'compliance', 'Opt-out line', 'If the owner says stop, remove me, take me off, do not call, or unsubscribe, acknowledge it politely, stop selling, end the call, and mark do-not-call.', { section: 'opt_out', complianceIntent: 'opt_out' }),
     doc('compliance.no_unverified_claims', 'compliance', 'No unverified claims', 'Do not promise SEO rankings, legal guarantees, immediate revenue, domain ownership, or ad performance. Keep the offer to a simple website build, hosted page, invoice, and reply path.', { section: 'claims', complianceIntent: 'unsupported_claims' }),
     doc('pricing.flat_fee', 'invoice_pricing', 'Flat fee', `The offer is a flat ${formatAmount(price)} same-day website package. Nothing starts until the customer chooses to pay the hosted invoice.`, { section: 'pricing', amountCents: price }),
-    doc('pricing.invoice_handoff', 'invoice_pricing', 'Invoice handoff', 'If the owner agrees, ask for the best invoice email, capture it, and tell them the invoice is sending right now. Do NOT read it back, repeat it, or ask them to confirm. AgentMail sends the invoice and keeps replies attached to the build.', { section: 'invoice', amountCents: price }),
+    doc('pricing.invoice_handoff', 'invoice_pricing', 'Invoice handoff', 'If the owner agrees, ask for the best invoice email, read it back exactly, ask them to confirm it, and only then say AgentMail will send the invoice and keep replies attached to the build.', { section: 'invoice', amountCents: price }),
     doc('strategy.call', 'call_strategy', 'Call strategy', [
       ...buildPitchHotStrategy({ pitch, profile: p, lead }),
       'Answer the first objection directly, then close only if the owner shows positive intent.',
@@ -128,6 +129,53 @@ export function buildLeadHotIndexDocs({ lead, profile = null, pitch = null }) {
       p.ownerHypothesis ? `Owner hypothesis: ${p.ownerHypothesis}.` : null
     ], { section: 'strategy' })
   ];
+  if (p.leadIntelligence) {
+    const intel = p.leadIntelligence;
+    docs.push(
+      doc('research.call_opener', 'pitch_snippet', 'Evidence-based opener', intel.callOpener?.text, {
+        section: 'opening',
+        evidenceIds: intel.callOpener?.evidenceIds || []
+      }),
+      doc('research.why_call', 'customer_need', 'Why this lead is worth calling', intel.whyThisLeadIsWorthCalling?.summary || intel.whyThisLeadIsWorthCalling?.claim, {
+        section: 'why_call',
+        evidenceIds: intel.whyThisLeadIsWorthCalling?.evidenceIds || []
+      }),
+      doc('research.best_cta', 'customer_need', 'Best CTA', intel.bestCtaRecommendation?.summary || intel.bestCtaRecommendation?.claim, {
+        section: 'cta',
+        evidenceIds: intel.bestCtaRecommendation?.evidenceIds || []
+      }),
+      doc('research.scores', 'lead_fact', 'Lead research scores', [
+        scoreLine('presence weakness', intel.scores?.presenceWeakness),
+        scoreLine('urgency', intel.scores?.urgency),
+        scoreLine('website value', intel.scores?.websiteValue),
+        scoreLine('contactability', intel.scores?.contactability),
+        scoreLine('vertical fit', intel.scores?.verticalFit),
+        Number.isFinite(Number(intel.scores?.totalScore)) ? `Total score: ${intel.scores.totalScore}.` : null
+      ], { section: 'scores' }),
+      doc('research.evidence_trace', 'lead_fact', 'Cited source trail', evidenceTraceText(intel, { limit: 8 }), {
+        section: 'evidence_trace',
+        sourceIds: (intel.sourceTrail || []).map((item) => item.id).slice(0, 8)
+      })
+    );
+    for (const [i, item] of (intel.reviewThemes || []).slice(0, 4).entries()) {
+      docs.push(doc(`research.review_theme.${i}`, 'customer_need', `Review theme ${i + 1}`, item.summary || item.claim, {
+        section: 'review_theme',
+        evidenceIds: item.evidenceIds || []
+      }));
+    }
+    for (const [i, item] of (intel.competitorComparison || []).slice(0, 4).entries()) {
+      docs.push(doc(`research.competitor_gap.${i}`, 'objection', `Competitor gap ${i + 1}`, item.summary || item.claim, {
+        section: 'competitor_gap',
+        evidenceIds: item.evidenceIds || []
+      }));
+    }
+    for (const [i, item] of (intel.currentWebsiteIssues || []).slice(0, 4).entries()) {
+      docs.push(doc(`research.website_issue.${i}`, 'customer_need', `Website issue ${i + 1}`, item.summary || item.claim, {
+        section: 'website_issue',
+        evidenceIds: item.evidenceIds || []
+      }));
+    }
+  }
 
   if (pitch) {
     docs.push(
@@ -253,6 +301,7 @@ function refreshIndexCounts(leadId) {
 
 function normalizeProfile(profile, lead) {
   const parsed = typeof profile === 'string' ? parseJson(profile) : profile;
+  const leadIntelligence = compactLeadIntelligence(parsed?.leadIntelligence, { evidenceLimit: 10 });
   return {
     businessName: firstText(parsed?.businessName, lead.business_name, 'the business'),
     niche: firstText(parsed?.niche, lead.niche, 'small business'),
@@ -265,8 +314,14 @@ function normalizeProfile(profile, lead) {
     ownerHypothesis: firstText(parsed?.ownerHypothesis, ''),
     customerPersona: firstText(parsed?.customerPersona, ''),
     needs: stringList(parsed?.needs),
-    signals: stringList(parsed?.signals)
+    signals: stringList(parsed?.signals),
+    leadIntelligence
   };
+}
+
+function scoreLine(label, score) {
+  if (!score) return null;
+  return `${label}: ${score.score ?? 'unknown'} - ${score.reason || 'no reason recorded'}`;
 }
 
 function priceForLead(leadId) {

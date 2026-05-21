@@ -64,12 +64,17 @@ export function evaluateInvoiceGate({
 } = {}) {
   const resolvedLead = lead || (leadId ? leads.get(leadId) : null);
   const resolvedLeadId = resolvedLead?.id || leadId || null;
-  const normalizedEmail = normalizeRevenueEmail(toEmail || postMortem?.invoiceEmail || postMortem?.emailConfirmation?.email);
   const resolvedCalls = callRows || (resolvedLeadId ? calls.listByLead(resolvedLeadId) : []);
   const resolvedContacts = contactRows || (resolvedLeadId ? contactEvents.listByLead(resolvedLeadId, { limit: 80 }) : []);
+  const normalizedEmail = normalizeRevenueEmail(
+    toEmail ||
+    postMortem?.invoiceEmail ||
+    postMortem?.emailConfirmation?.email ||
+    emailFromContactRows(resolvedContacts)
+  );
   const transcripts = resolvedCalls.map((row) => parseTranscript(row.transcript_json)).filter((turns) => turns.length);
-  const interest = findTranscriptInterest(transcripts);
-  const emailProof = findConfirmedEmailProof({ transcripts, postMortem, normalizedEmail });
+  const interest = findCustomerInterest({ transcripts, contactRows: resolvedContacts });
+  const emailProof = findConfirmedEmailProof({ transcripts, postMortem, normalizedEmail, contactRows: resolvedContacts });
   const optOut = findOptOutEvidence({ lead: resolvedLead, transcripts, contactRows: resolvedContacts });
   const existingConsentEvent = findInvoiceConsentEvent({
     leadId: resolvedLeadId,
@@ -537,6 +542,14 @@ function findInvoiceConsentEvent({ leadId, email, offerVersion, contactRows } = 
   }) || null;
 }
 
+function findCustomerInterest({ transcripts = [], contactRows = [] } = {}) {
+  const transcript = findTranscriptInterest(transcripts);
+  if (transcript.ok) return transcript;
+  const mail = findContactInterest(contactRows);
+  if (mail.ok) return mail;
+  return transcript;
+}
+
 function findTranscriptInterest(transcripts = []) {
   for (const turns of transcripts) {
     for (const [index, turn] of turns.entries()) {
@@ -561,7 +574,34 @@ function findTranscriptInterest(transcripts = []) {
   };
 }
 
-function findConfirmedEmailProof({ transcripts = [], postMortem, normalizedEmail }) {
+function findContactInterest(contactRows = []) {
+  for (const event of contactRows || []) {
+    if (!['agentmail', 'inbound_email', 'portal'].includes(event.channel)) continue;
+    if (!['inbound', 'internal'].includes(event.direction)) continue;
+    const body = cleanText(event.body || event.subject || '');
+    if (!body || OPT_OUT_RE.test(body)) continue;
+    const meta = safeJson(event.metadata_json) || {};
+    const intakeIntent = meta.intent || meta.intake?.intent || meta.classification?.intake?.intent;
+    const readyForQuote = meta.readyForQuote || meta.intake?.readyForQuote || meta.classification?.intake?.readyForQuote;
+    if (
+      EXPLICIT_INTEREST_RE.some((re) => re.test(body)) ||
+      /\b(build|make|create|start|launch|ship)\b.{0,60}\b(site|website|page|landing page)\b/i.test(body) ||
+      ['quote', 'invoice', 'build_start'].includes(intakeIntent) ||
+      readyForQuote
+    ) {
+      return {
+        ok: true,
+        source: event.channel,
+        contactEventId: event.id,
+        excerpt: excerpt(body || meta?.facts?.suppliedText || intakeIntent || 'inbound intake quote ready'),
+        pattern: readyForQuote ? 'inbound_intake_quote_ready' : 'explicit_email_or_portal_interest'
+      };
+    }
+  }
+  return { ok: false, source: 'contact_events', reason: 'no explicit inbound email or portal interest found' };
+}
+
+function findConfirmedEmailProof({ transcripts = [], postMortem, normalizedEmail, contactRows = [] }) {
   const pmEmail = normalizeRevenueEmail(postMortem?.invoiceEmail || postMortem?.emailConfirmation?.email);
   if (normalizedEmail && postMortem?.confirmedEmail && pmEmail === normalizedEmail) {
     return {
@@ -577,12 +617,54 @@ function findConfirmedEmailProof({ transcripts = [], postMortem, normalizedEmail
     if (proof.ok) return proof;
   }
 
+  const contactProof = confirmedEmailFromContacts(contactRows, normalizedEmail);
+  if (contactProof.ok) return contactProof;
+
   return {
     ok: false,
     source: 'call_transcript',
     email: normalizedEmail || null,
     reason: normalizedEmail ? 'email was not read back and confirmed' : 'no email candidate'
   };
+}
+
+function confirmedEmailFromContacts(contactRows = [], wantedEmail) {
+  const normalizedWanted = normalizeRevenueEmail(wantedEmail);
+  if (!normalizedWanted) return { ok: false };
+  for (const event of contactRows || []) {
+    const meta = safeJson(event.metadata_json) || {};
+    const candidates = [
+      meta.email,
+      meta.facts?.email,
+      meta.intake?.facts?.email,
+      meta.classification?.intake?.facts?.email,
+      event.body
+    ].flatMap((value) => emailCandidates(value));
+    if (!candidates.includes(normalizedWanted)) continue;
+    if (event.direction === 'internal' && event.type === 'inbound_intake') {
+      return {
+        ok: true,
+        source: event.channel || 'inbound_intake',
+        email: normalizedWanted,
+        evidence: {
+          contactEventId: event.id,
+          reason: 'email captured from inbound intake identity or supplied message'
+        }
+      };
+    }
+    if (event.direction === 'inbound' && event.channel === 'agentmail') {
+      return {
+        ok: true,
+        source: 'agentmail',
+        email: normalizedWanted,
+        evidence: {
+          contactEventId: event.id,
+          reason: 'customer controlled the sender address or supplied the email in an inbound message'
+        }
+      };
+    }
+  }
+  return { ok: false };
 }
 
 function confirmedEmailFromTurns(turns = [], wantedEmail) {
@@ -668,6 +750,22 @@ function latestThread(contactRows, lead) {
     lastEventAt: event?.created_at || null,
     subject: event?.subject || null
   };
+}
+
+function emailFromContactRows(contactRows = []) {
+  for (const event of contactRows || []) {
+    const meta = safeJson(event.metadata_json) || {};
+    const candidates = [
+      meta.email,
+      meta.facts?.email,
+      meta.intake?.facts?.email,
+      meta.classification?.intake?.facts?.email,
+      event.body
+    ].flatMap((value) => emailCandidates(value));
+    const email = candidates.find(Boolean);
+    if (email) return email;
+  }
+  return null;
 }
 
 function parseTranscript(value) {

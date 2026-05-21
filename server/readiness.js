@@ -6,16 +6,24 @@ import {
   RUN_MODES,
   sideEffectMatrix
 } from './env.js';
-import { callAttempts, contactEvents, doNotCall, leads, providerSmoke } from './db.js';
+import { callAttempts, contactEvents, doNotCall, leads, providerSmoke, durableJobs, webhookEvents } from './db.js';
 import { complianceGateReport } from './compliance.js';
 import { fulfillmentReadiness } from './fulfillment/targets.js';
 import { v0ReadinessDetails } from './providers/v0.js';
+import { reputationReadinessReport } from './reputation.js';
+import { adminAuthPosture } from './adminAuth.js';
+import { providerRuntimeIncident } from './providerIncidents.js';
+import { operationalErrorSummary } from './operationalErrors.js';
 
-const PROVIDER_ORDER = ['gemini', 'supermemory', 'moss', 'agentphone', 'browserUse', 'lovable', 'v0', 'agentmail', 'stripe'];
+export const PROVIDER_ORDER = ['gemini', 'supermemory', 'moss', 'agentphone', 'browserUse', 'lovable', 'v0', 'agentmail', 'stripe'];
 const LIVE_PROVIDER_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
-const PRODUCTION_REQUIRED_PROVIDERS = new Set(PROVIDER_ORDER.filter((name) => name !== 'v0'));
+export const PRODUCTION_REQUIRED_PROVIDERS = new Set(PROVIDER_ORDER.filter((name) => name !== 'v0'));
 const REQUIRED_WEBHOOK_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
 const PRODUCTION_LIVE_ACK_VALUE = 'I_UNDERSTAND_LIVE_OUTREACH';
+const PROVIDER_SMOKE_FRESH_MS = 24 * 60 * 60 * 1000;
+const WEBHOOK_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+const PRODUCTION_REVIEW_MODE = 'production_review';
+const PRODUCTION_LIVE_MODE = 'production_live';
 
 export const PROVIDER_DOCS = Object.freeze({
   agentphone: 'https://docs.agentphone.ai/documentation/guides/webhooks',
@@ -40,8 +48,12 @@ export function liveReadiness() {
   const webhooks = webhookReadiness(mode);
   const providers = providerReadiness({ mode, smoke, webhooks });
   const compliance = complianceGateReport({ mode });
-  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance });
-  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance });
+  const reputation = reputationReadinessReport();
+  const jobs = durableJobs.summary();
+  const admin = adminAuthPosture({ mode });
+  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin });
+  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs });
+  const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs });
   const nextActions = nextActionsFor([...blockers, ...productionBlockers]);
 
   return {
@@ -53,12 +65,16 @@ export function liveReadiness() {
     canGoLive: productionBlockers.length === 0,
     blockers,
     productionBlockers,
+    promotionGates,
     nextActions,
     providers,
     webhooks,
     fulfillment: fulfillmentReadiness(),
     sideEffects,
     compliance,
+    reputation,
+    admin,
+    jobs,
     smoke,
     smokeToggles: {
       gemini: env.smoke.gemini,
@@ -67,7 +83,8 @@ export function liveReadiness() {
       liveCall: env.smoke.liveCall,
       agentmailSend: env.smoke.agentmailSend,
       stripeInvoice: env.smoke.stripeInvoice,
-      browserUse: env.smoke.browserUse
+      browserUse: env.smoke.browserUse,
+      lovableNavigation: env.smoke.lovableNavigation
     },
     outreach: outreachSummary(),
     quotas: quotaAndCostSummary(),
@@ -81,19 +98,29 @@ export function liveReadiness() {
 }
 
 function providerReadiness({ mode, smoke, webhooks }) {
+  const now = Date.now();
   return Object.fromEntries(PROVIDER_ORDER.map((name) => {
     const configured = providerConfigured(name);
     const required = requiredProvider(name, mode);
     const smokeRow = smoke[name] || null;
     const smokeStatus = smokeRow?.status || 'not_run';
+    const smokeAgeMs = smokeRow?.checkedAt ? Math.max(0, now - smokeRow.checkedAt) : null;
+    const smokeFresh = smokeStatus === 'ok' && smokeAgeMs !== null && smokeAgeMs <= PROVIDER_SMOKE_FRESH_MS;
+    const dryRunEvent = providerSmoke.latestEvent({ provider: name, dryRun: true });
+    const liveEvent = providerSmoke.latestEvent({ provider: name, live: true });
+    const dryRunSmoke = smokeEventSummary(dryRunEvent, now);
+    const liveSmoke = smokeEventSummary(liveEvent, now);
     const lastError = smokeRow?.detail?.error || smokeRow?.detail?.lastError || null;
     const webhook = webhookForProvider(name, webhooks);
+    const runtimeIncident = providerRuntimeIncident(name, { now });
     const blockerReasons = [];
 
     if (required && !configured.ok) blockerReasons.push(`${name} provider missing ${configured.missing.join(', ')}`);
     if (webhook?.required && !webhook.configured) blockerReasons.push(`${name} webhook missing: ${webhook.blockerReasons.join('; ')}`);
-    if (['failed', 'blocked'].includes(smokeStatus)) blockerReasons.push(`${name} smoke ${smokeStatus}${lastError ? `: ${lastError}` : ''}`);
-    if (mode === 'production_live' && required && smokeStatus !== 'ok') blockerReasons.push(`${name} smoke has not passed`);
+    if (required && runtimeIncident.blocked) blockerReasons.push(providerIncidentBlocker(name, runtimeIncident.reason));
+    if (['failed', 'blocked'].includes(smokeStatus)) blockerReasons.push(`${name} smoke ${smokeStatus}${lastError ? `: ${operationalErrorSummary(lastError)}` : ''}`);
+    if (mode === 'production_live' && required && !(liveSmoke.status === 'ok' && liveSmoke.live)) blockerReasons.push(`${name} live smoke has not passed`);
+    if (mode === 'production_live' && required && liveSmoke.status === 'ok' && liveSmoke.live && !liveSmoke.fresh) blockerReasons.push(`${name} live smoke is stale`);
 
     return [name, {
       configured: configured.ok,
@@ -104,16 +131,32 @@ function providerReadiness({ mode, smoke, webhooks }) {
       smoke: smokeRow ? {
         status: smokeRow.status,
         checkedAt: smokeRow.checkedAt,
+        ageMs: smokeAgeMs,
+        fresh: smokeFresh,
         dryRun: smokeRow.detail?.dryRun !== false,
         live: !!smokeRow.detail?.live
       } : {
         status: 'not_run',
         checkedAt: null,
+        ageMs: null,
+        fresh: false,
         dryRun: true,
         live: false
       },
       smokeStatus,
-      lastError,
+      smokeFresh,
+      dryRunSmoke,
+      liveSmoke,
+      runtimeIncident: {
+        blocked: !!runtimeIncident.blocked,
+        reason: runtimeIncident.blocked && runtimeIncident.reason
+          ? providerIncidentBlocker(name, runtimeIncident.reason)
+          : null,
+        checkedAt: runtimeIncident.incident?.checkedAt || null,
+        ageMs: runtimeIncident.ageMs ?? null,
+        clearedBy: runtimeIncident.clearedBy?.checkedAt || null
+      },
+      lastError: lastError ? operationalErrorSummary(lastError) : null,
       quotaCostStatus: quotaCostStatus(name, smokeRow),
       blockerReasons,
       nextAction: nextProviderAction({ name, configured, required, webhook, smokeStatus, blockerReasons }),
@@ -122,7 +165,7 @@ function providerReadiness({ mode, smoke, webhooks }) {
   }));
 }
 
-function providerConfigured(name) {
+export function providerConfigured(name) {
   if (name === 'gemini') return requiredEnv({ GEMINI_API_KEY: env.gemini.apiKey });
   if (name === 'supermemory') return requiredEnv({ SUPERMEMORY_API_KEY: env.supermemory.apiKey });
   if (name === 'moss') return requiredEnv({ MOSS_PROJECT_ID: env.moss.projectId, MOSS_PROJECT_KEY: env.moss.projectKey });
@@ -133,6 +176,32 @@ function providerConfigured(name) {
   if (name === 'agentmail') return requiredEnv({ AGENTMAIL_API_KEY: env.agentmail.apiKey, AGENTMAIL_INBOX_ID: env.agentmail.inboxId });
   if (name === 'stripe') return requiredEnv({ STRIPE_SECRET_KEY: env.stripe.secretKey });
   return { ok: false, missing: ['unknown_provider'] };
+}
+
+function smokeEventSummary(event, now = Date.now()) {
+  if (!event) {
+    return {
+      status: 'not_run',
+      checkedAt: null,
+      ageMs: null,
+      fresh: false,
+      dryRun: false,
+      live: false,
+      detail: null,
+      error: null
+    };
+  }
+  const ageMs = event.checkedAt ? Math.max(0, now - event.checkedAt) : null;
+  return {
+    status: event.status,
+    checkedAt: event.checkedAt,
+    ageMs,
+    fresh: ageMs !== null && ageMs <= PROVIDER_SMOKE_FRESH_MS,
+    dryRun: !!event.dryRun,
+    live: !!event.live,
+    detail: event.detail || {},
+    error: event.error || null
+  };
 }
 
 function requiredEnv(required) {
@@ -152,11 +221,14 @@ function requiredProvider(name, mode = env.runMode) {
 function webhookReadiness(mode = env.runMode) {
   const required = REQUIRED_WEBHOOK_MODES.has(mode);
   const httpsPublicUrl = isHttpsPublicUrl(env.publicUrl);
+  const now = Date.now();
   return {
     agentphone: webhookRow({
       provider: 'agentphone',
       required,
       configured: !!env.agentphone.webhookSecret,
+      lastReceivedAt: webhookEvents.lastReceived('agentphone'),
+      now,
       endpoint: `${env.publicUrl.replace(/\/$/, '')}/api/webhooks/agentphone`,
       verifier: 'HMAC-SHA256 over X-Webhook-Timestamp.rawBody',
       replayWindowSeconds: 300,
@@ -170,6 +242,8 @@ function webhookReadiness(mode = env.runMode) {
       provider: 'agentmail',
       required,
       configured: !!env.agentmail.webhookSecret,
+      lastReceivedAt: webhookEvents.lastReceived('agentmail'),
+      now,
       endpoint: `${env.publicUrl.replace(/\/$/, '')}/api/webhooks/agentmail`,
       verifier: 'Svix signature headers',
       idempotency: 'event_id/svix-id stored in webhook_events',
@@ -183,6 +257,8 @@ function webhookReadiness(mode = env.runMode) {
       provider: 'stripe',
       required,
       configured: !!env.stripe.webhookSecret,
+      lastReceivedAt: webhookEvents.lastReceived('stripe'),
+      now,
       endpoint: `${env.publicUrl.replace(/\/$/, '')}/api/webhooks/stripe`,
       verifier: 'Stripe-Signature via stripe.webhooks.constructEvent',
       idempotency: 'Stripe event.id stored in webhook_events before fulfillment',
@@ -196,9 +272,20 @@ function webhookReadiness(mode = env.runMode) {
 }
 
 function webhookRow(row) {
-  const blockerReasons = row.blockerReasons.filter(Boolean);
+  const ageMs = row.lastReceivedAt ? Math.max(0, (row.now || Date.now()) - row.lastReceivedAt) : null;
+  const fresh = ageMs !== null && ageMs <= WEBHOOK_FRESH_MS;
+  const freshnessBlocker = env.runMode === 'production_live' && row.required && !fresh
+    ? `${row.provider} webhook has not been received in the last 7 days`
+    : null;
+  const blockerReasons = [...row.blockerReasons, freshnessBlocker].filter(Boolean);
   return {
     ...row,
+    now: undefined,
+    freshness: {
+      lastReceivedAt: row.lastReceivedAt || null,
+      ageMs,
+      fresh
+    },
     blockerReasons,
     configured: Boolean(row.configured && blockerReasons.length === 0),
     status: row.configured && blockerReasons.length === 0 ? 'configured' : row.required ? 'blocked' : 'not_required',
@@ -264,7 +351,10 @@ function providerDetail(name) {
       authWall: 'blocked_auth_event',
       projectUrlExtraction: '.lovable.app',
       docs: PROVIDER_DOCS.lovableBuildWithUrl,
-      sideEffects: { submissionSmoke: env.smoke.browserUse ? 'covered_by_SMOKE_BROWSER_USE' : 'disabled_by_default' }
+      sideEffects: {
+        navigationSmoke: env.smoke.lovableNavigation ? 'enabled_by_SMOKE_LOVABLE_NAVIGATION' : 'disabled_by_default',
+        submissionSmoke: env.smoke.browserUse ? 'covered_by_SMOKE_BROWSER_USE_for_build_flow' : 'disabled_by_default'
+      }
     };
   }
   if (name === 'v0') {
@@ -308,7 +398,7 @@ function quotaCostStatus(name, smokeRow) {
   return detail.quota || detail.usage || 'not reported';
 }
 
-function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance }) {
+function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin }) {
   const blockers = [];
   if (!isValidRunMode(mode)) blockers.push(`invalid RUN_MODE: ${mode}; expected one of ${RUN_MODES.join(', ')}`);
 
@@ -323,8 +413,9 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (mode === 'production_live') {
-    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance }));
+    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }));
   }
+  if (admin?.required && !admin.ok) blockers.push(...admin.blockers);
 
   for (const [name, row] of Object.entries(providers)) {
     if (row.required) blockers.push(...row.blockerReasons);
@@ -335,26 +426,38 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
   for (const gate of compliance.gates || []) {
     if (!gate.ok) blockers.push(`compliance gate ${gate.name} failed: ${gate.detail}`);
   }
+  if (['autonomous_live', 'production_review', 'production_live'].includes(mode)) {
+    for (const gate of reputation?.gates || []) {
+      if (!gate.ok) blockers.push(`reputation gate ${gate.name} failed: ${gate.detail}`);
+    }
+  }
+  if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
 
   return unique(blockers);
 }
 
-function productionLiveBlockers({ providers, webhooks, sideEffects, compliance }) {
+function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }) {
   const blockers = [];
+  const admin = adminAuthPosture({ mode: PRODUCTION_LIVE_MODE });
   if (env.runMode !== 'production_live') blockers.push('RUN_MODE is not production_live');
   if (!isProductionAcked()) blockers.push(`PRODUCTION_LIVE_ACK must equal ${PRODUCTION_LIVE_ACK_VALUE}`);
   if (env.nodeEnv !== 'production') blockers.push('NODE_ENV must be production for production_live');
   if (!isHttpsPublicUrl(env.publicUrl)) blockers.push('APP_PUBLIC_URL must be a public https URL for production webhooks');
   if (!env.outreach.enabled) blockers.push('AUTONOMOUS_OUTREACH_ENABLED must be true for production_live');
+  blockers.push(...admin.blockers);
 
   for (const [name, row] of Object.entries(providers || {})) {
     if (!PRODUCTION_REQUIRED_PROVIDERS.has(name)) continue;
+    const liveSmoke = row.liveSmoke || {};
     if (!row.configured) blockers.push(`${name} provider is not configured`);
-    if (row.smokeStatus !== 'ok') blockers.push(`${name} smoke has not passed`);
-    if (row.lastError) blockers.push(`${name} last error: ${row.lastError}`);
+    if (!(liveSmoke.status === 'ok' && liveSmoke.live === true)) blockers.push(`${name} live smoke has not passed`);
+    if (liveSmoke.status === 'ok' && liveSmoke.live === true && !liveSmoke.fresh) blockers.push(`${name} live smoke is stale`);
+    if (liveSmoke.error) blockers.push(`${name} last error: ${operationalErrorSummary(liveSmoke.error)}`);
+    blockers.push(...(row.blockerReasons || []));
   }
   for (const [name, row] of Object.entries(webhooks || {})) {
     if (!row.configured) blockers.push(`${name} webhook is not configured`);
+    if (row.required && !row.freshness?.fresh) blockers.push(`${name} webhook freshness has not been proven`);
   }
   for (const [action, row] of Object.entries(sideEffects || {})) {
     if (!row.allowed) blockers.push(`${row.label} are not enabled for production_live`);
@@ -363,8 +466,333 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance }
   for (const gate of compliance?.gates || []) {
     if (!gate.ok) blockers.push(`compliance gate ${gate.name} failed: ${gate.detail}`);
   }
+  for (const gate of reputation?.gates || []) {
+    if (!gate.ok) blockers.push(`reputation gate ${gate.name} failed: ${gate.detail}`);
+  }
+  if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
   if (stripeKeyMode(env.stripe.secretKey) === 'secret_live') blockers.push('STRIPE_SECRET_KEY is sk_live_; use a restricted rk_live_ key for production');
   return unique(blockers);
+}
+
+function promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs }) {
+  const productionReview = stageReport(PRODUCTION_REVIEW_MODE, [
+    gate({
+      name: 'target_mode',
+      label: 'Run mode',
+      ok: mode === PRODUCTION_REVIEW_MODE,
+      blockers: mode === PRODUCTION_REVIEW_MODE ? [] : [`RUN_MODE is not ${PRODUCTION_REVIEW_MODE}`],
+      nextAction: `set RUN_MODE=${PRODUCTION_REVIEW_MODE} to review production credentials without live side effects`,
+      detail: { current: mode, expected: PRODUCTION_REVIEW_MODE }
+    }),
+    gate({
+      name: 'live_side_effects_disabled',
+      label: 'Live side effects disabled',
+      ok: enabledLiveSideEffectRows().length === 0,
+      blockers: enabledLiveSideEffectRows().map(([, row]) => `${row.label} flag must be disabled for production_review`),
+      nextAction: 'turn off every LIVE_* flag before production_review',
+      detail: { enabled: enabledLiveSideEffectRows().map(([key, row]) => ({ key, label: row.label })) }
+    }),
+    providerCredentialGate(providers),
+    adminAuthGate(adminAuthPosture({ mode: PRODUCTION_REVIEW_MODE })),
+    providerIncidentGate(providers),
+    webhookSecretGate(),
+    dryRunSmokeGate(providers),
+    complianceGate(compliance),
+    reputationGate(reputation),
+    durableJobsGate(jobs)
+  ]);
+
+  const liveMatrix = sideEffectMatrix(PRODUCTION_LIVE_MODE);
+  const productionLive = stageReport(PRODUCTION_LIVE_MODE, [
+    gate({
+      name: 'target_mode',
+      label: 'Run mode',
+      ok: mode === PRODUCTION_LIVE_MODE,
+      blockers: mode === PRODUCTION_LIVE_MODE ? [] : [`RUN_MODE is not ${PRODUCTION_LIVE_MODE}`],
+      nextAction: `set RUN_MODE=${PRODUCTION_LIVE_MODE} only after every live gate is green`,
+      detail: { current: mode, expected: PRODUCTION_LIVE_MODE }
+    }),
+    gate({
+      name: 'production_ack',
+      label: 'Explicit launch ack',
+      ok: isProductionAcked(),
+      blockers: isProductionAcked() ? [] : [`PRODUCTION_LIVE_ACK must equal ${PRODUCTION_LIVE_ACK_VALUE}`],
+      nextAction: `set PRODUCTION_LIVE_ACK=${PRODUCTION_LIVE_ACK_VALUE} when intentionally launching`,
+      detail: { env: 'PRODUCTION_LIVE_ACK', expected: PRODUCTION_LIVE_ACK_VALUE }
+    }),
+    gate({
+      name: 'node_env',
+      label: 'Node production env',
+      ok: env.nodeEnv === 'production',
+      blockers: env.nodeEnv === 'production' ? [] : ['NODE_ENV must be production for production_live'],
+      nextAction: 'run the server with NODE_ENV=production',
+      detail: { current: env.nodeEnv, expected: 'production' }
+    }),
+    gate({
+      name: 'public_https_url',
+      label: 'Public HTTPS URL',
+      ok: isHttpsPublicUrl(env.publicUrl),
+      blockers: isHttpsPublicUrl(env.publicUrl) ? [] : ['APP_PUBLIC_URL must be a public https URL for production webhooks'],
+      nextAction: 'set APP_PUBLIC_URL to the deployed https origin and register webhooks',
+      detail: { current: env.publicUrl }
+    }),
+    gate({
+      name: 'autonomous_outreach',
+      label: 'Autonomous outreach enabled',
+      ok: env.outreach.enabled,
+      blockers: env.outreach.enabled ? [] : ['AUTONOMOUS_OUTREACH_ENABLED must be true for production_live'],
+      nextAction: 'set AUTONOMOUS_OUTREACH_ENABLED=true after review gates are green'
+    }),
+    gate({
+      name: 'live_side_effect_flags',
+      label: 'Live side-effect flags',
+      ok: Object.values(liveMatrix).every((row) => row.allowed),
+      blockers: Object.values(liveMatrix).flatMap((row) => row.allowed ? [] : [`${row.label} are not enabled for production_live`, ...(row.blockers || [])]),
+      nextAction: 'enable the specific LIVE_* flags only when intentionally launching',
+      detail: liveMatrix
+    }),
+    providerCredentialGate(providers),
+    adminAuthGate(adminAuthPosture({ mode: PRODUCTION_LIVE_MODE })),
+    providerIncidentGate(providers),
+    liveSmokeGate(providers),
+    webhookFreshnessGate(webhooks),
+    complianceGate(compliance),
+    reputationGate(reputation),
+    durableJobsGate(jobs),
+    gate({
+      name: 'stripe_key_scope',
+      label: 'Stripe key scope',
+      ok: stripeKeyMode(env.stripe.secretKey) !== 'secret_live',
+      blockers: stripeKeyMode(env.stripe.secretKey) === 'secret_live'
+        ? ['STRIPE_SECRET_KEY is sk_live_; use a restricted rk_live_ key for production']
+        : [],
+      nextAction: 'replace sk_live_ with a restricted rk_live_ key',
+      detail: { keyMode: stripeKeyMode(env.stripe.secretKey) }
+    })
+  ]);
+
+  return { productionReview, productionLive };
+}
+
+function stageReport(targetMode, gates) {
+  const blockers = unique(gates.flatMap((item) => item.blockers || []));
+  return {
+    targetMode,
+    ok: gates.every((item) => item.ok),
+    blockerCount: blockers.length,
+    blockers,
+    nextActions: nextActionsFor(blockers),
+    gates
+  };
+}
+
+function gate({ name, label, ok, blockers = [], nextAction = 'monitor', detail = undefined }) {
+  return {
+    name,
+    label,
+    ok: Boolean(ok),
+    blockers: unique(blockers),
+    nextAction: Boolean(ok) ? 'monitor' : nextAction,
+    ...(detail === undefined ? {} : { detail })
+  };
+}
+
+function providerCredentialGate(providers) {
+  const blockers = [];
+  const detail = {};
+  for (const name of PRODUCTION_REQUIRED_PROVIDERS) {
+    const row = providers?.[name];
+    detail[name] = { configured: !!row?.configured, missing: row?.missing || [] };
+    if (!row?.configured) blockers.push(`${name} provider is not configured`);
+  }
+  return gate({
+    name: 'provider_credentials',
+    label: 'Provider credentials',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'set missing provider credentials',
+    detail
+  });
+}
+
+function providerIncidentGate(providers) {
+  const blockers = [];
+  const detail = {};
+  for (const name of PRODUCTION_REQUIRED_PROVIDERS) {
+    const incident = providers?.[name]?.runtimeIncident || {};
+    detail[name] = incident;
+    if (incident.blocked && incident.reason) blockers.push(incident.reason);
+  }
+  return gate({
+    name: 'provider_runtime_incidents',
+    label: 'Provider runtime incidents',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'fix provider credentials/config, then run a successful live smoke for the named provider',
+    detail
+  });
+}
+
+function adminAuthGate(admin) {
+  return gate({
+    name: 'admin_auth',
+    label: 'Admin auth',
+    ok: admin?.ok === true,
+    blockers: admin?.blockers || ['ADMIN_API_TOKEN posture is unavailable'],
+    nextAction: admin?.nextAction || 'set ADMIN_API_TOKEN',
+    detail: {
+      required: !!admin?.required,
+      configured: !!admin?.configured,
+      strong: !!admin?.strong
+    }
+  });
+}
+
+function dryRunSmokeGate(providers) {
+  const blockers = [];
+  const detail = {};
+  for (const name of PRODUCTION_REQUIRED_PROVIDERS) {
+    const row = providers?.[name];
+    const dryRun = row?.dryRunSmoke?.status !== 'not_run' ? row.dryRunSmoke : row?.smoke;
+    const status = dryRun?.status || 'not_run';
+    const ageMs = dryRun?.ageMs;
+    const fresh = Number.isFinite(ageMs) && ageMs <= PROVIDER_SMOKE_FRESH_MS;
+    const acceptableStatus = ['configured', 'ok'].includes(status);
+    detail[name] = {
+      status,
+      checkedAt: dryRun?.checkedAt || null,
+      ageMs: ageMs ?? null,
+      fresh,
+      dryRun: dryRun?.dryRun === true,
+      live: dryRun?.live === true
+    };
+    if (!acceptableStatus) blockers.push(`${name} dry-run/config smoke has not passed`);
+    else if (!fresh) blockers.push(`${name} dry-run/config smoke is stale`);
+  }
+  return gate({
+    name: 'dry_run_smoke_freshness',
+    label: 'Dry-run smoke freshness',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'run npm run smoke:providers without live toggles',
+    detail
+  });
+}
+
+function liveSmokeGate(providers) {
+  const blockers = [];
+  const detail = {};
+  for (const name of PRODUCTION_REQUIRED_PROVIDERS) {
+    const row = providers?.[name];
+    const liveSmoke = row?.liveSmoke || {};
+    detail[name] = {
+      status: liveSmoke.status || 'not_run',
+      checkedAt: liveSmoke.checkedAt || null,
+      ageMs: liveSmoke.ageMs ?? null,
+      fresh: !!liveSmoke.fresh,
+      live: liveSmoke.live === true,
+      lastError: liveSmoke.error ? operationalErrorSummary(liveSmoke.error) : null
+    };
+    if (liveSmoke.status !== 'ok' || liveSmoke.live !== true) blockers.push(`${name} live smoke has not passed`);
+    else if (!liveSmoke.fresh) blockers.push(`${name} live smoke is stale`);
+    if (liveSmoke.error) blockers.push(`${name} last error: ${operationalErrorSummary(liveSmoke.error)}`);
+  }
+  return gate({
+    name: 'live_smoke_freshness',
+    label: 'Live smoke freshness',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'run one provider smoke at a time with SMOKE_* live toggles',
+    detail
+  });
+}
+
+function webhookSecretGate() {
+  const rows = {
+    agentphone: { configured: !!env.agentphone.webhookSecret, missing: 'AGENTPHONE_WEBHOOK_SECRET missing' },
+    agentmail: { configured: !!env.agentmail.webhookSecret, missing: 'AGENTMAIL_WEBHOOK_SECRET missing' },
+    stripe: { configured: !!env.stripe.webhookSecret, missing: 'STRIPE_WEBHOOK_SECRET missing' }
+  };
+  const blockers = Object.entries(rows)
+    .filter(([, row]) => !row.configured)
+    .map(([provider, row]) => `${provider} webhook missing: ${row.missing}`);
+  return gate({
+    name: 'webhook_secrets',
+    label: 'Webhook secrets',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'configure provider webhook secrets before review',
+    detail: rows
+  });
+}
+
+function webhookFreshnessGate(webhooks) {
+  const blockers = [];
+  const detail = {};
+  for (const [name, row] of Object.entries(webhooks || {})) {
+    detail[name] = {
+      configured: !!row.configured,
+      lastReceivedAt: row.freshness?.lastReceivedAt || null,
+      ageMs: row.freshness?.ageMs ?? null,
+      fresh: !!row.freshness?.fresh,
+      endpoint: row.endpoint
+    };
+    if (!row.configured) blockers.push(`${name} webhook is not configured`);
+    if (row.required && !row.freshness?.fresh) blockers.push(`${name} webhook freshness has not been proven`);
+    for (const reason of row.blockerReasons || []) blockers.push(reason);
+  }
+  return gate({
+    name: 'webhook_freshness',
+    label: 'Webhook freshness',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'deliver and verify provider webhooks on the public https endpoint',
+    detail
+  });
+}
+
+function complianceGate(compliance) {
+  const blockers = (compliance?.gates || [])
+    .filter((item) => !item.ok)
+    .map((item) => `compliance gate ${item.name} failed: ${item.detail}`);
+  return gate({
+    name: 'compliance',
+    label: 'Compliance gates',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'fix the named compliance gate before resuming outreach',
+    detail: compliance?.gates || []
+  });
+}
+
+function reputationGate(reputation) {
+  const blockers = (reputation?.gates || [])
+    .filter((item) => !item.ok)
+    .map((item) => `reputation gate ${item.name} failed: ${item.detail}`);
+  return gate({
+    name: 'reputation',
+    label: 'Reputation gates',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'pause or throttle outreach until reputation gates recover',
+    detail: reputation?.gates || []
+  });
+}
+
+function durableJobsGate(jobs) {
+  const blockers = jobs?.staleRunning ? [`${jobs.staleRunning} durable job(s) have stale leases`] : [];
+  return gate({
+    name: 'durable_jobs',
+    label: 'Durable jobs',
+    ok: blockers.length === 0,
+    blockers,
+    nextAction: 'recover stale jobs before promotion',
+    detail: jobs || null
+  });
+}
+
+function enabledLiveSideEffectRows() {
+  return Object.entries(sideEffectMatrix(PRODUCTION_LIVE_MODE)).filter(([, row]) => row.flagEnabled);
 }
 
 function outreachSummary() {
@@ -385,6 +813,7 @@ function quotaAndCostSummary() {
     maxAttemptsPerPhone: env.outreach.maxAttemptsPerPhone,
     mossIndexPolicy: env.smoke.mossIndex ? 'smoke_can_create_delete_or_reuse' : 'no_index_side_effects_without_SMOKE_MOSS_INDEX',
     browserUseSessionPolicy: env.smoke.browserUse ? 'smoke_can_create_session' : 'no_session_side_effects_without_SMOKE_BROWSER_USE',
+    lovableNavigationPolicy: env.smoke.lovableNavigation ? 'smoke_can_open_lovable_without_submission' : 'no_lovable_navigation_without_SMOKE_LOVABLE_NAVIGATION',
     browserUseMaxCostUsd: process.env.BROWSER_USE_MAX_COST_USD || null,
     stripeInvoicePolicy: env.smoke.stripeInvoice ? 'smoke_can_create_test_invoice' : 'no_invoice_side_effects_without_SMOKE_STRIPE_INVOICE',
     stripeKeyMode: stripeKeyMode(env.stripe.secretKey)
@@ -400,13 +829,20 @@ function nextProviderAction({ name, configured, required, webhook, smokeStatus, 
   return `investigate ${name} smoke status ${smokeStatus}`;
 }
 
+function providerIncidentBlocker(provider, reason) {
+  return `${provider} provider has an uncleared runtime incident: ${operationalErrorSummary(reason)}`;
+}
+
 function nextActionsFor(blockers) {
   return unique(blockers).slice(0, 12).map((blocker) => {
+    if (/RUN_MODE is not production_review/.test(blocker)) return 'set RUN_MODE=production_review to review production credentials without live side effects';
     if (/RUN_MODE/.test(blocker)) return 'set RUN_MODE=production_live only after review blockers are gone';
     if (/PRODUCTION_LIVE_ACK/.test(blocker)) return `set PRODUCTION_LIVE_ACK=${PRODUCTION_LIVE_ACK_VALUE} when intentionally launching`;
+    if (/ADMIN_API_TOKEN/.test(blocker)) return 'set a strong ADMIN_API_TOKEN before production review/live';
     if (/APP_PUBLIC_URL/.test(blocker)) return 'set APP_PUBLIC_URL to the deployed https origin and register webhooks';
     if (/WEBHOOK_SECRET|webhook/.test(blocker)) return 'configure provider webhook secret and endpoint';
-    if (/smoke has not passed/.test(blocker)) return 'run one provider smoke at a time with SMOKE_* toggles';
+    if (/dry-run\/config smoke/.test(blocker)) return 'run npm run smoke:providers without live toggles';
+    if (/live smoke/.test(blocker)) return 'run one provider smoke at a time with SMOKE_* toggles';
     if (/LIVE_/.test(blocker) || /not enabled/.test(blocker)) return 'enable the specific LIVE_* flag only for the side effect being launched';
     if (/provider/.test(blocker) || /not configured/.test(blocker)) return 'set missing provider credentials';
     if (/compliance/.test(blocker)) return 'fix the named compliance gate before resuming outreach';

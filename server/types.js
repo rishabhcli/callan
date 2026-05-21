@@ -70,6 +70,7 @@ export const BusinessProfile = z.object({
   yelpUrl: z.string().nullable(),
   sourceUrl: z.string().nullable(),
   sourceUrls: z.array(z.string()).max(10).optional(),
+  leadIntelligence: z.any().optional(),
   sourceProvenance: z.object({
     phone: z.string().nullable(),
     address: z.string().nullable(),

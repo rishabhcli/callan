@@ -38,6 +38,27 @@ function formatPhone(p) {
   return `(${digits.slice(0, digits.length - 7) || '—'}) ${mid} ${last}`;
 }
 
+function labelize(value) {
+  return String(value || '').replace(/_/g, ' ');
+}
+
+function parseResearchJson(lead) {
+  const raw = lead.research_json || lead.researchJson;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function leadIntelligence(lead) {
+  return parseResearchJson(lead)?.leadIntelligence || null;
+}
+
+function scoreValue(score) {
+  if (score == null) return null;
+  const value = typeof score === 'number' ? score : Number(score.score);
+  return Number.isFinite(value) ? Math.round(value) : null;
+}
+
 export default function RightRail({
   leads = [],
   focusedLeadId,
@@ -45,6 +66,7 @@ export default function RightRail({
   queueCounts,
   sseStatus,
   scheduledCalls = { pending: [], recent: [], warmingIds: [] },
+  handoffCases = [],
   onCancelScheduled,
   onFireScheduled
 }) {
@@ -79,6 +101,19 @@ export default function RightRail({
       <div className="nyna-rail-body">
         <QueueSummary queueCounts={queueCounts} />
 
+        {handoffCases?.length ? (
+          <>
+            <div className="nyna-rail-section-title">handoff queue</div>
+            {handoffCases.slice(0, 5).map((item) => (
+              <HandoffRailCard
+                key={item.id}
+                item={item}
+                onFocus={() => item.lead_id && onFocus?.(item.lead_id)}
+              />
+            ))}
+          </>
+        ) : null}
+
         {scheduledCalls?.pending?.length ? (
           <>
             <div className="nyna-rail-section-title">upcoming callbacks</div>
@@ -112,6 +147,30 @@ export default function RightRail({
         )}
       </div>
     </aside>
+  );
+}
+
+function HandoffRailCard({ item, onFocus }) {
+  return (
+    <button
+      type="button"
+      className={`nyna-rail-card nyna-rail-card-handoff handoff-severity-${item.severity}`}
+      onClick={onFocus}
+    >
+      <div className="nyna-rail-card-top">
+        <div style={{ minWidth: 0 }}>
+          <div className="nyna-rail-card-name">{item.businessName || item.business_name || item.lead_id || 'unassigned case'}</div>
+          <div className="nyna-rail-card-loc">{labelize(item.category)}</div>
+        </div>
+        <span className="nyna-rail-card-status nyna-rail-card-status-blocked">
+          {item.severity}
+        </span>
+      </div>
+      <div className="nyna-rail-card-meta">
+        <span>{item.status}</span>
+        <span>{relTime(item.updated_at || item.created_at)}</span>
+      </div>
+    </button>
   );
 }
 
@@ -220,6 +279,9 @@ function QueueSummary({ queueCounts = {} }) {
 function RailCard({ lead, focused, onClick }) {
   const tone = statusTone(lead);
   const progress = progressForLead(lead);
+  const intelligence = leadIntelligence(lead);
+  const totalScore = scoreValue(intelligence?.scores?.totalScore);
+  const opener = intelligence?.callOpener?.text || null;
   return (
     <button
       type="button"
@@ -242,6 +304,13 @@ function RailCard({ lead, focused, onClick }) {
         <span>{formatPhone(lead.phone)}</span>
         <span>{relTime(lead.updated_at || lead.created_at)}</span>
       </div>
+      {intelligence ? (
+        <div className="nyna-rail-card-research">
+          {totalScore != null ? <span>fit {totalScore}</span> : null}
+          {opener ? <span>evidence opener</span> : null}
+          {intelligence.doNotCallBecauseAlreadyStrong?.skip ? <span>strong skip</span> : null}
+        </div>
+      ) : null}
     </button>
   );
 }

@@ -1,6 +1,6 @@
 // Hosting/edits monthly subscription ($29/mo) sold AFTER the one-shot $500 build
 // ships. Flow:
-//   1. builder.done -> sendHostingUpsellEmail (one-click accept link).
+//   1. builder.done -> durable hosting.upsell job -> sendHostingUpsellEmail.
 //   2. /api/hosting/accept/:leadId -> acceptHostingSubscription -> Stripe Checkout
 //      session (subscription mode) -> 302 to the Checkout URL.
 //   3. customer.subscription.* webhook -> handleStripeSubscriptionEvent ->
@@ -14,7 +14,7 @@ import { randomBytes } from 'node:crypto';
 import { env } from './env.js';
 import { log } from './logger.js';
 import { emit } from './sse.js';
-import { leads, subscriptions, payments } from './db.js';
+import { leads, subscriptions, payments, contactEvents } from './db.js';
 import { stripeClient } from './providers/stripe.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
 
@@ -49,6 +49,15 @@ function alreadyHasSubscription(leadId) {
   if (lead?.subscription_id) return true;
   const rows = subscriptions.forLead(leadId) || [];
   return rows.some((row) => ['active', 'trialing', 'past_due', 'unpaid', 'incomplete'].includes(row.status));
+}
+
+function alreadySentHostingUpsell(leadId) {
+  if (!leadId) return false;
+  return (contactEvents.listByLead(leadId, { limit: 200 }) || []).some((row) => (
+    row.direction === 'outbound'
+    && row.channel === 'agentmail'
+    && row.type === 'hosting_upsell'
+  ));
 }
 
 function buildHostingEmailBody({ leadId, businessName, acceptUrl, optOutUrl }) {
@@ -103,6 +112,13 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/'/g, '&#39;');
 }
 
+function maskEmail(value) {
+  const text = String(value || '');
+  const [local, domain] = text.split('@');
+  if (!local || !domain) return text ? '***' : null;
+  return `${local[0]}***@${domain}`;
+}
+
 /**
  * Send the $29/mo hosting upsell. Silent-skip with a log.warn when the price
  * isn't configured or the lead already has a subscription. Never throws — the
@@ -128,6 +144,11 @@ export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
   if (alreadyHasSubscription(leadId)) {
     log.info('hosting_upsell.skipped', { leadId, reason: 'already_subscribed' });
     return { sent: false, reason: 'already_subscribed' };
+  }
+
+  if (alreadySentHostingUpsell(leadId)) {
+    log.info('hosting_upsell.skipped', { leadId, reason: 'already_sent' });
+    return { sent: false, reason: 'already_sent' };
   }
 
   const recipient = toEmail || pickLeadEmail(leadRow);
@@ -157,6 +178,32 @@ export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
       leadId,
       costKind: 'hosting_upsell'
     }, { timeoutSeconds: 15, maxRetries: 2 });
+
+    try {
+      contactEvents.add({
+        lead_id: leadId,
+        type: 'hosting_upsell',
+        direction: 'outbound',
+        channel: 'agentmail',
+        provider_id: result?.providerId || result?.messageId || null,
+        thread_id: result?.threadId || null,
+        subject,
+        body: text,
+        metadata: {
+          plan: HOSTING_PLAN_LABEL,
+          amountCents: HOSTING_DEFAULT_AMOUNT_CENTS,
+          currency: HOSTING_DEFAULT_CURRENCY,
+          acceptUrl,
+          optOutUrl,
+          messageId: result?.messageId || null,
+          toMasked: maskEmail(recipient),
+          decisionCode: 'agentmail.outbound.hosting_upsell',
+          decisionReason: 'customer received a completed site and no active hosting/edit-care subscription is linked'
+        }
+      });
+    } catch (err) {
+      log.warn('hosting_upsell.contact_event_failed', { leadId, error: err?.message || String(err) });
+    }
 
     emit('hosting_upsell.sent', {
       worker: 'hostingSubscription',

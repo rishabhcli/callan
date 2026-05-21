@@ -3,7 +3,7 @@ import cors from 'cors';
 import { env } from './env.js';
 import { log } from './logger.js';
 import { attachStream, emit } from './sse.js';
-import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts } from './db.js';
+import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, accountManagerPlans, accountTasks, handoffCases } from './db.js';
 import { marginForLead } from './costs.js';
 import { DiscoverRequest, CallRequest, FollowupRequest, BuildRequest } from './types.js';
 import {
@@ -30,7 +30,9 @@ import {
   canRouteCallLead,
   explainLeadCallability as explainOutreachCallability,
   forceRetryLeadOutreach,
+  handleOutreachLeadJob,
   optOutLeadFromOutreach,
+  OUTREACH_LEAD_JOB_TYPE,
   outreachRouteSmoke,
   outreachStatus,
   pauseOutreachLoop,
@@ -40,19 +42,25 @@ import {
 } from './outreach.js';
 import { reputationStatus, startReputationLoop } from './reputation.js';
 import { topPriorityLeads, nicheWinRateMap } from './leadPriority.js';
+import { LEAD_PRIORITY_SCORE_JOB_TYPE, handleLeadPriorityScoreJob } from './leadPriorityQueue.js';
 import { runScraper } from './workers/scraper.js';
 import { runCaller } from './workers/caller.js';
 import { runAnalyst } from './workers/analyst.js';
 import { handleAgentMailInbound, runMailer } from './workers/mailer.js';
-import { runBuilder } from './workers/builder.js';
+import { runBuilder, runPreviewBuilder } from './workers/builder.js';
+import { BUILDER_BUILD_JOB_TYPE, enqueueBuilderBuild } from './builderQueue.js';
+import { HOSTING_UPSELL_JOB_TYPE, handleHostingUpsellJob } from './hostingUpsellQueue.js';
 import { runScheduledCaller } from './workers/scheduledCaller.js';
 import {
   registerScheduledCallDispatcher,
+  SCHEDULED_CALL_JOB_TYPE,
+  handleScheduledCallPlacementJob,
   startScheduledCallLoop,
   cancelScheduledCall,
   fireScheduledCallNow
 } from './scheduledCalls.js';
 import { ensureOperatorTransferConfigured } from './operatorTransfer.js';
+import { handoffDeskSummary, performHandoffAction } from './handoff.js';
 import {
   createBrowserUseResearchJob,
   getBrowserResearchStatus,
@@ -61,19 +69,54 @@ import {
   stopBrowserUseResearchJob
 } from './research/browserUseSwarm.js';
 import { BrowserUseLovableAdapter, normalizeBrowserUseSessionSnapshot } from './providers/browserUse.js';
-import { generateGrowthPlanForLead, growthStatus, readGrowthState, recordGrowthCustomerResponse, sendGrowthRecap } from './growth/index.js';
+import { growthStatus, readGrowthState, recordGrowthCustomerResponse } from './growth/index.js';
+import { GROWTH_FOLLOWUP_JOB_TYPE, GROWTH_PLAN_JOB_TYPE, enqueueGrowthFollowupJob, enqueueGrowthPlanJob, handleGrowthFollowupJob, handleGrowthPlanJob } from './growthQueue.js';
+import {
+  ACCOUNT_MANAGER_RUN_JOB_TYPE,
+  ACCOUNT_MANAGER_TASK_JOB_TYPE,
+  accountManagerStatus,
+  approveAccountTask,
+  buildAftercarePreview,
+  completeAccountTask,
+  enqueueAccountManagerRun,
+  enqueueAccountManagerTask,
+  evaluateSendPolicy,
+  generateAccountManagerPlanForLead,
+  handleAccountManagerRunJob,
+  handleAccountManagerTaskJob,
+  pauseAccountTask,
+  readAccountManagerState,
+  reassignAccountTask,
+  startAccountManagerLoop
+} from './accountManager/index.js';
+import { commerceStatus, planCommerceForLead, readCommerceState, submitPortalCommerceIntake } from './commerce/index.js';
 import { mossStatusForLead } from './moss/hotIndex.js';
-import { buildQaReadModel } from './fulfillment/hooks/index.js';
+import { buildQaReadModel, renderMockGeneratedSite } from './fulfillment/hooks/index.js';
 import { recordReferralClick, referralRollup, totalReferralClicks } from './referrals.js';
 import {
   acceptQuote as portalAcceptQuote,
-  requestEdit as portalRequestEdit,
+  approveLaunch as portalApproveLaunch,
+  approveScope as portalApproveScope,
   bookCallback as portalBookCallback,
   optOut as portalOptOut,
-  quoteStatusForLead,
-  paymentLinksForLead,
-  pendingCallbackForLead
+  portalState,
+  recordAssetUrl as portalRecordAssetUrl,
+  requestRevision as portalRequestRevision,
+  resolvePortalAccess,
+  updateIntake as portalUpdateIntake
 } from './customerPortal.js';
+import { customerTrustSummaryForLead, trustSummaryForLead } from './trust.js';
+import { enqueueJob, jobQueueHealth, startDurableJobLoop } from './jobs.js';
+import { EMAIL_CALLBACK_JOB_TYPE, handleEmailCallbackJob } from './emailCallback.js';
+import { CALL_ANALYSIS_JOB_TYPE } from './analysisQueue.js';
+import { MAIL_REPLY_JOB_TYPE, enqueueMailReplyJob } from './mailReplyQueue.js';
+import { INBOUND_VOICE_FOLLOWUP_JOB_TYPE, handleInboundVoiceFollowupJob } from './inboundVoiceQueue.js';
+import { INBOUND_MEMORY_HYDRATE_JOB_TYPE, handleInboundMemoryHydrationJob } from './inboundMemoryQueue.js';
+import { OPERATOR_TRANSFER_JOB_TYPE, handleOperatorTransferJob } from './operatorTransferQueue.js';
+import { runProductionEvals } from './evals.js';
+import { OPS_BACKUP_JOB_TYPE, OPS_PROVIDER_POSTURE_JOB_TYPE, OPS_RECOVER_STUCK_JOB_TYPE, backupFreshness, backupSqliteDataDir, exportOperationsData, latestBackupManifest, opsObservability, recoverStuckOperations, runOpsBackupJob, runOpsRecoveryJob, runProviderPostureJob, resetMockData, startOpsBackupScheduler, startOpsRecoveryScheduler, startProviderPostureScheduler } from './ops.js';
+import { SAFE_TO_SELL_JOB_TYPE, buildProviderProofMatrix, buildSafeToSellDecisionReceipt, buildSafeToSellNextActions, compactSafeToSellReceiptHistory, enqueueSafeToSellSelfCheck, runSafeToSellSelfCheck, safeToSellSnapshotStatus, startSafeToSellSelfCheckScheduler } from './safeToSell.js';
+import { isOperatorProtectedRequest, requireAdmin } from './adminAuth.js';
 
 const app = express();
 app.use(cors());
@@ -83,13 +126,20 @@ const rawBodySaver = (req, _res, buf) => { req.rawBody = buf; };
 app.use('/api/webhooks', express.json({ verify: rawBodySaver }));
 app.use(express.json({ limit: '1mb' }));
 
-const fire = (worker, args, fn) => {
-  Promise.resolve()
-    .then(() => fn(args))
-    .catch((err) => {
-      log.error(`${worker}.unhandled`, { error: err.message });
-      emit(`${worker}.error`, { worker, error: err.message, ...args });
-    });
+app.use((req, res, next) => {
+  if (!isOperatorProtectedRequest(req)) return next();
+  return requireAdmin(req, res, next);
+});
+
+const fire = (worker, args, _fn, options = {}) => {
+  const result = enqueueJob({
+    type: options.type || worker,
+    payload: args || {},
+    idempotencyKey: options.idempotencyKey || null,
+    runAt: options.runAt || Date.now(),
+    maxAttempts: options.maxAttempts || 5
+  });
+  return result.row;
 };
 
 /**
@@ -143,7 +193,7 @@ function findEmailContextForLead(leadId) {
  * Browser Use live URL the moment the build session starts. Lazy-imports
  * sendPreviewBuildEmail to avoid a circular dep at module load.
  */
-const startBuilder = (args) => fire('builder', { ...args }, async (a) => {
+async function runBuilderWithLiveEmail(a = {}) {
   const { sendPreviewBuildEmail } = await import('./workers/mailer.js');
   const onLiveUrl = async (liveUrl, ctx) => {
     const ec = findEmailContextForLead(a.leadId);
@@ -168,6 +218,96 @@ const startBuilder = (args) => fire('builder', { ...args }, async (a) => {
     }
   };
   return runBuilder({ ...a, onLiveUrl });
+}
+
+async function runPreviewBuilderWithReplyEmail(a = {}, job = null) {
+  const previewEmail = a.previewEmail || {};
+  const onLiveUrl = async (liveUrl, ctx) => {
+    if (!previewEmail.messageId || !previewEmail.toEmail) {
+      log.warn('builder.preview_live_url.skipped', { leadId: a.leadId, reason: 'missing_preview_email_context' });
+      return;
+    }
+    const { sendPreviewBuildEmail } = await import('./workers/mailer.js');
+    await sendPreviewBuildEmail({
+      leadId: a.leadId,
+      liveUrl,
+      inReplyToMessageId: previewEmail.messageId,
+      threadId: previewEmail.threadId || null,
+      toEmail: previewEmail.toEmail,
+      businessName: previewEmail.businessName || leads.get(a.leadId)?.business_name || null,
+      buildId: ctx?.buildId || null,
+      sessionId: ctx?.sessionId || null,
+      mock: !!ctx?.mock
+    });
+  };
+  try {
+    return await runPreviewBuilder({ leadId: a.leadId, target: a.target, onLiveUrl });
+  } catch (err) {
+    const finalAttempt = Number(job?.attempts || 0) >= Number(job?.max_attempts || 1);
+    log.warn('builder.preview_job_failed', {
+      leadId: a.leadId,
+      jobId: job?.id || null,
+      finalAttempt,
+      error: err?.message || String(err)
+    });
+    try {
+      leads.update(a.leadId, {
+        preview_build_triggered_at: finalAttempt ? null : leads.get(a.leadId)?.preview_build_triggered_at || null,
+        next_action: finalAttempt ? 'await_payment' : 'preview_build_retry'
+      });
+    } catch (rollbackErr) {
+      log.warn('builder.preview_job_state_update_failed', { leadId: a.leadId, error: rollbackErr?.message || String(rollbackErr) });
+    }
+    throw err;
+  }
+}
+
+async function handleBuilderBuildJob(payload = {}, job = null) {
+  if (payload.previewBuild) return runPreviewBuilderWithReplyEmail(payload, job);
+  return runBuilderWithLiveEmail(payload);
+}
+
+const startBuilder = (args = {}) => enqueueBuilderBuild(args).row;
+
+const durableJobHandlers = {
+  'research.discover': runScraper,
+  'research.browser_use': runBrowserUseResearchJob,
+  'call.followup': runCaller,
+  [SCHEDULED_CALL_JOB_TYPE]: handleScheduledCallPlacementJob,
+  [CALL_ANALYSIS_JOB_TYPE]: runAnalyst,
+  [OUTREACH_LEAD_JOB_TYPE]: handleOutreachLeadJob,
+  [INBOUND_MEMORY_HYDRATE_JOB_TYPE]: handleInboundMemoryHydrationJob,
+  [INBOUND_VOICE_FOLLOWUP_JOB_TYPE]: handleInboundVoiceFollowupJob,
+  [OPERATOR_TRANSFER_JOB_TYPE]: handleOperatorTransferJob,
+  [EMAIL_CALLBACK_JOB_TYPE]: handleEmailCallbackJob,
+  [LEAD_PRIORITY_SCORE_JOB_TYPE]: handleLeadPriorityScoreJob,
+  'mail.followup': runMailer,
+  [MAIL_REPLY_JOB_TYPE]: (payload) => handleAgentMailInbound(payload),
+  [BUILDER_BUILD_JOB_TYPE]: handleBuilderBuildJob,
+  [HOSTING_UPSELL_JOB_TYPE]: handleHostingUpsellJob,
+  [GROWTH_PLAN_JOB_TYPE]: handleGrowthPlanJob,
+  [GROWTH_FOLLOWUP_JOB_TYPE]: handleGrowthFollowupJob,
+  [ACCOUNT_MANAGER_RUN_JOB_TYPE]: handleAccountManagerRunJob,
+  [ACCOUNT_MANAGER_TASK_JOB_TYPE]: handleAccountManagerTaskJob,
+  [OPS_BACKUP_JOB_TYPE]: runOpsBackupJob,
+  [OPS_PROVIDER_POSTURE_JOB_TYPE]: runProviderPostureJob,
+  [OPS_RECOVER_STUCK_JOB_TYPE]: (payload) => runOpsRecoveryJob(payload, {
+    recoverBuilds: (options) => recoverTriggeredPaymentBuilds({ startBuilder, ...options })
+  }),
+  [SAFE_TO_SELL_JOB_TYPE]: (payload) => runSafeToSellSelfCheck({ ...payload, source: 'durable_job' }),
+  scraper: runScraper,
+  browser_research: runBrowserUseResearchJob,
+  caller: runCaller,
+  mailer: runMailer,
+  builder: runBuilderWithLiveEmail
+};
+
+app.get('/api/ping', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'callan',
+    ts: Date.now()
+  });
 });
 
 app.get('/api/health', (_req, res) => {
@@ -191,8 +331,11 @@ app.get('/api/health', (_req, res) => {
     liveBlockers: readiness.blockers,
     productionBlockers: readiness.productionBlockers,
     canGoLive: readiness.canGoLive,
+    promotionGates: readiness.promotionGates,
+    admin: readiness.admin,
     sideEffects: readiness.sideEffects,
     compliance: readiness.compliance,
+    reputation: readiness.reputation,
     nextActions: readiness.nextActions,
     smoke: readiness.smoke,
     quotas: readiness.outreach,
@@ -201,6 +344,10 @@ app.get('/api/health', (_req, res) => {
     browserUseStatus: browserUseStatusSummary(),
     reasoning: reasoningTraces.summary(),
     growth: growthStatus(),
+    handoff: handoffCases.summary(),
+    accountManager: accountManagerStatus(),
+    commerce: commerceStatus(),
+    jobs: jobQueueHealth(),
     revenue: {
       ...revenueHealthSummary(),
       mrrUsd: subscriptions.activeMrrCents() / 100,
@@ -239,8 +386,11 @@ app.get('/api/status', (_req, res) => {
     canGoLive: readiness.canGoLive,
     blockers: readiness.blockers,
     productionBlockers: readiness.productionBlockers,
+    promotionGates: readiness.promotionGates,
+    admin: readiness.admin,
     sideEffects: readiness.sideEffects,
     outreach: readiness.outreach,
+    reputation: readiness.reputation,
     nextActions: readiness.nextActions
   });
 });
@@ -253,21 +403,208 @@ app.get('/api/growth/status', (_req, res) => {
   res.json(growthStatus());
 });
 
+app.get('/api/handoff/cases', (req, res) => {
+  res.json(handoffDeskSummary({
+    leadId: cleanText(req.query?.leadId || req.query?.lead_id) || null,
+    status: cleanText(req.query?.status) || 'open',
+    category: cleanText(req.query?.category) || null,
+    limit: boundedLimit(req.query?.limit, 80, 500)
+  }));
+});
+
+app.get('/api/leads/:id/handoff', (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  res.json(handoffDeskSummary({
+    leadId: lead.id,
+    status: cleanText(req.query?.status) || 'all',
+    limit: boundedLimit(req.query?.limit, 80, 500)
+  }));
+});
+
+app.post('/api/handoff/cases/:id/actions', async (req, res) => {
+  try {
+    const result = await performHandoffAction(req.params.id, {
+      action: req.body?.action,
+      actor: req.body?.actor || 'operator',
+      note: req.body?.note || null,
+      body: req.body?.body || req.body?.replyText || null,
+      assignedTo: req.body?.assignedTo || req.body?.assigned_to || null,
+      scheduledAtMs: req.body?.scheduledAtMs || req.body?.scheduled_at_ms || null,
+      ask: req.body?.ask || null,
+      resumeAutomation: req.body?.resumeAutomation === true || req.body?.resume_automation === true,
+      target: req.body?.target || null,
+      startBuilder
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err?.message || String(err) });
+  }
+});
+
+app.get('/api/commerce/status', (_req, res) => {
+  res.json(commerceStatus());
+});
+
 app.get('/api/production-readiness', (_req, res) => {
   const readiness = liveReadiness();
+  const observability = opsObservability();
   res.json({
     ok: readiness.canGoLive,
     mode: readiness.mode,
     canGoLive: readiness.canGoLive,
     productionBlockers: readiness.productionBlockers,
+    promotionGates: readiness.promotionGates,
     providers: readiness.providers,
+    providerProof: buildProviderProofMatrix({ readiness, observability }),
     webhooks: readiness.webhooks,
+    admin: readiness.admin,
     sideEffects: readiness.sideEffects,
     compliance: readiness.compliance,
+    reputation: readiness.reputation,
     quotas: readiness.quotas,
     nextActions: readiness.nextActions,
     docs: readiness.docs
   });
+});
+
+app.get('/api/jobs/health', (req, res) => {
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    queue: jobQueueHealth(),
+    recent: durableJobs.list({
+      status: req.query?.status || undefined,
+      type: req.query?.type || undefined,
+      limit: boundedLimit(req.query?.limit, 50, 200)
+    })
+  });
+});
+
+app.post('/api/jobs/recover-stuck', requireAdmin, (_req, res) => {
+  const recovered = durableJobs.recoverExpiredLeases({ limit: 200 });
+  res.json({ ok: true, recovered, queue: jobQueueHealth() });
+});
+
+app.get('/api/ops/command-center', async (_req, res) => {
+  const readiness = liveReadiness();
+  const queue = jobQueueHealth();
+  const observability = opsObservability();
+  const durableSnapshot = safeToSellSnapshotStatus(observability.safeToSellHistory?.latest);
+  const safeToSellReceipts = compactSafeToSellReceiptHistory(observability.safeToSellHistory);
+  const safeSnapshot = durableSnapshot.snapshot;
+  const evals = safeSnapshot?.report?.evals || await runProductionEvals();
+  const backups = latestBackupManifest();
+  const backup = backupFreshness(backups);
+  const since24h = Date.now() - 24 * 3600 * 1000;
+  const economics = economicsByNiche({ since: since24h });
+  const safeToSellToday = safeSnapshot
+    ? safeToSellSnapshotSummary({ snapshot: safeSnapshot, durableSnapshot })
+    : safeToSellTodaySummary({ readiness, queue, evals, observability, backup, durableSnapshot });
+  const providerProof = safeToSellToday.providerProof?.length
+    ? safeToSellToday.providerProof
+    : buildProviderProofMatrix({ readiness, observability });
+  res.json({
+    ok: safeToSellToday.ok
+      && readiness.canGoLive
+      && queue.ok
+      && evals.ok
+      && backup.ok
+      && observability.schedulerHealth?.ok !== false
+      && observability.economicsHealth?.ok !== false
+      && observability.providerHealthSlo?.ok !== false
+      && observability.workerHealthSlo?.ok !== false,
+    ts: Date.now(),
+    mode: env.runMode,
+    safeToSellToday,
+    safeToSellReceipts,
+    readiness: {
+      currentModeReady: readiness.ready,
+      productionLiveReady: readiness.canGoLive,
+      blockers: readiness.blockers,
+      productionBlockers: readiness.productionBlockers,
+      promotionGates: readiness.promotionGates,
+      admin: readiness.admin,
+      nextActions: readiness.nextActions
+    },
+    promotionGates: readiness.promotionGates,
+    providers: readiness.providers,
+    providerProof,
+    webhooks: readiness.webhooks,
+    queue,
+    evals,
+    observability,
+    backups: {
+      ...backup,
+      files: backups.files
+    },
+    economics24h: economics,
+    outreach: readiness.outreach,
+    compliance: readiness.compliance
+  });
+});
+
+app.get('/api/ops/observability', (_req, res) => {
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    ...opsObservability()
+  });
+});
+
+app.post('/api/ops/recover-stuck', requireAdmin, (req, res) => {
+  const result = recoverStuckOperations({
+    dryRun: req.body?.dryRun === true,
+    maxCallAgeMs: Number(req.body?.maxCallAgeMs) || undefined
+  });
+  res.json(result);
+});
+
+app.post('/api/ops/self-check', requireAdmin, async (req, res) => {
+  try {
+    if (req.body?.runNow === true) {
+      const report = await runSafeToSellSelfCheck({
+        record: req.body?.record !== false,
+        source: 'api'
+      });
+      return res.json({ ok: true, report });
+    }
+    const result = enqueueSafeToSellSelfCheck({
+      reason: cleanText(req.body?.reason) || 'api'
+    });
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      jobId: result.row?.id || null,
+      jobStatus: result.row?.status || null,
+      inserted: result.inserted
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.get('/api/admin/export', requireAdmin, (req, res) => {
+  res.json(exportOperationsData({
+    includePII: req.query?.includePII === 'true',
+    limit: boundedLimit(req.query?.limit, 500, 2000)
+  }));
+});
+
+app.post('/api/admin/backup', requireAdmin, (_req, res) => {
+  res.json(backupSqliteDataDir());
+});
+
+app.get('/api/admin/backups', requireAdmin, (_req, res) => {
+  res.json(latestBackupManifest());
+});
+
+app.post('/api/admin/reset-mock-data', requireAdmin, (req, res) => {
+  const result = resetMockData({
+    confirm: req.body?.confirm,
+    dryRun: req.body?.dryRun !== false
+  });
+  res.status(result.ok ? 200 : 409).json(result);
 });
 
 app.get('/api/safety/status', (_req, res) => {
@@ -277,6 +614,7 @@ app.get('/api/safety/status', (_req, res) => {
     mode: readiness.mode,
     sideEffects: readiness.sideEffects,
     compliance: readiness.compliance,
+    reputation: readiness.reputation,
     webhooks: readiness.webhooks,
     blockers: readiness.blockers
   });
@@ -358,10 +696,15 @@ app.get('/api/leads/:id', async (req, res) => {
   const leadHistory = leads.history(lead.id);
   const leadReasoningTraces = reasoningTraces.listByLead(lead.id, { limit: 80 });
   const builderEvents = eventStore.listByLead(lead.id, { worker: 'builder', limit: 100 });
+  const callerEvents = eventStore.listByLead(lead.id, { worker: 'caller', limit: 150 });
   const builderState = buildBuilderReadModel({ lead, buildRows, builderEvents });
+  const callState = buildCallStateReadModel({ lead, callRows, callerEvents });
   const builderQa = buildQaReadModel({ leadId: lead.id, buildId: buildRows[0]?.id || null });
   const researchProfile = safeJson(lead.research_json);
   const growth = await readGrowthState(lead.id);
+  const accountManager = await readAccountManagerState(lead.id);
+  const commerce = readCommerceState(lead.id);
+  const leadHandoffCases = handoffCases.listByLead(lead.id, { status: 'all', limit: 80 });
   const moss = mossStatusForLead(lead.id);
   let memory = null;
   try {
@@ -375,6 +718,7 @@ app.get('/api/leads/:id', async (req, res) => {
   } catch (err) {
     log.warn('lead.margin_lookup_failed', { leadId: lead.id, error: err?.message || String(err) });
   }
+  const trust = trustSummaryForLead(lead.id);
   res.json({
     lead,
     calls: callRows,
@@ -392,11 +736,23 @@ app.get('/api/leads/:id', async (req, res) => {
     latestInvoice: paymentRows[0] || null,
     buildStatus: builderState.status,
     builderState,
+    callState,
     builderQa,
     reasoningTraces: leadReasoningTraces,
     moss,
     growth,
-    margin
+    accountManager,
+    commerce,
+    handoff: {
+      cases: leadHandoffCases,
+      openCases: leadHandoffCases.filter((row) => !['resolved', 'closed'].includes(row.status)),
+      summary: {
+        total: leadHandoffCases.length,
+        open: leadHandoffCases.filter((row) => !['resolved', 'closed'].includes(row.status)).length
+      }
+    },
+    margin,
+    trust
   });
 });
 
@@ -407,6 +763,12 @@ app.get('/api/leads/:id/reasoning', (req, res) => {
     leadId: lead.id,
     traces: reasoningTraces.listByLead(lead.id, { limit: boundedLimit(req.query?.limit, 100, 500) })
   });
+});
+
+app.get('/api/leads/:id/trust', (req, res) => {
+  const summary = trustSummaryForLead(req.params.id, { eventLimit: boundedLimit(req.query?.limit, 80, 200) });
+  if (!summary) return res.status(404).json({ error: 'lead not found' });
+  res.json(summary);
 });
 
 app.get('/api/leads/:id/build-qa', (req, res) => {
@@ -459,12 +821,17 @@ app.post('/api/leads/:id/growth/plan', async (req, res) => {
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).json({ error: 'lead not found' });
   try {
-    const result = await generateGrowthPlanForLead({
+    const result = enqueueGrowthPlanJob({
       leadId: lead.id,
       force: req.body?.force === true,
       source: req.body?.source || 'api'
     });
-    res.json(result);
+    res.status(202).json({
+      accepted: true,
+      jobId: result.row?.id,
+      jobStatus: result.row?.status,
+      duplicate: !result.inserted
+    });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -474,12 +841,18 @@ app.post('/api/leads/:id/growth/followup', async (req, res) => {
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).json({ error: 'lead not found' });
   try {
-    const result = await sendGrowthRecap({
+    const result = enqueueGrowthFollowupJob({
       leadId: lead.id,
       toEmail: req.body?.toEmail,
-      force: req.body?.force === true
+      force: req.body?.force === true,
+      source: req.body?.source || 'api'
     });
-    res.json(result);
+    res.status(202).json({
+      accepted: true,
+      jobId: result.row?.id,
+      jobStatus: result.row?.status,
+      duplicate: !result.inserted
+    });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -502,20 +875,196 @@ app.post('/api/leads/:id/growth/replies', async (req, res) => {
   }
 });
 
+app.get('/api/account-manager/status', (_req, res) => {
+  res.json(accountManagerStatus());
+});
+
+app.post('/api/account-manager/run', async (req, res) => {
+  try {
+    const result = enqueueAccountManagerRun({
+      leadId: req.body?.leadId || req.body?.lead_id || null,
+      taskId: req.body?.taskId || req.body?.task_id || null,
+      dryRun: req.body?.dryRun !== false,
+      forcePlan: req.body?.forcePlan === true,
+      operatorSend: req.body?.operatorSend === true,
+      source: req.body?.source || 'api',
+      reason: req.body?.reason || 'api',
+      idempotencyKey: req.body?.idempotencyKey || req.body?.idempotency_key || null
+    });
+    res.status(202).json({
+      ok: true,
+      accepted: true,
+      jobId: result.row?.id || null,
+      jobStatus: result.row?.status || null,
+      inserted: result.inserted
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.get('/api/leads/:id/account-manager', async (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  res.json(await readAccountManagerState(lead.id));
+});
+
+app.post('/api/leads/:id/account-manager/plan', async (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  try {
+    const result = await generateAccountManagerPlanForLead({
+      leadId: lead.id,
+      force: req.body?.force === true,
+      source: req.body?.source || 'api'
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.post('/api/leads/:id/account-manager/run', async (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  try {
+    const result = enqueueAccountManagerRun({
+      leadId: lead.id,
+      dryRun: req.body?.dryRun !== false,
+      forcePlan: req.body?.forcePlan === true,
+      operatorSend: req.body?.operatorSend === true,
+      source: req.body?.source || 'api',
+      reason: req.body?.reason || 'lead_api',
+      idempotencyKey: req.body?.idempotencyKey || req.body?.idempotency_key || null
+    });
+    res.status(202).json({
+      ok: true,
+      accepted: true,
+      jobId: result.row?.id || null,
+      jobStatus: result.row?.status || null,
+      inserted: result.inserted
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.get('/api/account-tasks/:id/explain', (req, res) => {
+  const task = accountTasks.get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'account task not found' });
+  const lead = leads.get(task.lead_id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  const plan = task.account_plan_id ? accountManagerPlans.get(task.account_plan_id) : accountManagerPlans.getLatest(lead.id);
+  const preview = buildAftercarePreview({ lead, task, evidence: plan?.evidence || plan?.plan?.evidence || [] });
+  const policy = evaluateSendPolicy({
+    lead,
+    task,
+    dryRun: req.query?.dryRun !== 'false',
+    operatorSend: req.query?.operatorSend === 'true',
+    preview
+  });
+  res.json({
+    task,
+    planId: plan?.id || null,
+    preview,
+    policy,
+    evidence: (plan?.evidence || plan?.plan?.evidence || []).filter((item) => task.evidenceIds?.includes(item.id)),
+    history: accountTasks.history(task.id, { limit: 50 })
+  });
+});
+
+app.post('/api/account-tasks/:id/approve', (req, res) => {
+  const row = approveAccountTask(req.params.id, { note: req.body?.note });
+  if (!row) return res.status(404).json({ error: 'account task not found' });
+  res.json({ ok: true, task: row });
+});
+
+app.post('/api/account-tasks/:id/send', async (req, res) => {
+  const task = accountTasks.get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'account task not found' });
+  try {
+    const result = enqueueAccountManagerTask({
+      taskId: task.id,
+      dryRun: req.body?.dryRun === true,
+      operatorSend: true,
+      source: req.body?.source || 'operator_send',
+      reason: req.body?.reason || 'operator_send',
+      idempotencyKey: req.body?.idempotencyKey || req.body?.idempotency_key || null,
+      maxAttempts: req.body?.dryRun === true ? 1 : 3
+    });
+    res.status(202).json({
+      ok: true,
+      accepted: true,
+      jobId: result.row?.id || null,
+      jobStatus: result.row?.status || null,
+      inserted: result.inserted
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.post('/api/account-tasks/:id/pause', (req, res) => {
+  const pausedUntil = Number(req.body?.pausedUntil || req.body?.paused_until || 0) || null;
+  const row = pauseAccountTask(req.params.id, { note: req.body?.note, pausedUntil });
+  if (!row) return res.status(404).json({ error: 'account task not found' });
+  res.json({ ok: true, task: row });
+});
+
+app.post('/api/account-tasks/:id/complete', (req, res) => {
+  const row = completeAccountTask(req.params.id, { note: req.body?.note });
+  if (!row) return res.status(404).json({ error: 'account task not found' });
+  res.json({ ok: true, task: row });
+});
+
+app.post('/api/account-tasks/:id/reassign', (req, res) => {
+  const owner = String(req.body?.owner || '').trim();
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  const row = reassignAccountTask(req.params.id, { owner, note: req.body?.note });
+  if (!row) return res.status(404).json({ error: 'account task not found' });
+  res.json({ ok: true, task: row });
+});
+
+app.get('/api/leads/:id/commerce', (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  res.json(readCommerceState(lead.id));
+});
+
+app.post('/api/leads/:id/commerce/plan', async (req, res) => {
+  const lead = leads.get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'lead not found' });
+  try {
+    const result = await planCommerceForLead({
+      leadId: lead.id,
+      intake: req.body?.intake || req.body || {},
+      source: req.body?.source || 'api',
+      force: req.body?.force === true
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 app.post('/api/leads/discover', (req, res) => {
   const parsed = DiscoverRequest.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  fire('scraper', parsed.data, runScraper);
-  res.status(202).json({ accepted: true });
+  const job = fire('scraper', parsed.data, runScraper, { type: 'research.discover' });
+  res.status(202).json({ accepted: true, jobId: job?.id, jobStatus: job?.status });
 });
 
 app.post('/api/research/start', (req, res) => {
   const parsed = researchStartBody(req.body || {});
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
   const job = createBrowserUseResearchJob(parsed.value);
-  fire('browser_research', { jobId: job.id }, runBrowserUseResearchJob);
+  const durableJob = fire('browser_research', { jobId: job.id }, runBrowserUseResearchJob, {
+    type: 'research.browser_use',
+    idempotencyKey: `browser_research:${job.id}`
+  });
   res.status(202).json({
     accepted: true,
+    durableJobId: durableJob?.id,
     jobId: job.id,
     job,
     status: getBrowserResearchStatus({ jobId: job.id })
@@ -636,8 +1185,8 @@ app.post('/api/leads/:id/call', (req, res) => {
     const gate = canRouteCallLead(lead.id, { explicitPhone: phone });
     if (!gate.ok) return res.status(409).json({ error: 'callability blocked', explanation: gate.explanation });
   }
-  fire('caller', { leadId: lead.id, toPhone: phone }, runCaller);
-  res.status(202).json({ accepted: true, mode: env.runMode });
+  const job = fire('caller', { leadId: lead.id, toPhone: phone }, runCaller, { type: 'call.followup' });
+  res.status(202).json({ accepted: true, mode: env.runMode, jobId: job?.id, jobStatus: job?.status });
 });
 
 app.post('/api/leads/:id/approve-live-call', (req, res) => {
@@ -869,8 +1418,8 @@ app.post('/api/leads/:id/followup', (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const lead = leads.get(parsed.data.leadId);
   if (!lead) return res.status(404).json({ error: 'lead not found' });
-  fire('mailer', { leadId: lead.id, toEmail: parsed.data.toEmail }, runMailer);
-  res.status(202).json({ accepted: true });
+  const job = fire('mailer', { leadId: lead.id, toEmail: parsed.data.toEmail }, runMailer, { type: 'mail.followup' });
+  res.status(202).json({ accepted: true, jobId: job?.id, jobStatus: job?.status });
 });
 
 app.post('/api/leads/:id/build', (req, res) => {
@@ -879,8 +1428,8 @@ app.post('/api/leads/:id/build', (req, res) => {
   const lead = leads.get(parsed.data.leadId);
   if (!lead) return res.status(404).json({ error: 'lead not found' });
   const target = parsed.data.target || req.query?.target || undefined;
-  fire('builder', { leadId: lead.id, target, images: parsed.data.images || [] }, runBuilder);
-  res.status(202).json({ accepted: true, target: target || 'default' });
+  const job = enqueueBuilderBuild({ leadId: lead.id, target, images: parsed.data.images || [], source: 'api' }).row;
+  res.status(202).json({ accepted: true, target: target || 'default', jobId: job?.id, jobStatus: job?.status });
 });
 
 const previewScreenshotAdapter = (() => {
@@ -949,45 +1498,12 @@ app.get('/api/leads/:id/build-preview', (req, res) => {
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).send('<!doctype html><html><body>Lead not found.</body></html>');
   const latest = builds.listByLead(lead.id)[0] || {};
-  const projectUrl = latest.project_url || lead.website || '';
-  const status = latest.status || 'running';
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(lead.business_name)} build preview</title>
-  <style>
-    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif; background: #080b0d; color: #f1f3f4; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: linear-gradient(135deg, #080b0d 0%, #101820 55%, #172218 100%); }
-    main { width: min(760px, calc(100vw - 40px)); border: 1px solid #2c3540; background: rgba(11, 14, 16, 0.92); padding: 28px; }
-    .eyebrow { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-transform: uppercase; color: #7dffb6; }
-    h1 { margin: 10px 0 8px; font-size: clamp(28px, 6vw, 48px); line-height: 1; letter-spacing: 0; }
-    p { margin: 0; max-width: 56ch; color: #c9ced3; font-size: 16px; }
-    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 22px; }
-    .cell { border: 1px solid #1d242c; background: #10141a; padding: 12px; min-height: 82px; }
-    .key { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; color: #8b9098; text-transform: uppercase; letter-spacing: .08em; }
-    .value { margin-top: 8px; font-size: 14px; color: #f1f3f4; overflow-wrap: anywhere; }
-    .bar { height: 6px; margin-top: 24px; background: #1d242c; overflow: hidden; }
-    .bar span { display: block; height: 100%; width: ${status === 'completed' ? '100' : status === 'failed' ? '42' : '70'}%; background: #7dffb6; }
-    a { color: #7dffb6; }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="eyebrow">mock Browser Use live preview · ${escapeHtml(status)}</div>
-    <h1>${escapeHtml(lead.business_name)}</h1>
-    <p>The paid-build path is active. In live mode this panel is replaced by the Browser Use session URL while Lovable generates the site.</p>
-    <div class="grid">
-      <div class="cell"><div class="key">niche</div><div class="value">${escapeHtml(lead.niche || 'local services')}</div></div>
-      <div class="cell"><div class="key">phone</div><div class="value">${escapeHtml(lead.phone || 'not set')}</div></div>
-      <div class="cell"><div class="key">final URL</div><div class="value">${projectUrl ? `<a href="${escapeHtml(projectUrl)}" target="_blank" rel="noreferrer">${escapeHtml(projectUrl)}</a>` : 'publishing'}</div></div>
-    </div>
-    <div class="bar"><span></span></div>
-  </main>
-</body>
-</html>`);
+  const websiteBrief = safeJson(latest.website_brief_json);
+  if (latest.preview_html || websiteBrief) {
+    res.type('html').send(latest.preview_html || renderMockGeneratedSite({ brief: websiteBrief }));
+    return;
+  }
+  res.type('html').send(renderMockGeneratedSite({ brief: fallbackWebsiteBriefForPreview(lead) }));
 });
 
 app.post('/api/webhooks/agentphone', async (req, res) => {
@@ -1017,14 +1533,14 @@ app.post('/api/webhooks/agentmail', async (req, res) => {
     preview: typeof msg.text === 'string' ? msg.text.slice(0, 240) : undefined
   });
   if (isInboundAgentMailWebhook(body, msg)) {
-    try {
-      const result = await handleAgentMailInbound({ body, normalized: msg, eventId, req });
-      return res.json({ ok: true, inbound: result });
-    } catch (err) {
-      log.error('agentmail.inbound.failed', { error: err?.message || String(err), threadId: msg.threadId });
-      emit('mailer.error', { worker: 'mailer', threadId: msg.threadId, error: err?.message || String(err) });
-      return res.status(500).json({ error: err?.message || String(err) });
-    }
+    const queued = enqueueMailReplyJob({
+      body,
+      normalized: msg,
+      eventId,
+      source: 'agentmail.webhook',
+      idempotencyKey: `agentmail:${eventId}`
+    });
+    return res.status(202).json({ ok: true, queued: true, jobId: queued.row?.id, eventId });
   }
   res.json({ ok: true });
 });
@@ -1071,111 +1587,247 @@ app.get('/api/hosting/accept/:leadId', async (req, res) => {
   }
 });
 
-// --- per-customer share link (browser-use live preview) ---
-// Token is the opaque lead.id (already unguessable in this demo). When we move
-// to multi-tenant production, replace this with a signed JWT carrying lead+build+exp.
-app.get('/api/share/build/:token', (req, res) => {
+function portalAccessForRequest(req, res) {
   const token = String(req.params.token || '').trim();
-  if (!token) return res.status(400).json({ error: 'token required' });
-  const lead = leads.get(token);
-  if (!lead) return res.status(404).json({ error: 'not found' });
-  const buildRows = builds.listByLead(lead.id) || [];
-  const latest = buildRows[0] || null;
-  const builderEvents = eventStore.listByLead(lead.id, { worker: 'builder', limit: 60 });
-  const quoteStatus = quoteStatusForLead(lead);
-  const { paymentLinkUrl, invoiceUrl } = paymentLinksForLead(lead.id);
-  const pendingCallback = pendingCallbackForLead(lead.id);
-  res.json({
-    business: {
-      name: lead.business_name || null,
-      niche: lead.niche || null,
-      city: lead.city || null
+  if (!token) {
+    res.status(400).json({ error: 'token required' });
+    return null;
+  }
+  const access = resolvePortalAccess(token);
+  if (access?.ok && access.lead) return access;
+  if (!access?.lead) {
+    res.status(access?.status || 404).json({ error: access?.error || 'not found', reason: access?.reason || 'not_found' });
+    return null;
+  }
+  return access;
+}
+
+function portalActionFailed(res, eventType, err, metadata = {}) {
+  log.warn(eventType, { ...metadata, error: err?.message || String(err) });
+  const status = err?.code === 'invalid_request' ? 400 : err?.code === 'lead_not_found' ? 404 : 500;
+  res.status(status).json({ error: err?.message || 'portal_action_failed' });
+}
+
+function customerCommerceState(commerce) {
+  if (!commerce?.plan) return null;
+  return {
+    type: commerce.plan.type,
+    status: commerce.plan.status,
+    commerceCta: commerce.plan.commerceCta,
+    customerCopy: commerce.plan.customerCopy,
+    launchChecklist: commerce.plan.launchChecklist,
+    stripeBoundary: {
+      mode: commerce.plan.stripeBoundary?.mode || null,
+      requiresStripe: !!commerce.plan.stripeBoundary?.requiresStripe,
+      liveCustomerCommerceEnabled: !!commerce.plan.stripeBoundary?.liveCustomerCommerceEnabled,
+      paymentLinks: []
     },
-    build: latest ? {
-      id: latest.id,
-      status: latest.status,
-      sessionId: latest.browser_session_id || null,
-      liveUrl: latest.live_url || null,
-      projectUrl: latest.project_url || null,
-      updatedAt: latest.updated_at || null
-    } : null,
-    timeline: builderEvents.map((e) => ({
-      ts: e.ts || e.created_at,
-      type: e.type || e.event_type,
-      summary: e.summary || e.note || null
-    })),
-    // Customer-portal state — drives the action cards in ShareView.
-    quoteStatus,
-    paymentLinkUrl,
-    invoiceUrl,
-    vertical_pack: lead.vertical_pack || null,
-    existingPendingCallback: pendingCallback ? {
-      id: pendingCallback.id,
-      scheduledAtMs: pendingCallback.scheduled_at_ms,
-      status: pendingCallback.status,
-      createdAt: pendingCallback.created_at
-    } : null
-  });
+    riskFlags: commerce.plan.riskFlags || [],
+    humanHandoff: commerce.plan.humanHandoff || null
+  };
+}
+
+// --- per-customer share link (browser-use live preview + client operating room) ---
+app.get('/api/share/build/:token', (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const lead = access.lead;
+    const commerce = readCommerceState(lead.id);
+    const trust = customerTrustSummaryForLead(lead.id);
+    const aftercareRows = accountTasks.listByLead(lead.id, { limit: 30 });
+    const aftercare = {
+      pending: aftercareRows
+        .filter((task) => ['pending', 'approved', 'paused'].includes(task.status))
+        .slice(0, 6)
+        .map(rowToCustomerAftercareTask),
+      recent: aftercareRows
+        .filter((task) => ['sent', 'completed', 'blocked'].includes(task.status))
+        .slice(0, 6)
+        .map(rowToCustomerAftercareTask)
+    };
+    res.json({
+      ...portalState({ leadId: lead.id, access }),
+      trust,
+      aftercare,
+      commerce: customerCommerceState(commerce)
+    });
+  } catch (err) {
+    log.warn('portal.state_failed', { token: req.params.token, error: err?.message || String(err) });
+    res.status(500).json({ error: err?.message || 'portal_state_failed' });
+  }
 });
 
-// Customer-portal POST endpoints (idempotent; lock by lead.id token).
+// Customer-portal POST endpoints (token-scoped, auditable, idempotent where providers allow).
 app.post('/api/share/build/:token/accept', async (req, res) => {
-  const token = String(req.params.token || '').trim();
-  if (!token) return res.status(400).json({ error: 'token required' });
-  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
   try {
-    const result = await portalAcceptQuote({ leadId: token });
+    const result = await portalAcceptQuote({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null });
     res.json(result);
   } catch (err) {
-    log.warn('portal.accept_quote_failed', { token, error: err?.message || String(err) });
-    res.status(500).json({ error: err?.message || 'accept_failed' });
+    portalActionFailed(res, 'portal.accept_quote_failed', err, { token: req.params.token });
   }
 });
 
 app.post('/api/share/build/:token/edit', async (req, res) => {
-  const token = String(req.params.token || '').trim();
-  if (!token) return res.status(400).json({ error: 'token required' });
-  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
   const note = String(req.body?.note || '').trim();
   if (!note) return res.status(400).json({ error: 'note required' });
   try {
-    const result = await portalRequestEdit({ leadId: token, note });
+    const result = await portalRequestRevision({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null, note });
     res.json(result);
   } catch (err) {
-    log.warn('portal.request_edit_failed', { token, error: err?.message || String(err) });
-    res.status(500).json({ error: err?.message || 'edit_failed' });
+    portalActionFailed(res, 'portal.request_edit_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/approve-launch', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = await portalApproveLaunch({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      notes: req.body?.notes || ''
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.approve_launch_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/intake', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = await portalUpdateIntake({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      intake: req.body || {}
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.update_intake_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/scope/approve', (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = portalApproveScope({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      notes: req.body?.notes || ''
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.approve_scope_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/launch/approve', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = await portalApproveLaunch({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      notes: req.body?.notes || ''
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.approve_launch_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/revision', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  const note = String(req.body?.note || '').trim();
+  if (!note) return res.status(400).json({ error: 'note required' });
+  try {
+    const result = await portalRequestRevision({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      buildId: req.body?.buildId || null,
+      note
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.request_revision_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/asset', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = await portalRecordAssetUrl({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      url: req.body?.url,
+      label: req.body?.label,
+      notes: req.body?.notes
+    });
+    res.json(result);
+  } catch (err) {
+    portalActionFailed(res, 'portal.record_asset_failed', err, { token: req.params.token });
   }
 });
 
 app.post('/api/share/build/:token/callback', (req, res) => {
-  const token = String(req.params.token || '').trim();
-  if (!token) return res.status(400).json({ error: 'token required' });
-  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
   const scheduledAtMs = Number(req.body?.scheduledAtMs);
   if (!Number.isFinite(scheduledAtMs) || scheduledAtMs <= 0) {
     return res.status(400).json({ error: 'scheduledAtMs required (epoch ms)' });
   }
   const ask = String(req.body?.ask || '').trim();
   try {
-    const result = portalBookCallback({ leadId: token, scheduledAtMs, ask });
+    const result = portalBookCallback({
+      leadId: access.lead.id,
+      tokenId: access.tokenRow?.id || null,
+      scheduledAtMs,
+      ask
+    });
     res.json(result);
   } catch (err) {
-    log.warn('portal.book_callback_failed', { token, error: err?.message || String(err) });
-    res.status(500).json({ error: err?.message || 'callback_failed' });
+    portalActionFailed(res, 'portal.book_callback_failed', err, { token: req.params.token });
+  }
+});
+
+app.post('/api/share/build/:token/commerce', async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  try {
+    const result = await submitPortalCommerceIntake({
+      leadId: access.lead.id,
+      intake: req.body?.intake || req.body || {}
+    });
+    res.json({
+      ok: true,
+      type: result.plan.type,
+      status: result.plan.status,
+      plan: result.plan,
+      contactEventId: result.contactEventId
+    });
+  } catch (err) {
+    portalActionFailed(res, 'portal.commerce_failed', err, { token: req.params.token });
   }
 });
 
 app.post('/api/share/build/:token/opt-out', (req, res) => {
-  const token = String(req.params.token || '').trim();
-  if (!token) return res.status(400).json({ error: 'token required' });
-  if (!leads.get(token)) return res.status(404).json({ error: 'not found' });
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
   try {
     const reason = String(req.body?.reason || '').trim() || 'customer_portal_opt_out';
-    const result = portalOptOut({ leadId: token, reason });
+    const result = portalOptOut({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null, reason });
     res.json(result);
   } catch (err) {
-    log.warn('portal.opt_out_failed', { token, error: err?.message || String(err) });
-    res.status(500).json({ error: err?.message || 'opt_out_failed' });
+    portalActionFailed(res, 'portal.opt_out_failed', err, { token: req.params.token });
   }
 });
 
@@ -1272,12 +1924,42 @@ app.get('*', (_req, res) => {
 
 app.listen(env.port, () => {
   log.info(`callmemaybe server listening`, { port: env.port, mode: env.runMode });
+  startDurableJobLoop(durableJobHandlers);
+  try {
+    log.info('ops.backup_scheduler_start', startOpsBackupScheduler());
+  } catch (err) {
+    log.warn('ops.backup_scheduler_start_failed', { error: err?.message || String(err) });
+  }
+  try {
+    log.info('ops.provider_posture_scheduler_start', startProviderPostureScheduler());
+  } catch (err) {
+    log.warn('ops.provider_posture_scheduler_start_failed', { error: err?.message || String(err) });
+  }
+  try {
+    log.info('ops.recover_stuck_scheduler_start', startOpsRecoveryScheduler());
+  } catch (err) {
+    log.warn('ops.recover_stuck_scheduler_start_failed', { error: err?.message || String(err) });
+  }
+  try {
+    log.info('safe_to_sell.scheduler_start', startSafeToSellSelfCheckScheduler());
+  } catch (err) {
+    log.warn('safe_to_sell.scheduler_start_failed', { error: err?.message || String(err) });
+  }
   const recovered = recoverTriggeredPaymentBuilds({ startBuilder });
   if (recovered.length) log.warn('builder.recovered_pending_payment_builds', { count: recovered.length });
 
   // Scheduled-callback service: wire dispatcher then start the loop.
   registerScheduledCallDispatcher(runScheduledCaller);
   startScheduledCallLoop();
+
+  // Account-manager aftercare service. Dry-run by default; live AgentMail
+  // still needs ACCOUNT_MANAGER_LIVE_SENDS, LIVE_EMAILS, allow-list/run-mode,
+  // and operator-approved tasks.
+  try {
+    startAccountManagerLoop();
+  } catch (err) {
+    log.warn('account_manager.loop_start_failed', { error: err?.message || String(err) });
+  }
 
   // Reputation auto-throttle: 30s sweep that emits reputation.alert and can
   // pause the outreach loop when opt-out or voicemail-only rates go red.
@@ -1328,6 +2010,23 @@ function rowToScheduledCallDTO(row) {
       city: lead.city,
       status: lead.status
     } : null
+  };
+}
+
+function rowToCustomerAftercareTask(task) {
+  if (!task) return null;
+  return {
+    id: task.id,
+    kind: task.kind,
+    title: task.title,
+    status: task.status,
+    dueAt: task.due_at,
+    priority: task.priority,
+    channel: task.channel,
+    summary: task.summary,
+    lastPreviewedAt: task.last_previewed_at,
+    sentAt: task.sent_at,
+    completedAt: task.completed_at
   };
 }
 
@@ -1543,6 +2242,118 @@ function economicsByNiche({ since = 0 } = {}) {
         : null
     }
   };
+}
+
+function safeToSellTodaySummary({ readiness, queue, evals, observability, backup, durableSnapshot }) {
+  const providerRows = Object.entries(readiness.providers || {});
+  const dryRunVerified = providerRows
+    .map(([name, row]) => [name, row.dryRunSmoke?.status !== 'not_run' ? row.dryRunSmoke : row.smoke])
+    .filter(([, smoke]) => smoke?.dryRun && ['configured', 'ok'].includes(smoke.status))
+    .map(([name, smoke]) => ({ provider: name, status: smoke.status, checkedAt: smoke.checkedAt }));
+  const liveSmokeVerified = providerRows
+    .filter(([, row]) => row.liveSmoke?.live && row.liveSmoke?.status === 'ok')
+    .map(([name, row]) => ({ provider: name, status: row.liveSmoke.status, checkedAt: row.liveSmoke.checkedAt }));
+  const stillBlocked = [
+    ...(readiness.productionBlockers || []),
+    ...(queue?.staleRunning ? [`${queue.staleRunning} durable job(s) have stale leases`] : []),
+    ...(observability?.stuck?.builds?.length ? [`${observability.stuck.builds.length} build(s) look stuck`] : []),
+    ...(observability?.stuck?.calls?.length ? [`${observability.stuck.calls.length} call(s) look stuck`] : []),
+    ...(observability?.providerHealthSlo?.blockers || []),
+    ...(observability?.workerHealthSlo?.blockers || []),
+    ...(observability?.economicsHealth?.blockers || []),
+    ...(observability?.schedulerHealth?.blockers || []),
+    ...(durableSnapshot?.ok === false ? [durableSnapshot.reason] : []),
+    ...(!backup?.ok ? [backup?.reason || 'SQLite backup is not fresh'] : []),
+    ...(evals?.ok === false ? ['production eval suite is failing'] : [])
+  ];
+  const nextActions = buildSafeToSellNextActions({
+    readiness,
+    observability,
+    backupFresh: backup,
+    evalResult: evals
+  });
+  const providerProof = buildProviderProofMatrix({ readiness, observability });
+  const ok = stillBlocked.length === 0;
+  const summary = {
+    ok,
+    safe: ok,
+    source: 'inline',
+    generatedAt: new Date().toISOString(),
+    command: 'npm run safe-to-sell',
+    mode: readiness.mode,
+    durableSnapshot: durableSnapshot || null,
+    dryRunVerified,
+    liveSmokeVerified,
+    providerProof,
+    stillBlocked,
+    nextActions,
+    promotionGates: readiness.promotionGates || null,
+    schedulerHealth: observability?.schedulerHealth || null,
+    providerHealthSlo: observability?.providerHealthSlo || null,
+    workerHealthSlo: observability?.workerHealthSlo || null,
+    economicsHealth: observability?.economicsHealth || null,
+    evals: {
+      ok: evals?.ok ?? null,
+      summary: evals?.summary || null,
+      command: 'npm run check:evals'
+    },
+    economics: observability?.dailyEconomics || null,
+    backup: backup || null,
+    queue: {
+      due: queue?.due || 0,
+      staleRunning: queue?.staleRunning || 0,
+      failed: queue?.countsByStatus?.failed || 0,
+      retrying: queue?.countsByStatus?.retry || 0
+    }
+  };
+  summary.decisionReceipt = buildSafeToSellDecisionReceipt(summary);
+  return summary;
+}
+
+function safeToSellSnapshotSummary({ snapshot, durableSnapshot }) {
+  const report = snapshot.report || {};
+  const queue = report.queue || {};
+  const summary = {
+    ok: !!report.ok,
+    safe: !!report.ok,
+    source: 'safe_to_sell_snapshot',
+    generatedAt: report.generatedAt || (snapshot.generatedAt ? new Date(snapshot.generatedAt).toISOString() : null),
+    command: report.command || 'npm run safe-to-sell',
+    mode: report.mode || null,
+    durableSnapshot: durableSnapshot || null,
+    snapshot: {
+      id: snapshot.id,
+      version: report.version || null,
+      generatedAt: snapshot.generatedAt,
+      ageMs: snapshot.ageMs,
+      freshMs: snapshot.freshMs
+    },
+    dryRunVerified: report.dryRunVerified || [],
+    liveSmokeVerified: report.liveSmokeVerified || [],
+    providerProof: report.providerProof || [],
+    stillBlocked: report.stillBlocked || [],
+    nextActions: report.nextActions || report.readiness?.nextActions || [],
+    promotionGates: report.promotionGates || report.readiness?.promotionGates || null,
+    schedulerHealth: report.observability?.schedulerHealth || null,
+    providerHealthSlo: report.observability?.providerHealthSlo || null,
+    workerHealthSlo: report.observability?.workerHealthSlo || null,
+    economicsHealth: report.observability?.economicsHealth || null,
+    evals: report.evals || { ok: null, summary: null, command: 'npm run safe-to-sell' },
+    economics: report.observability?.dailyEconomics || null,
+    backup: report.backups || null,
+    queue: {
+      due: queue.due || 0,
+      staleRunning: queue.staleRunning || 0,
+      failed: queue.countsByStatus?.failed || 0,
+      retrying: queue.countsByStatus?.retry || 0
+    }
+  };
+  summary.decisionReceipt = report.decisionReceipt || {
+    ...buildSafeToSellDecisionReceipt(summary),
+    snapshotId: snapshot.id,
+    durable: true
+  };
+  return summary;
 }
 
 function round2(value) {
@@ -1955,10 +2766,77 @@ const BUILDER_LABELS = {
   'builder.progress': 'Progress update',
   'builder.project_url': 'Final site URL found',
   'builder.blocked_auth': 'Lovable auth needed',
+  'builder.hosting_upsell_queued': 'Hosting upsell queued',
+  'builder.hosting_upsell_duplicate': 'Hosting upsell already queued',
+  'builder.hosting_upsell_sent': 'Hosting upsell sent',
+  'builder.hosting_upsell_skipped': 'Hosting upsell skipped',
   'builder.done': 'Build completed',
   'browserUse.session.stopped': 'Browser Use stopped',
   'builder.error': 'Build failed'
 };
+
+function buildCallStateReadModel({ lead, callRows, callerEvents }) {
+  const stateRows = (callerEvents || [])
+    .filter((row) => row.type === 'caller.state')
+    .map((row) => {
+      const payload = safeJson(row.payload_json) || {};
+      const event = payload.event || {};
+      const mossSnippet = payload.mossSnippet || event.mossSnippet || null;
+      const complianceState = payload.complianceState || event.complianceState || null;
+      const safety = payload.safety || event.safety || null;
+      const detectors = normalizeCallStateDetectors(payload.detectors || event.detectors || []);
+      return {
+        id: row.id,
+        ts: row.ts,
+        callId: payload.callId || event.callId || null,
+        state: payload.currentState || payload.stage || event.stage || 'unknown',
+        previousState: event.previousStage || null,
+        nextLine: payload.nextLine || event.nextLine || null,
+        objection: payload.objection || event.objection || null,
+        detectors,
+        mossSnippet,
+        complianceState,
+        safety,
+        callback: payload.callback || event.callback || null,
+        email: payload.email || event.email || null,
+        transitionReason: payload.transitionReason || event.transitionReason || null,
+        contextUsed: payload.contextUsed || event.contextUsed || null
+      };
+    });
+  const latest = stateRows[stateRows.length - 1] || null;
+  const latestCall = (callRows || [])[0] || null;
+  return {
+    leadId: lead?.id || null,
+    callId: latest?.callId || latestCall?.id || null,
+    currentState: latest?.state || null,
+    nextLine: latest?.nextLine || null,
+    objection: latest?.objection || null,
+    mossSnippet: latest?.mossSnippet || null,
+    complianceState: latest?.complianceState || null,
+    safety: latest?.safety || {
+      safe: lead?.outreach_status !== 'blocked',
+      code: lead?.risk_status || 'unknown',
+      reason: lead?.blocked_reason || lead?.callable_reason || 'No caller.state event has been emitted yet.'
+    },
+    callback: latest?.callback || null,
+    email: latest?.email || null,
+    detectors: latest?.detectors || [],
+    transitionReason: latest?.transitionReason || null,
+    contextUsed: latest?.contextUsed || null,
+    timeline: stateRows.slice(-16)
+  };
+}
+
+function normalizeCallStateDetectors(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    if (typeof item === 'string') return { type: item, excerpt: null };
+    return {
+      type: item?.type || item?.kind || 'signal',
+      excerpt: item?.excerpt || null
+    };
+  }).filter((item) => item.type);
+}
 
 function buildBuilderReadModel({ lead, buildRows, builderEvents }) {
   const latest = buildRows[0] || null;
@@ -1985,8 +2863,12 @@ function buildBuilderReadModel({ lead, buildRows, builderEvents }) {
     finishedAt: latest?.finished_at || terminalTs(timeline),
     liveUrl: latest?.live_url || lastValue(timeline, 'liveUrl'),
     projectUrl: latest?.project_url || lastValue(timeline, 'projectUrl'),
-    finalSiteUrl: latest?.project_url || (lead.status === 'shipped' ? lead.website : null),
-    target: latest?.target || lastValue(timeline, 'target') || 'lovable',
+    finalSiteUrl: latest?.project_url || (['shipped', 'awaiting_launch_approval', 'launch_approved'].includes(lead.status) ? lead.website : null),
+    launchStatus: latest?.launch_status || lastValue(timeline, 'launchStatus') || 'not_started',
+    customerApprovedAt: latest?.customer_approved_at || null,
+    operatorApprovedAt: latest?.operator_approved_at || null,
+    launchedAt: latest?.launched_at || null,
+    target: latest?.target || lastValue(timeline, 'target') || 'anything',
     submissionUrl: latest?.submission_url || latest?.lovable_url || lastValue(timeline, 'submissionUrl'),
     error: latest?.error || lastValue(timeline, 'error'),
     brief: latest?.brief || lastValue(timeline, 'brief'),
@@ -2052,6 +2934,7 @@ function builderTimelineItem(row) {
     proxyCostUsd: payload.proxyCostUsd || null,
     browserCostUsd: payload.browserCostUsd || null,
     totalCostUsd: payload.totalCostUsd || null,
+    launchStatus: payload.launchStatus || null,
     agentmailEmail: payload.agentmailEmail || null,
     integrationsUsed: payload.integrationsUsed || [],
     evidenceCount: payload.evidenceCount || evidenceCount(payload.output || payload.summary || payload.projectUrl || payload.liveUrl),
@@ -2125,6 +3008,42 @@ function lastArray(timeline, key) {
 
 function safeJson(text) {
   try { return text ? JSON.parse(text) : null; } catch { return null; }
+}
+
+function fallbackWebsiteBriefForPreview(lead) {
+  const businessName = lead?.business_name || 'Your business';
+  const phone = lead?.phone || '';
+  const area = lead?.city || lead?.address || 'your service area';
+  const niche = lead?.niche || 'local services';
+  const services = [niche, 'service estimates', 'contact details'];
+  return {
+    businessName,
+    phone,
+    locationOrServiceArea: area,
+    pages: [
+      { name: 'Home', path: '/', goal: 'Preview the generated local-services site.', sections: ['hero', 'services', 'contact'] }
+    ],
+    sections: [
+      { key: 'hero', name: 'Hero', goal: 'Show business name and contact path.', requiredFacts: [businessName, phone, area].filter(Boolean) },
+      { key: 'services', name: 'Services', goal: 'Show core services.', requiredFacts: services },
+      { key: 'contact', name: 'Contact', goal: 'Make contact obvious.', requiredFacts: [phone].filter(Boolean) }
+    ],
+    hero: {
+      headline: businessName,
+      subheadline: 'A clear, mobile-first local business site preview.',
+      proofLine: 'Preview generated from confirmed lead details only.'
+    },
+    services,
+    serviceCards: services.map((name) => ({ name, description: `${name} for customers in ${area}.` })),
+    reviewProof: { items: [], disclaimer: 'Unverified credibility claims are omitted unless confirmed.' },
+    location: { city: lead?.city || null, address: lead?.address || null, serviceArea: area, hours: null },
+    cta: phone ? `Call ${phone} for service or a quote` : 'Call for service or a quote',
+    contactMethods: phone ? [{ type: 'phone', value: phone, href: `tel:${phone}` }, { type: 'form', value: '#contact-form', href: '#contact-form' }] : [{ type: 'form', value: '#contact-form', href: '#contact-form' }],
+    commerceNeeds: [{ key: 'invoice', status: 'pending', detail: 'Invoice/payment state lives outside the public site.' }],
+    assets: [{ type: 'placeholder', alt: `${businessName} local service placeholder` }],
+    prohibitedClaims: [],
+    sourceFacts: { address: lead?.address || null, hours: null }
+  };
 }
 
 function escapeHtml(value) {

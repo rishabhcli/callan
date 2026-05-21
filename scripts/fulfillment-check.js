@@ -78,15 +78,20 @@ try {
     const builds = dbApi.builds.listByLead(leadId);
     assert(builds.length === 1, `expected one build row, got ${builds.length}`);
     assert(builds[0].status === 'completed', `expected completed build, got ${builds[0].status}: ${builds[0].error || 'no error'}`);
-    assert(builds[0].target === 'lovable', `expected lovable target, got ${builds[0].target}`);
-    return { buildId: builds[0].id, projectUrl: builds[0].project_url };
+    assert(builds[0].launch_status === 'ready_for_customer', `expected ready_for_customer, got ${builds[0].launch_status}`);
+    assert(['anything', 'lovable', 'v0'].includes(builds[0].target), `unexpected target ${builds[0].target}`);
+    const qa = dbApi.buildQaResults.listByBuild(builds[0].id)[0];
+    assert(qa?.passed, 'paid build should persist passing QA');
+    return { buildId: builds[0].id, target: builds[0].target, projectUrl: builds[0].project_url, qaScore: qa.score };
   });
 
-  await check('Lovable mock URL extracted', () => {
+  await check('Lovable mock URL extracted', async () => {
     const url = lovableProvider.extractLovableAppUrl({
       output: 'PROJECT_URL: https://luna-ridge-hvac.lovable.app'
     });
     assert(url === 'https://luna-ridge-hvac.lovable.app', `unexpected Lovable URL ${url}`);
+    const leadId = seedLead({ id: stamp('paid_lovable_explicit'), businessName: 'Luna Ridge HVAC', niche: 'hvac repair' });
+    await builderWorker.runBuilder({ leadId, target: 'lovable' });
     const build = latestBuildByTarget('lovable');
     assert(/\.lovable\.app$/i.test(build.project_url || ''), `stored project URL was not Lovable: ${build.project_url}`);
     assert((build.lovable_url || '').startsWith('https://lovable.dev/?autosubmit=true#prompt='), `bad Lovable submission URL: ${build.lovable_url}`);

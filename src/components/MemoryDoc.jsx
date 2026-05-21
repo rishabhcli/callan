@@ -16,6 +16,7 @@ function maskPhone(p) {
 }
 
 function Profile({ data }) {
+  const intel = data.leadIntelligence || data.raw?.leadIntelligence || null;
   return (
     <div className="kv">
       <Row label="business">{data.businessName}</Row>
@@ -45,6 +46,84 @@ function Profile({ data }) {
           ))}
         </div>
       </Row>
+      {intel ? <LeadIntelligence data={intel} /> : null}
+    </div>
+  );
+}
+
+function LeadIntelligence({ data }) {
+  const scores = data.scores || {};
+  const scoreEntries = [
+    ['presence weakness', scores.presenceWeakness],
+    ['urgency', scores.urgency],
+    ['website value', scores.websiteValue],
+    ['contactability', scores.contactability],
+    ['vertical fit', scores.verticalFit]
+  ];
+  return (
+    <>
+      <Row label="opener"><em>{data.callOpener?.text || '—'}</em></Row>
+      <Row label="why call">{data.whyThisLeadIsWorthCalling?.summary || data.whyThisLeadIsWorthCalling?.claim || '—'}</Row>
+      <Row label="CTA">{data.bestCtaRecommendation?.summary || data.bestCtaRecommendation?.claim || '—'}</Row>
+      <Row label="scores">
+        <div className="chips">
+          {scoreEntries.map(([label, value]) => (
+            <span key={label} className="chip mono">{label}: {scoreNumber(value)}</span>
+          ))}
+          {Number.isFinite(Number(scores.totalScore)) ? <span className="chip mono">total: {scores.totalScore}</span> : null}
+        </div>
+      </Row>
+      <Row label="review themes">
+        <ClaimChips items={data.reviewThemes} />
+      </Row>
+      <Row label="competitors">
+        <ClaimChips items={data.competitorComparison} />
+      </Row>
+      <Row label="evidence">
+        <div className="stack">
+          {(data.evidence || []).slice(0, 4).map((item) => (
+            <span key={item.id} className="mono mem-evidence-line">
+              {item.id}: {item.claim || item.quote} {item.sourceUrl ? `(${item.sourceUrl})` : ''}
+            </span>
+          ))}
+        </div>
+      </Row>
+    </>
+  );
+}
+
+function ResearchEvidence({ data }) {
+  const intel = data.leadIntelligence || data.raw?.leadIntelligence || null;
+  return (
+    <div className="kv">
+      <Row label="business">{data.businessName || data.business_name}</Row>
+      <Row label="source">{data.sourceUrl || data.source_url || '—'}</Row>
+      <Row label="presence">{data.presenceStrength || data.presence_strength || '—'}</Row>
+      <Row label="opener"><em>{intel?.callOpener?.text || '—'}</em></Row>
+      <Row label="source trail">
+        <div className="stack">
+          {(intel?.sourceTrail || []).slice(0, 4).map((item) => (
+            <span key={`${item.id}:${item.url}`} className="mono mem-evidence-line">{item.id}: {item.url}</span>
+          ))}
+        </div>
+      </Row>
+      <Row label="claims">
+        <ClaimChips items={[...(intel?.reviewThemes || []), ...(intel?.currentWebsiteIssues || []), ...(intel?.competitorComparison || [])].slice(0, 6)} />
+      </Row>
+    </div>
+  );
+}
+
+function ClaimChips({ items }) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return <span>—</span>;
+  return (
+    <div className="chips">
+      {list.slice(0, 6).map((item, i) => (
+        <span key={item.id || i} className="chip mono" title={(item.evidenceIds || []).join(', ')}>
+          {item.summary || item.claim || item.title}
+        </span>
+      ))}
     </div>
   );
 }
@@ -155,6 +234,11 @@ function Row({ label, children, mono }) {
   );
 }
 
+function scoreNumber(value) {
+  const n = typeof value === 'number' ? value : Number(value?.score);
+  return Number.isFinite(n) ? `${Math.round(n)}/100` : '—';
+}
+
 export default function MemoryDoc({ kind, doc, defaultOpen }) {
   const [open, setOpen] = useState(!!defaultOpen);
   const data = parseDoc(doc);
@@ -184,6 +268,7 @@ export default function MemoryDoc({ kind, doc, defaultOpen }) {
       {open && (
         <div className="memcard-body">
           {kind === 'profile'     && <Profile data={data} />}
+          {kind === 'research_evidence' && <ResearchEvidence data={data} />}
           {kind === 'pitch'       && <Pitch data={data} />}
           {kind === 'call_log'    && <CallLog data={data} />}
           {kind === 'post_mortem' && <PostMortem data={data} />}

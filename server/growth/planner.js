@@ -8,6 +8,7 @@ import { GrowthPlan as ReasoningGrowthPlan } from '../reasoning/schemas.js';
 import { log } from '../logger.js';
 import { buildGrowthOffers } from './offerEngine.js';
 import { PLAN_SECTION_KEYS, collectRecommendations, emptyGrowthPlan } from './schema.js';
+import { compactLeadIntelligence } from '../research/leadIntelligence.js';
 
 const GROWTH_SYSTEM = [
   'You write operational growth plans for small local businesses after a website delivery.',
@@ -146,6 +147,7 @@ export async function collectGrowthContext(lead) {
     websiteUrl: lead.website,
     ...researchProfile
   };
+  profile.leadIntelligence = compactLeadIntelligence(profile.leadIntelligence, { evidenceLimit: 16 });
   const evidence = collectEvidence({ lead, profile, postMortem, mailDocs, contacts: dbContacts, calls: dbCalls });
   const conversationText = [
     JSON.stringify(postMortem || {}),
@@ -335,11 +337,12 @@ function generateSyntheticPlan({ lead, context }) {
   const evidenceIds = plan.evidence.map((item) => item.id);
   const primary = evidenceIds[0];
   const profile = context.profile || {};
+  const intel = compactLeadIntelligence(profile.leadIntelligence, { evidenceLimit: 16 });
   const hasWebsite = Boolean(profile.hasWebsite || profile.websiteUrl || lead.website);
   const hoursUnknown = /unknown|not found|missing/i.test(String(profile.hours || ''));
   const weakPresence = ['none', 'weak', 'mixed', undefined, null].includes(profile.onlinePresenceStrength);
-  const noReviewSignal = !JSON.stringify(profile.signals || []).match(/review/i);
-  const bookingNeed = JSON.stringify(profile.needs || []).match(/book|schedule|appointment|quote|form|contact/i);
+  const noReviewSignal = !JSON.stringify([profile.signals, intel?.reviewThemes]).match(/review|stars?|rating|customer/i);
+  const bookingNeed = JSON.stringify([profile.needs, intel?.missingCustomerInfo, intel?.currentWebsiteIssues]).match(/book|schedule|appointment|quote|form|contact|cta/i);
   const noBookingSignal = bookingNeed || !JSON.stringify([profile.signals, profile.whatTheyDo]).match(/book|schedule|appointment|quote|form/i);
 
   if (!hasWebsite || weakPresence) {
@@ -349,7 +352,18 @@ function generateSyntheticPlan({ lead, context }) {
       why: hasWebsite ? 'The public profile still shows local search gaps.' : 'Research did not prove a strong owned website presence.',
       action: 'Publish or improve a service-area page with NAP, services, hours, and LocalBusiness structured data.',
       priority: 'high',
-      evidenceIds: [primary]
+      evidenceIds: bestEvidence(evidenceIds, ['website', 'issue', 'missing', 'profile'])
+    }));
+  }
+
+  for (const [index, gap] of (intel?.competitorComparison || []).slice(0, 2).entries()) {
+    plan.localSeoGaps.push(item({
+      id: `lead-intel-competitor-gap-${index + 1}`,
+      title: gap.title || 'Close competitor positioning gap',
+      why: gap.summary || gap.claim,
+      action: 'Turn this gap into page copy, proof blocks, and Google Business Profile/service-area copy.',
+      priority: 'high',
+      evidenceIds: bestEvidence(evidenceIds, [...(gap.evidenceIds || []), 'competitor', 'website'])
     }));
   }
 
@@ -380,6 +394,15 @@ function generateSyntheticPlan({ lead, context }) {
       action: 'Create a simple post-service message asking satisfied customers for a review without incentives or pressure.',
       priority: 'medium',
       evidenceIds: bestEvidence(evidenceIds, ['profile', 'mail'])
+    }));
+  } else if (intel?.reviewThemes?.length) {
+    plan.reviewCapturePlan.push(item({
+      id: 'reviews-use-existing-themes',
+      title: 'Turn review themes into proof blocks',
+      why: intel.reviewThemes.slice(0, 2).map((theme) => theme.summary || theme.claim).join(' | '),
+      action: 'Add a lightweight review/proof section and ask future happy customers around the same themes.',
+      priority: 'medium',
+      evidenceIds: bestEvidence(evidenceIds, [...intel.reviewThemes.flatMap((theme) => theme.evidenceIds || []), 'review'])
     }));
   }
 
@@ -527,6 +550,37 @@ function collectEvidence({ lead, profile, postMortem, mailDocs, contacts, calls:
     summary: profile.onlinePresenceSummary,
     url: profile.websiteUrl || lead.website || profile.sourceUrl || null,
     confidence: profile.onlinePresenceConfidence || profile.presenceConfidence || 0.7
+  });
+  const intel = compactLeadIntelligence(profile.leadIntelligence, { evidenceLimit: 16 });
+  for (const item of intel?.evidence || []) {
+    addEvidence(out, {
+      id: item.id,
+      source: item.source || item.sourceType || 'lead intelligence',
+      summary: item.claim || item.quote || item.id,
+      url: item.sourceUrl || null,
+      confidence: item.confidence ?? 0.72
+    });
+  }
+  for (const item of [
+    ...(intel?.reviewThemes || []),
+    ...(intel?.competitorComparison || []),
+    ...(intel?.currentWebsiteIssues || []),
+    ...(intel?.missingCustomerInfo || [])
+  ]) {
+    addEvidence(out, {
+      id: item.id,
+      source: 'lead intelligence',
+      summary: item.summary || item.claim || item.title,
+      url: item.sourceUrls?.[0] || null,
+      confidence: item.confidence ?? 0.74
+    });
+  }
+  if (intel?.bestCtaRecommendation) addEvidence(out, {
+    id: intel.bestCtaRecommendation.id || 'best-cta',
+    source: 'lead intelligence',
+    summary: intel.bestCtaRecommendation.summary || intel.bestCtaRecommendation.claim,
+    url: intel.bestCtaRecommendation.sourceUrls?.[0] || profile.sourceUrl || null,
+    confidence: intel.bestCtaRecommendation.confidence ?? 0.74
   });
   if (profile.hours) addEvidence(out, {
     id: 'profile-hours',

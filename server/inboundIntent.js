@@ -13,8 +13,10 @@ import { log } from './logger.js';
 import { emit } from './sse.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
 import { sendCallbackInvoiceEmail } from './emailCallback.js';
+import { contactEvents, db } from './db.js';
 
-// Per-call de-dupe — keyed by call row id. In-memory is fine; calls are short-lived.
+// Per-call hot-path de-dupe keyed by call row id. Durable de-dupe is backed by
+// contact_events so a worker restart after a successful send does not resend.
 const sentByCallId = new Set();
 
 const EMAIL_RX = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
@@ -136,6 +138,130 @@ function callmemaybeEmailBody({ businessName, fromPhone }) {
   return lines.join('\n');
 }
 
+function safeId(value) {
+  return String(value || 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96) || 'unknown';
+}
+
+function maskEmail(email) {
+  if (!email) return null;
+  const [name, domain] = String(email).split('@');
+  if (!domain) return '***';
+  const visible = name.length <= 2 ? name[0] || '*' : `${name[0]}***${name[name.length - 1]}`;
+  return `${visible}@${domain}`;
+}
+
+function inboundEmailEventType(useContextualInvoice) {
+  return useContextualInvoice ? 'callback_invoice' : 'inbound_voice_followup';
+}
+
+function inboundEmailEventId(callId, type) {
+  return `agentmail_${type}_${safeId(callId)}`;
+}
+
+function parseMetadata(row) {
+  try {
+    return row?.metadata_json ? JSON.parse(row.metadata_json) : {};
+  } catch {
+    return {};
+  }
+}
+
+function existingInboundVoiceEmailEvent(callRow, type) {
+  if (!callRow?.id) return null;
+  const expectedId = inboundEmailEventId(callRow.id, type);
+  const byId = db.prepare('SELECT * FROM contact_events WHERE id = ? LIMIT 1').get(expectedId);
+  if (byId) return { ...byId, metadata: parseMetadata(byId) };
+
+  const leadId = callRow.lead_id || null;
+  if (!leadId) return null;
+  const rows = db.prepare(`
+    SELECT * FROM contact_events
+    WHERE lead_id = ?
+      AND type = ?
+      AND direction = 'outbound'
+      AND channel = 'agentmail'
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all(leadId, type);
+  for (const row of rows) {
+    const metadata = parseMetadata(row);
+    if (metadata.callId === callRow.id || metadata.call_id === callRow.id) {
+      return { ...row, metadata };
+    }
+  }
+  return null;
+}
+
+function resultFromPersistedInboundEmail(row, email) {
+  const metadata = row?.metadata || parseMetadata(row);
+  return {
+    email,
+    reused: true,
+    contactEventId: row?.id || null,
+    providerId: row?.provider_id || metadata?.providerId || metadata?.messageId || null,
+    messageId: metadata?.messageId || row?.provider_id || null,
+    threadId: row?.thread_id || metadata?.threadId || null,
+    subject: row?.subject || null
+  };
+}
+
+function isDuplicateContactEvent(err) {
+  return err?.code?.startsWith('SQLITE_CONSTRAINT') || /UNIQUE constraint failed: contact_events\.id/i.test(err?.message || '');
+}
+
+function recordInboundVoiceEmailEvent({
+  callRow,
+  lead,
+  type,
+  trigger,
+  email,
+  subject,
+  body,
+  result,
+  checkoutUrl = null,
+  context = null
+}) {
+  const eventId = inboundEmailEventId(callRow.id, type);
+  const metadata = {
+    callId: callRow.id,
+    leadId: callRow.lead_id || lead?.id || null,
+    trigger,
+    toMasked: maskEmail(email),
+    messageId: result?.messageId || result?.providerId || null,
+    threadId: result?.threadId || null,
+    providerId: result?.providerId || result?.messageId || null,
+    checkoutUrl,
+    businessName: context?.businessName || lead?.business_name || null,
+    decisionCode: `agentmail.outbound.${type}`,
+    decisionReason: type === 'callback_invoice'
+      ? 'Transcript-triggered invoice email was sent after the caller requested payment details.'
+      : 'Transcript-triggered inbound voice follow-up email was sent after the caller requested details.'
+  };
+  try {
+    const id = contactEvents.add({
+      id: eventId,
+      lead_id: callRow.lead_id || lead?.id || null,
+      type,
+      direction: 'outbound',
+      channel: 'agentmail',
+      provider_id: result?.providerId || result?.messageId || null,
+      thread_id: result?.threadId || null,
+      subject,
+      body,
+      metadata
+    });
+    return { id, inserted: true, metadata };
+  } catch (err) {
+    if (!isDuplicateContactEvent(err)) throw err;
+    const row = existingInboundVoiceEmailEvent(callRow, type);
+    return { id: row?.id || eventId, inserted: false, metadata: row?.metadata || metadata };
+  }
+}
+
 /**
  * Called after each transcript update on an inbound call.
  * If we detect a valid email + a send intent, fire AgentMail (once per call).
@@ -144,19 +270,21 @@ function callmemaybeEmailBody({ businessName, fromPhone }) {
  * us first), pass `overrideEmail` so we use the originating address without
  * needing the caller to dictate their email back to the agent.
  */
-export async function maybeFireInboundEmail({ callRow, lead, transcript, overrideEmail = null }) {
+export async function maybeFireInboundEmail({
+  callRow,
+  lead,
+  transcript,
+  overrideEmail = null,
+  throwOnFailure = false,
+  mailSender = sendAgentMailMessage,
+  invoiceSender = sendCallbackInvoiceEmail,
+  requireAgentMailConfig = true
+}) {
   if (!callRow || sentByCallId.has(callRow.id)) return null;
-  if (!env.agentmail?.apiKey || !env.agentmail?.inboxId) {
-    log.warn('inbound.email.skipped', { callId: callRow.id, reason: 'agentmail_not_configured' });
-    return null;
-  }
   const email = overrideEmail || detectEmailInTranscript(transcript);
   if (!email) return null;
   const wantsEmail = detectSendEmailIntent(transcript);
   if (!wantsEmail) return null;
-
-  // Mark BEFORE the await so concurrent transcript events don't double-fire.
-  sentByCallId.add(callRow.id);
 
   // Decide whether to send a CONTEXTUAL invoice (Stripe checkout + meeting
   // invite + Gemini recap) vs the generic callmemaybe follow-up body.
@@ -171,21 +299,55 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
     .join(' ');
   const wantsInvoice = /\b(invoice|the\s+\$?500|the\s+five[\s-]?hundred|the\s+build|the\s+website\s+build|the\s+deal|the\s+offer)\b/i.test(transcriptText);
   const useContextualInvoice = callRow.decision_reason === 'agentphone_email_callback' || wantsInvoice;
+  const eventType = inboundEmailEventType(useContextualInvoice);
+  const persisted = existingInboundVoiceEmailEvent(callRow, eventType);
+  if (persisted) {
+    sentByCallId.add(callRow.id);
+    log.info('inbound.email.reused_persisted_receipt', {
+      callId: callRow.id,
+      leadId: callRow.lead_id || null,
+      type: eventType,
+      contactEventId: persisted.id
+    });
+    return resultFromPersistedInboundEmail(persisted, email);
+  }
+
+  if (requireAgentMailConfig && (!env.agentmail?.apiKey || !env.agentmail?.inboxId)) {
+    log.warn('inbound.email.skipped', { callId: callRow.id, reason: 'agentmail_not_configured' });
+    return null;
+  }
+
+  // Mark BEFORE the await so concurrent transcript events don't double-fire.
+  sentByCallId.add(callRow.id);
 
   if (useContextualInvoice) {
     try {
-      const result = await sendCallbackInvoiceEmail({
+      const result = await invoiceSender({
         recipient: email,
         transcript,
         callId: callRow.id,
         leadId: callRow.lead_id || null
       });
+      const receipt = recordInboundVoiceEmailEvent({
+        callRow,
+        lead,
+        type: eventType,
+        trigger: 'callback_invoice',
+        email,
+        subject: result?.subject || 'Your callmemaybe invoice — $500 + meeting notes',
+        body: result?.text || 'Callback invoice email sent.',
+        result,
+        checkoutUrl: result?.checkoutUrl || null,
+        context: result?.context || null
+      });
       log.info('callback.invoice.sent', {
         callId: callRow.id, toEmail: email,
         businessName: result?.context?.businessName || null,
-        path: callRow.decision_reason === 'agentphone_email_callback' ? 'email_callback' : 'inbound_invoice_intent'
+        path: callRow.decision_reason === 'agentphone_email_callback' ? 'email_callback' : 'inbound_invoice_intent',
+        contactEventId: receipt.id,
+        receiptInserted: receipt.inserted
       });
-      return { email, ...result };
+      return { email, contactEventId: receipt.id, ...result };
     } catch (err) {
       sentByCallId.delete(callRow.id);
       log.error('callback.invoice.send_failed', {
@@ -199,6 +361,7 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
         error: err?.message || String(err),
         trigger: 'callback_invoice'
       });
+      if (throwOnFailure) throw err;
       return null;
     }
   }
@@ -211,19 +374,31 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
   });
 
   try {
-    const result = await sendAgentMailMessage({
+    const result = await mailSender({
       toEmail: email,
       subject,
       text,
       leadId: callRow.lead_id || null,
       costKind: 'inbound_followup'
     });
+    const receipt = recordInboundVoiceEmailEvent({
+      callRow,
+      lead,
+      type: eventType,
+      trigger: 'inbound_voice',
+      email,
+      subject,
+      body: text,
+      result
+    });
     log.info('inbound.email.sent', {
       callId: callRow.id,
       leadId: callRow.lead_id,
       toEmail: email,
       messageId: result?.messageId || null,
-      threadId: result?.threadId || null
+      threadId: result?.threadId || null,
+      contactEventId: receipt.id,
+      receiptInserted: receipt.inserted
     });
     emit('mailer.email_sent', {
       worker: 'mailer',
@@ -235,7 +410,7 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
       messageId: result?.messageId,
       trigger: 'inbound_voice'
     });
-    return { email, ...result };
+    return { email, contactEventId: receipt.id, ...result };
   } catch (err) {
     // Roll back so we'll retry on the next transcript chunk.
     sentByCallId.delete(callRow.id);
@@ -250,6 +425,7 @@ export async function maybeFireInboundEmail({ callRow, lead, transcript, overrid
       error: err?.message || String(err),
       trigger: 'inbound_voice'
     });
+    if (throwOnFailure) throw err;
     return null;
   }
 }

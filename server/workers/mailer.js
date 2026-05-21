@@ -9,8 +9,16 @@ import { generateStructured } from '../reasoning/geminiReasoner.js';
 import { PreviewRecap, PreviewRecapCritique } from '../reasoning/schemas.js';
 import { agentMailWebhookEventId, isInboundAgentMailWebhook, normalizeAgentMailWebhook } from '../webhooks/agentmail.js';
 import { classifyInvoiceAffirmation, decideEmailReply, handleScheduleIntent } from './mailReply.js';
-import { maybePlaceEmailCallback } from '../emailCallback.js';
-import { runPreviewBuilder } from './builder.js';
+import { enqueueEmailCallbackJob } from '../emailCallback.js';
+import { enqueuePreviewBuilderBuild } from '../builderQueue.js';
+import { recordProviderFlag } from '../reputation.js';
+import { processInboundIntake } from '../inboundIntake.js';
+import {
+  classifyHandoffRisk,
+  createHandoffCaseFromMail,
+  recordHandoffSafeReply,
+  safeHandoffReply
+} from '../handoff.js';
 import {
   createOrReuseRevenueInvoice,
   existingInvoiceEmailEvent,
@@ -440,24 +448,62 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
     return { ignored: true, reason: 'self_message', eventId, msg };
   }
 
-  // "Call me" intent → fire an outbound callback right now. Runs BEFORE the lead
-  // / classification machinery so it works for non-lead senders (the operator
-  // emailing in to test, a curious prospect with no lead row, etc.). If a
-  // callback is placed, we short-circuit the rest of the inbound flow — the
-  // phone is ringing within seconds, no email reply needed.
-  const callback = await maybePlaceEmailCallback({ msg, eventId }).catch((err) => {
-    log.warn('email_callback.handler_threw', { error: err?.message || String(err), eventId });
-    return null;
-  });
-  if (callback?.fired) {
-    return { ignored: false, eventId, msg, callbackPlaced: true, toPhone: callback.toPhone, callId: callback.callId };
+  // "Call me" intent → enqueue an outbound callback job before the lead /
+  // classification machinery so non-lead senders still get called. The actual
+  // AgentPhone side effect is durable and retryable.
+  const callback = (() => {
+    try {
+      return enqueueEmailCallbackJob({ msg, eventId, source: 'agentmail.inbound' });
+    } catch (err) {
+      log.warn('email_callback.enqueue_failed', { error: err?.message || String(err), eventId });
+      return null;
+    }
+  })();
+  if (callback?.queued) {
+    return {
+      ignored: false,
+      eventId,
+      msg,
+      callbackQueued: true,
+      durableJobId: callback.row?.id || null,
+      duplicate: !callback.inserted,
+      toPhone: callback.toPhone || null
+    };
   }
 
-  const lead = findLeadForAgentMail(msg, body);
-  const leadId = lead?.id || body.leadId || body.lead_id || null;
+  let deliveryRisk = agentMailDeliveryRisk(msg);
+  let lead = findLeadForAgentMail(msg, body);
+  let leadId = lead?.id || body.leadId || body.lead_id || null;
+  let intake = null;
+  if (!deliveryRisk.flagged) {
+    intake = await processInboundIntake({
+      channel: 'email',
+      fromEmail: msg.fromEmail,
+      threadId: msg.threadId,
+      messageId: msg.messageId,
+      subject: msg.subject,
+      text: msg.text || msg.preview || '',
+      lead,
+      eventId,
+      stage: 'message',
+      createQuote: true,
+      sendAutoReply: false,
+      scheduleCallbacks: false
+    }).catch((err) => {
+      log.warn('agentmail.inbound_intake_failed', {
+        eventId,
+        threadId: msg.threadId,
+        error: err?.message || String(err)
+      });
+      return null;
+    });
+    if (intake?.lead) {
+      lead = intake.lead;
+      leadId = lead.id;
+    }
+  }
   const history = leadId ? recentAgentMailEvents(leadId) : [];
-  const deliveryRisk = agentMailDeliveryRisk(msg);
-  const classification = deliveryRisk.operatorFlag
+  let classification = deliveryRisk.operatorFlag
     ? deliveryRiskClassification(deliveryRisk)
     : await classifyAgentMailReply({
         lead,
@@ -467,6 +513,33 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
         history,
         eventId
       });
+  applyIntakeReplyToClassification(classification, intake);
+  const handoffRisk = classifyHandoffRisk({
+    subject: msg.subject,
+    text: msg.text || msg.preview || '',
+    source: 'agentmail',
+    classification,
+    forcedCategory: deliveryRisk.operatorFlag ? 'provider_failure' : null,
+    reason: deliveryRisk.reason || classification.reason
+  });
+  if (handoffRisk.caseRequired && !classification.operatorFlag) {
+    classification = {
+      ...classification,
+      kind: 'handoff',
+      scope: handoffRisk.category,
+      scopes: [handoffRisk.category],
+      supported: false,
+      operatorFlag: true,
+      replyMode: 'safe_handoff',
+      reason: handoffRisk.reason,
+      matches: {
+        supported: classification.matches?.supported || [],
+        unsupported: [...new Set([...(classification.matches?.unsupported || []), handoffRisk.category])]
+      },
+      replyText: safeHandoffReply()
+    };
+  }
+  classification.handoffRisk = handoffRisk;
   const inboundEvent = addContactEventOnce({
     id: contactEventId('in', eventId, msg),
     lead_id: leadId,
@@ -485,7 +558,8 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
       fetched: !!msg.fetched,
       fetchError: msg.fetchError || null,
       deliveryRisk,
-      classification
+      classification,
+      intake: intake ? compactIntakeForMetadata(intake) : null
     }
   });
 
@@ -493,6 +567,35 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
     log.info('agentmail.inbound_duplicate_contact_event', { eventId, contactEventId: inboundEvent.id, threadId: msg.threadId });
     return { ignored: true, duplicate: true, eventId, leadId, msg };
   }
+
+  if (deliveryRisk.flagged) {
+    recordProviderFlag({
+      provider: 'agentmail',
+      kind: deliveryRisk.kind,
+      leadId,
+      severity: deliveryRisk.kind === 'complaint' ? 'alert' : 'warn',
+      reason: deliveryRisk.reason,
+      metadata: {
+        eventId,
+        contactEventId: inboundEvent.id,
+        threadId: msg.threadId,
+        labels: msg.labels || [],
+        eventType: msg.eventType || null
+      }
+    });
+  }
+
+  const handoffCaseResult = leadId && (classification.operatorFlag || deliveryRisk.operatorFlag || handoffRisk.caseRequired)
+    ? createHandoffCaseFromMail({
+        lead,
+        leadId,
+        msg,
+        inboundEventId: inboundEvent.id,
+        classification,
+        risk: handoffRisk,
+        draftReply: safeHandoffReply()
+      })
+    : null;
 
   if (leadId) {
     await writeMailMemory(leadId, 'inbound', msg, { eventId, classification });
@@ -565,6 +668,7 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
       leadId,
       inboundContactEventId: inboundEvent.id,
       classification,
+      handoffCase: handoffCaseResult?.case || null,
       deliveryRisk,
       msg
     };
@@ -600,6 +704,7 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
         bodyText,
         classification
       });
+      syncScheduledOutcomeIntoIntake(intake, scheduleOutcome, classification);
     } catch (err) {
       log.warn('agentmail.schedule.handler_failed', {
         leadId, threadId: msg.threadId, error: err?.message || String(err)
@@ -632,6 +737,15 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
     }
   });
 
+  if (handoffCaseResult?.case && classification.operatorFlag) {
+    recordHandoffSafeReply({
+      caseId: handoffCaseResult.case.id,
+      outboundEventId: outboundEvent.id,
+      replyText,
+      mock: sendResult.mock
+    });
+  }
+
   if (leadId) {
     await writeMailMemory(leadId, 'outbound', {
       ...msg,
@@ -653,6 +767,7 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
     supported: classification.supported,
     operatorFlag: classification.operatorFlag,
     policy: classification,
+    intake: intake ? compactIntakeForMetadata(intake) : null,
     mock: sendResult.mock,
     schedule: scheduleOutcome ? {
       action: scheduleOutcome.action,
@@ -674,10 +789,12 @@ export async function handleAgentMailInbound(input = {}, options = {}) {
     leadId,
     inboundContactEventId: inboundEvent.id,
     outboundContactEventId: outboundEvent.id,
+    handoffCase: handoffCaseResult?.case || null,
     replyText,
     classification,
     sendResult,
-    previewKickoff
+    previewKickoff,
+    intake
   };
 }
 
@@ -699,6 +816,14 @@ function agentMailDeliveryRisk(msg = {}) {
       kind: 'blocked',
       operatorFlag: true,
       reason: 'AgentMail matched this inbound message against a block list.'
+    };
+  }
+  if (has('complaint') || has('abuse') || has('report')) {
+    return {
+      flagged: true,
+      kind: 'complaint',
+      operatorFlag: true,
+      reason: 'AgentMail/provider signaled a complaint or abuse report.'
     };
   }
   if (has('unauthenticated')) {
@@ -724,7 +849,64 @@ function deliveryRiskClassification(deliveryRisk) {
     reason: deliveryRisk.reason,
     matches: { supported: [], unsupported: [deliveryRisk.kind] },
     supportedScopes: ['invoice', 'price', 'schedule', 'brief', 'revisions', 'build status', 'unsubscribe'],
-    unsupportedScopes: ['legal', 'custom contract', 'refund threat', 'security issue', 'spam', 'blocked', 'unauthenticated']
+    unsupportedScopes: ['legal', 'custom contract', 'refund threat', 'security issue', 'spam', 'blocked', 'complaint', 'unauthenticated']
+  };
+}
+
+function applyIntakeReplyToClassification(classification, intake) {
+  if (!classification || !intake?.replyText) return classification;
+  if (classification.kind === 'opt_out' || classification.operatorFlag) return classification;
+  const wantsSchedule = intake.intent === 'callback' || intake.nextAction === 'schedule_callback';
+  classification.replyText = intake.replyText;
+  classification.scope = wantsSchedule ? 'scheduling' : intake.readyForQuote ? 'invoice' : 'brief';
+  classification.scopes = unique([
+    ...(classification.scopes || []),
+    classification.scope,
+    wantsSchedule ? 'scheduling' : intake.readyForQuote ? 'pricing' : 'brief'
+  ]);
+  classification.reason = `${classification.reason || 'supported'}; inbound intake ${wantsSchedule ? 'callback requested' : intake.readyForQuote ? 'quote ready' : 'needs missing info'}`;
+  classification.intake = {
+    sessionId: intake.sessionId,
+    nextAction: intake.nextAction,
+    requiredMissingFields: intake.requiredMissingFields || [],
+    portalUrl: intake.portalUrl,
+    invoiceUrl: intake.invoiceUrl || null,
+    readyForQuote: !!intake.readyForQuote
+  };
+  return classification;
+}
+
+function syncScheduledOutcomeIntoIntake(intake, scheduleOutcome, classification) {
+  if (!intake || !scheduleOutcome) return;
+  intake.scheduleOutcome = scheduleOutcome;
+  if (classification?.replyText) intake.replyText = classification.replyText;
+  if (!scheduleOutcome.scheduledCallId) return;
+  const row = scheduledCallsDb.get(scheduleOutcome.scheduledCallId);
+  if (!row) return;
+  intake.scheduledCall = row;
+  intake.nextAction = 'schedule_callback';
+}
+
+function compactIntakeForMetadata(intake) {
+  return {
+    sessionId: intake.sessionId,
+    source: intake.source,
+    intent: intake.intent,
+    facts: intake.facts,
+    missingFields: intake.missingFields,
+    requiredMissingFields: intake.requiredMissingFields,
+    nextQuestion: intake.nextQuestion,
+    nextAction: intake.nextAction,
+    readyForQuote: intake.readyForQuote,
+    portalUrl: intake.portalUrl,
+    invoiceUrl: intake.invoiceUrl || null,
+    quoteBlocked: intake.quoteBlocked,
+    quoteBlockers: intake.quoteBlockers,
+    scheduledCall: intake.scheduledCall ? {
+      id: intake.scheduledCall.id,
+      scheduledAtMs: intake.scheduledCall.scheduled_at_ms || intake.scheduledCall.scheduledAtMs || null,
+      status: intake.scheduledCall.status || null
+    } : null
   };
 }
 
@@ -806,11 +988,19 @@ async function draftAgentMailReply({ lead, msg, classification, history }) {
   if (classification.kind === 'opt_out') {
     return 'Understood. We will stop emailing this thread. Thanks for letting us know.';
   }
+  if (classification.scope === 'source provenance') {
+    const source = lead?.source_url || lead?.website || null;
+    const business = lead?.business_name || 'your business';
+    const sourceLine = source
+      ? `The source attached to this contact is ${source}.`
+      : 'The source record attached to this contact does not include a public URL, so I have flagged the operator to review it before any further outreach.';
+    return `We contacted ${business} because our research marked it as a public business lead that might benefit from a clearer website/contact path. ${sourceLine} If you want us to stop, reply "unsubscribe" or "opt out" and we will stop calls and emails.`;
+  }
   if (classification.operatorFlag) {
-    return 'Thanks for asking. I can only handle invoice questions, scheduling, website briefs, revisions, pricing, build progress, and opt-outs in this automated thread. I have flagged the operator and paused the automated handling so a human can review this safely.';
+    return safeHandoffReply();
   }
 
-  return 'Thanks for the note. The invoice, scheduling, website brief, revisions, pricing, and build progress can all be handled right here in this thread. Send any details you want reflected on the site and I will keep the build moving.';
+  return 'Thanks for the note. The invoice, scheduling, website brief, revisions, pricing, build progress, source questions, and opt-outs can all be handled right here in this thread. Send any details you want reflected on the site and I will keep the build moving.';
 }
 
 async function sendAgentMailAutoReply({ msg, text, eventId, leadId = null }) {
@@ -869,6 +1059,10 @@ function stableStringify(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+}
+
+function unique(values) {
+  return [...new Set((values || []).filter(Boolean))];
 }
 
 function safeJson(text) {
@@ -1211,7 +1405,7 @@ function previewBuildEmailText({ businessName, liveUrl, recap }) {
   ].join('\n');
 }
 
-function startPreviewBuildKickoff({ leadId, msg, affirm }) {
+export function startPreviewBuildKickoff({ leadId, msg, affirm }) {
   const triggeredAt = Date.now();
   leads.update(leadId, {
     preview_build_triggered_at: triggeredAt,
@@ -1233,31 +1427,34 @@ function startPreviewBuildKickoff({ leadId, msg, affirm }) {
   const fromEmail = msg.fromEmail;
   const businessNameInput = leads.get(leadId)?.business_name;
 
-  // Fire-and-forget — the webhook handler returns immediately while the build runs in the background.
-  Promise.resolve()
-    .then(() => runPreviewBuilder({
+  try {
+    const queued = enqueuePreviewBuilderBuild({
       leadId,
-      onLiveUrl: (liveUrl, ctx) => sendPreviewBuildEmail({
-        leadId,
-        liveUrl,
-        inReplyToMessageId: replyMessageId,
-        threadId: msg.threadId,
-        toEmail: fromEmail,
-        businessName: businessNameInput,
-        buildId: ctx?.buildId || null,
-        sessionId: ctx?.sessionId || null,
-        mock: !!ctx?.mock
-      })
-    }))
-    .catch((err) => {
-      log.warn('mailer.preview_builder_failed', {
-        leadId,
-        err: err?.message || String(err)
-      });
-      // Roll back the trigger stamp so a future affirmative can retry.
-      try { leads.update(leadId, { preview_build_triggered_at: null, next_action: 'await_payment' }); }
-      catch (rollbackErr) { log.warn('mailer.preview_rollback_failed', { leadId, err: rollbackErr?.message }); }
+      threadId: msg.threadId,
+      messageId: replyMessageId,
+      toEmail: fromEmail,
+      businessName: businessNameInput,
+      source: 'mailer.preview_kickoff'
     });
+    kickoff.durableJobId = queued.row?.id || null;
+    kickoff.duplicate = !queued.inserted;
+    emit(queued.inserted ? 'mailer.preview_builder_queued' : 'mailer.preview_builder_duplicate', {
+      worker: 'mailer',
+      leadId,
+      threadId: msg.threadId,
+      messageId: replyMessageId,
+      jobId: queued.row?.id || null,
+      duplicate: !queued.inserted
+    });
+  } catch (err) {
+    log.warn('mailer.preview_builder_enqueue_failed', {
+      leadId,
+      err: err?.message || String(err)
+    });
+    try { leads.update(leadId, { preview_build_triggered_at: null, next_action: 'await_payment' }); }
+    catch (rollbackErr) { log.warn('mailer.preview_rollback_failed', { leadId, err: rollbackErr?.message }); }
+    throw err;
+  }
 
   return kickoff;
 }

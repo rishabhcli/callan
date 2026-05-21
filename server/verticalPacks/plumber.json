@@ -40,6 +40,19 @@
       "response": "Most plumber sites are too generic. This one is built for the local urgent search, with the service area and the phone first, not a multi-page brochure no one reads."
     }
   ],
+  "objectionMap": {
+    "skeptical": "Fair question. I am Callan from callmemaybe. I was checking public plumbing listings for whether homeowners can quickly see service area, emergency work, and a number to call. If it is not useful, I can let you go.",
+    "ai_disclosure": "Yes, I am an AI voice operator for callmemaybe, and the call is automated and recorded. I am here to see if a simple plumber page is worth considering, not to trap you in a long pitch.",
+    "number_source": "I used public business listing research for the plumbing business, not a private contact list. If you want no more calls, say stop and I will mark it.",
+    "pricing": "It is a flat $600 because trades pages need service-area clarity, emergency copy, review proof, and a tap-to-call layout. Nothing starts unless you choose to pay the invoice.",
+    "send_info": "I can send the short version through AgentMail, but the real question is whether a flat service-area page is worth considering. What email should I use if you want it sent?",
+    "call_later": "No problem. What exact day and time works? I do not want to promise a vague callback while you are under a sink."
+  },
+  "reviewValueProps": [
+    "Pull repeated review phrases about fast response, clean work, and emergency fixes into the hero proof.",
+    "Put service area and tap-to-call above the fold for homeowners with leaks or drain problems.",
+    "Turn review mentions of water heaters, drains, leaks, and repipes into concrete service chips."
+  ],
   "siteTemplateHint": "Use the dependable trades template: white background with deep blue and a clean accent, service-area hero with a giant tap-to-call number, emergency-friendly copy, service grid (drain, water heater, leak, repipe) using only confirmed services, and review proof if present.",
   "customerPersonaHint": "Homeowners with an active plumbing problem searching on a phone late at night or before work, looking for a local number to call and confirmation that the plumber covers their zip."
 }

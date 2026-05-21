@@ -7,13 +7,18 @@
 import { log } from './logger.js';
 import { emit } from './sse.js';
 import { scheduledCalls } from './db.js';
+import { enqueueJob } from './jobs.js';
 
 const LOOP_INTERVAL_MS = 5_000;
 const STUCK_THRESHOLD_MS = 60_000;
 const WARMING_WINDOW_MS = 30_000;       // emit "incoming in <30s" once per row
+const JOB_RETRY_BASE_DELAY_MS = 30_000;
+const JOB_RETRY_MAX_DELAY_MS = 15 * 60 * 1000;
 let timer = null;
 let dispatcher = null;
 const warmedIds = new Set();
+
+export const SCHEDULED_CALL_JOB_TYPE = 'call.scheduled';
 
 /**
  * Register the worker that actually places the call. Wired by server/index.js
@@ -66,6 +71,106 @@ export function cancelScheduledCall(id, { reason } = {}) {
   return row;
 }
 
+export function enqueueScheduledCallPlacement(rowOrId, {
+  reason = 'scheduled_call_due',
+  maxAttempts = 3
+} = {}) {
+  const row = typeof rowOrId === 'string' ? scheduledCalls.get(rowOrId) : rowOrId;
+  if (!row?.id) throw new Error('enqueueScheduledCallPlacement requires a scheduled call row or id');
+  return enqueueJob({
+    type: SCHEDULED_CALL_JOB_TYPE,
+    payload: {
+      scheduledCallId: row.id,
+      leadId: row.lead_id || null,
+      attempt: Number(row.attempts) || 0,
+      reason
+    },
+    idempotencyKey: `${SCHEDULED_CALL_JOB_TYPE}:${row.id}:${Number(row.attempts) || 0}`,
+    maxAttempts
+  });
+}
+
+function retryLeaseMs(job = null) {
+  const attempts = Math.max(1, Number(job?.attempts || 1));
+  const delay = Math.min(JOB_RETRY_MAX_DELAY_MS, JOB_RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempts - 1)));
+  return delay + STUCK_THRESHOLD_MS + 5_000;
+}
+
+function isFinalJobAttempt(job = null) {
+  return Number(job?.attempts || 1) >= Number(job?.max_attempts || 1);
+}
+
+function errorMessage(err) {
+  return err?.message || String(err);
+}
+
+export async function handleScheduledCallPlacementJob(payload = {}, job = null, { dispatcherFn = dispatcher } = {}) {
+  const scheduledCallId = payload.scheduledCallId;
+  if (!scheduledCallId) return { ok: false, skipped: true, reason: 'missing_scheduledCallId' };
+  let row = scheduledCalls.get(scheduledCallId);
+  if (!row) return { ok: false, skipped: true, reason: 'scheduled_call_not_found', scheduledCallId };
+  if (row.status === 'pending') {
+    scheduledCalls.markPlacing(row.id);
+    row = scheduledCalls.get(row.id);
+  }
+  if (row.status !== 'placing') {
+    return {
+      ok: true,
+      skipped: true,
+      reason: `scheduled_call_${row.status}`,
+      scheduledCallId,
+      status: row.status
+    };
+  }
+
+  scheduledCalls.touchPlacing(row.id, { leaseMs: retryLeaseMs(job) });
+  try {
+    if (!dispatcherFn) {
+      const err = new Error('scheduled call dispatcher is not registered');
+      err.retryable = true;
+      throw err;
+    }
+    const result = await dispatcherFn(row);
+    const callId = result?.call_id || result?.callId || null;
+    if (callId) {
+      scheduledCalls.markPlaced(row.id, { call_id: callId });
+      emit('scheduledCall.placed', { worker: 'caller', id: row.id, leadId: row.lead_id, callId });
+      return { ok: true, scheduledCallId, callId };
+    }
+    const reason = result?.failure || 'dispatcher_returned_no_call_id';
+    scheduledCalls.markFailed(row.id, { reason });
+    emit('scheduledCall.failed', { worker: 'caller', id: row.id, leadId: row.lead_id, reason });
+    return { ok: false, scheduledCallId, failure: reason, terminal: true };
+  } catch (err) {
+    const reason = errorMessage(err);
+    const retryable = err?.retryable !== false;
+    const finalAttempt = isFinalJobAttempt(job);
+    if (!retryable || finalAttempt) {
+      scheduledCalls.markFailed(row.id, { reason });
+      emit('scheduledCall.failed', {
+        worker: 'caller',
+        id: row.id,
+        leadId: row.lead_id,
+        reason,
+        retryable,
+        finalAttempt
+      });
+      return { ok: false, scheduledCallId, failure: reason, retryable, finalAttempt, terminal: true };
+    }
+
+    scheduledCalls.touchPlacing(row.id, { leaseMs: retryLeaseMs(job) });
+    emit('scheduledCall.retry', {
+      worker: 'caller',
+      id: row.id,
+      leadId: row.lead_id,
+      reason,
+      attempts: job?.attempts || null,
+      maxAttempts: job?.max_attempts || null
+    });
+    throw err;
+  }
+}
+
 /**
  * Emit `scheduledCall.warming` for any pending rows within WARMING_WINDOW_MS of
  * their scheduled time. Once per row. Lets the dashboard flash "incoming in 30s"
@@ -111,25 +216,23 @@ export async function drainDueScheduledCalls(now = Date.now()) {
       threadId: row.thread_id,
       scheduledAtMs: row.scheduled_at_ms
     });
-    // Fire in the background so one slow call doesn't block other due rows.
-    Promise.resolve()
-      .then(() => dispatcher(row))
-      .then((result) => {
-        if (result?.call_id) {
-          scheduledCalls.markPlaced(row.id, { call_id: result.call_id });
-          emit('scheduledCall.placed', { worker: 'caller', id: row.id, leadId: row.lead_id, callId: result.call_id });
-        } else {
-          const reason = result?.failure || 'dispatcher_returned_no_call_id';
-          scheduledCalls.markFailed(row.id, { reason });
-          emit('scheduledCall.failed', { worker: 'caller', id: row.id, leadId: row.lead_id, reason });
-        }
-      })
-      .catch((err) => {
-        const reason = err?.message || String(err);
-        scheduledCalls.markFailed(row.id, { reason });
-        emit('scheduledCall.failed', { worker: 'caller', id: row.id, leadId: row.lead_id, reason });
-        log.error('scheduledCall.dispatch_failed', { id: row.id, leadId: row.lead_id, error: reason });
+    try {
+      const placing = scheduledCalls.get(row.id);
+      const queued = enqueueScheduledCallPlacement(placing, { reason: 'scheduled_call_due' });
+      emit('scheduledCall.job_queued', {
+        worker: 'caller',
+        id: row.id,
+        leadId: row.lead_id,
+        jobId: queued.row?.id || null,
+        jobStatus: queued.row?.status || null,
+        duplicate: !queued.inserted
       });
+    } catch (err) {
+      const reason = err?.message || String(err);
+      scheduledCalls.markFailed(row.id, { reason });
+      emit('scheduledCall.failed', { worker: 'caller', id: row.id, leadId: row.lead_id, reason });
+      log.error('scheduledCall.enqueue_failed', { id: row.id, leadId: row.lead_id, error: reason });
+    }
     drained += 1;
   }
   return { drained, skipped, considered: due.length };

@@ -1,7 +1,8 @@
-import { payments, contactEvents } from '../db.js';
+import { payments, contactEvents, commercePlans } from '../db.js';
 import { generateStructured } from '../reasoning/geminiReasoner.js';
 import { WebsiteBrief } from '../reasoning/schemas.js';
 import { log } from '../logger.js';
+import { compactLeadIntelligence, evidenceTraceText } from '../research/leadIntelligence.js';
 
 export async function buildFulfillmentBrief({ lead, profileDoc, postMortemDoc } = {}) {
   if (!lead) throw new Error('build brief requires a lead');
@@ -9,9 +10,10 @@ export async function buildFulfillmentBrief({ lead, profileDoc, postMortemDoc } 
   const profile = parseDocContent(profileDoc) || parseDocContent(lead.research_json);
   const postMortem = parseDocContent(postMortemDoc);
   const latestPayment = payments.listByLead(lead.id)[0];
+  const latestCommerce = commercePlans.getLatest(lead.id)?.plan || null;
   const niche = (lead.niche || profile?.niche || 'local services').toLowerCase();
   const style = pickStyle(niche);
-  const context = buildBriefContext({ lead, profile, postMortem, latestPayment, niche, style });
+  const context = buildBriefContext({ lead, profile, postMortem, latestPayment, latestCommerce, niche, style });
   const prompt = buildFulfillmentPromptRequest(context);
 
   try {
@@ -49,7 +51,7 @@ function websiteBriefToFulfillmentPrompt(decision, ctx, trace) {
   ].filter(Boolean).join(' ');
 }
 
-export function buildBriefContext({ lead, profile, postMortem, latestPayment, niche, style }) {
+export function buildBriefContext({ lead, profile, postMortem, latestPayment, latestCommerce, niche, style }) {
   const city = firstText(lead.city, profile?.city, 'the local area');
   const phone = firstText(lead.phone, profile?.phone, 'use a visible phone placeholder');
   const hours = firstText(profile?.hours, 'Hours not confirmed');
@@ -58,6 +60,7 @@ export function buildBriefContext({ lead, profile, postMortem, latestPayment, ni
   const needs = listItems(profile?.needs, 5, ['clear service menu', 'trust proof', 'tap-to-call contact path']);
   const agentMailQuestions = collectAgentMailQuestions(lead.id, postMortem);
   const postCall = postCallSummary(postMortem);
+  const leadIntelligence = compactLeadIntelligence(profile?.leadIntelligence, { evidenceLimit: 10 });
 
   return {
     lead,
@@ -75,8 +78,11 @@ export function buildBriefContext({ lead, profile, postMortem, latestPayment, ni
     needs,
     agentMailQuestions,
     postCall,
+    commerce: commerceBriefSummary(latestCommerce),
     invoice: invoiceSummary(latestPayment, postMortem),
     research: researchSummary(profile),
+    leadIntelligence,
+    evidenceTrace: leadIntelligence ? evidenceTraceText(leadIntelligence, { limit: 8 }) : '',
     customer: customerSummary(profile, postMortem)
   };
 }
@@ -91,32 +97,43 @@ export function buildFulfillmentPromptRequest(ctx) {
     `Business: ${ctx.businessName}`,
     `Niche/location: ${ctx.niche} in ${ctx.city}`,
     `Research findings: ${ctx.research}`,
+    ctx.leadIntelligence?.callOpener?.text ? `Evidence-based call opener that sold the fit: ${ctx.leadIntelligence.callOpener.text}` : null,
+    ctx.leadIntelligence?.reviewThemes?.length ? `Review/customer themes to reflect: ${ctx.leadIntelligence.reviewThemes.map((item) => item.summary || item.claim).join('; ')}` : null,
+    ctx.leadIntelligence?.currentWebsiteIssues?.length ? `Website issues to fix: ${ctx.leadIntelligence.currentWebsiteIssues.map((item) => item.summary || item.claim).join('; ')}` : null,
+    ctx.leadIntelligence?.missingCustomerInfo?.length ? `Missing info customers need: ${ctx.leadIntelligence.missingCustomerInfo.map((item) => item.summary || item.claim).join('; ')}` : null,
+    ctx.leadIntelligence?.bestCtaRecommendation ? `Recommended CTA: ${ctx.leadIntelligence.bestCtaRecommendation.summary || ctx.leadIntelligence.bestCtaRecommendation.claim}.` : null,
+    ctx.evidenceTrace ? `Evidence/source ids: ${ctx.evidenceTrace}` : null,
     `Phone/hours/address: phone ${ctx.phone}; hours ${ctx.hours}; address ${ctx.address || 'not confirmed'}`,
     `Services to feature: ${ctx.services.join('; ')}`,
     `Confirmed needs: ${ctx.needs.join('; ')}`,
     `Likely customers/persona: ${ctx.customer}`,
     `Style direction: ${ctx.style.tone}; ${ctx.style.palette}; ${ctx.style.layout}`,
     `Customer questions from AgentMail/call: ${ctx.agentMailQuestions.length ? ctx.agentMailQuestions.join('; ') : 'none yet'}`,
+    `Customer-business commerce: ${ctx.commerce}`,
     `Invoice/customer context: ${ctx.invoice}`,
     `Post-call objections/commitments: ${ctx.postCall}`,
     '',
     'Required output: only the finished website-build prompt, no analysis or preamble.'
-  ].join('\n');
+  ].filter((line) => line !== null && line !== undefined).join('\n');
 }
 
 export function fallbackBrief(ctx) {
   return [
     `Build a concise, polished website for ${ctx.businessName}, a ${ctx.niche} business in ${ctx.city}.`,
     `Use research findings: ${ctx.research}.`,
+    ctx.leadIntelligence?.reviewThemes?.length ? `Reflect review/customer themes: ${ctx.leadIntelligence.reviewThemes.map((item) => item.summary || item.claim).join('; ')}.` : null,
+    ctx.leadIntelligence?.currentWebsiteIssues?.length ? `Fix website issues: ${ctx.leadIntelligence.currentWebsiteIssues.map((item) => item.summary || item.claim).join('; ')}.` : null,
+    ctx.leadIntelligence?.bestCtaRecommendation ? `Use primary CTA: ${ctx.leadIntelligence.bestCtaRecommendation.summary || ctx.leadIntelligence.bestCtaRecommendation.claim}.` : null,
     `Show phone ${ctx.phone}, hours ${ctx.hours}${ctx.address ? `, and address ${ctx.address}` : ''}.`,
     `Feature services: ${ctx.services.join(', ')}.`,
     `Solve confirmed customer needs: ${ctx.needs.join(', ')}.`,
     `Style: ${ctx.style.tone}; ${ctx.style.palette}; ${ctx.style.layout}.`,
     `Include Home, Services, and Contact sections with tap-to-call and a simple inquiry form; do not imply unsupported booking or guarantees.`,
     `Answer customer questions: ${ctx.agentMailQuestions.length ? ctx.agentMailQuestions.join('; ') : 'make invoice, timing, and revision expectations clear'}.`,
+    `Customer-business commerce: ${ctx.commerce}.`,
     `Invoice/customer context: ${ctx.invoice}.`,
     `Respect post-call context: ${ctx.postCall}.`
-  ].join(' ');
+  ].filter(Boolean).join(' ');
 }
 
 function pickStyle(niche) {
@@ -151,7 +168,9 @@ function researchSummary(profile) {
     profile.websiteUrl ? `existing site: ${profile.websiteUrl}` : null,
     profile.sourceUrl ? `source: ${profile.sourceUrl}` : null,
     profile.yelpUrl ? `Yelp/listing: ${profile.yelpUrl}` : null,
-    listItems(profile.signals, 5, []).length ? `signals: ${listItems(profile.signals, 5, []).join(', ')}` : null
+    listItems(profile.signals, 5, []).length ? `signals: ${listItems(profile.signals, 5, []).join(', ')}` : null,
+    profile.leadIntelligence?.whyThisLeadIsWorthCalling ? `why call: ${profile.leadIntelligence.whyThisLeadIsWorthCalling.summary || profile.leadIntelligence.whyThisLeadIsWorthCalling.claim}` : null,
+    profile.leadIntelligence?.bestCtaRecommendation ? `CTA: ${profile.leadIntelligence.bestCtaRecommendation.summary || profile.leadIntelligence.bestCtaRecommendation.claim}` : null
   ].filter(Boolean);
   return compactText(parts.join('; '), 420);
 }
@@ -187,6 +206,18 @@ function invoiceSummary(payment, postMortem) {
   const status = payment.status || 'unknown status';
   const url = payment.hosted_invoice_url || payment.payment_link_url;
   return compactText(`invoice ${invoiceId}, ${status}, ${amount}; ${emailStatus}${url ? '; payment URL available' : ''}`, 260);
+}
+
+function commerceBriefSummary(plan) {
+  if (!plan) {
+    return 'No customer-business commerce plan captured; use contact/quote form only and do not invent checkout, booking, tax, refund, or policy details.';
+  }
+  const cta = plan.commerceCta?.label || 'Contact us';
+  const stripe = plan.stripeBoundary?.requiresStripe
+    ? `${plan.stripeBoundary.mode}; no public payment link unless customer-owned setup is approved`
+    : 'no customer-business payment link required';
+  const handoff = plan.humanHandoff?.required ? `handoff required: ${plan.humanHandoff.boundary}` : 'no hard handoff flags';
+  return compactText(`${plan.type}; CTA "${cta}" as an inquiry/contact action; ${stripe}; ${handoff}; do not use Callan's $500 invoice as customer commerce.`, 520);
 }
 
 function postCallSummary(postMortem) {

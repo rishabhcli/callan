@@ -24,10 +24,13 @@ import { emit } from './sse.js';
 import { normalizePhone } from './compliance.js';
 import { ensureAgentPhoneAgent, placeAgentPhoneCall } from './providers/agentphone.js';
 import { calls, leads, db } from './db.js';
+import { enqueueJob } from './jobs.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
 import { generateText } from './gemini.js';
 import { buildIcs, nextWeekdayTen } from './workers/mailer.js';
 import { stripeClient } from './providers/stripe.js';
+
+export const EMAIL_CALLBACK_JOB_TYPE = 'email.callback_call';
 
 /**
  * Map from providerCallId → { fromEmail, threadId, fromName, leadId }. Used by the
@@ -112,6 +115,120 @@ export function extractPhoneFromText(text) {
   return null;
 }
 
+function callbackDedupKey({ msg = {}, eventId = null } = {}) {
+  return eventId || `${msg.threadId || ''}:${msg.messageId || ''}`;
+}
+
+function clearRecentDedup(key) {
+  if (key) recentByEvent.delete(key);
+}
+
+function resolveCallbackPhone(msg = {}) {
+  const senderEmail = String(msg.fromEmail || '').toLowerCase();
+  const senderPhone = senderEmail ? env.callbackPhoneByEmail?.[senderEmail] : null;
+  return (
+    (senderPhone && normalizePhone(senderPhone)) ||
+    extractPhoneFromText(msg.text) ||
+    extractPhoneFromText(msg.subject) ||
+    normalizePhone(env.defaultCallbackPhone || process.env.DEMO_CALLBACK_PHONE || '')
+  );
+}
+
+function compactCallbackMessage(msg = {}) {
+  return {
+    fromEmail: msg.fromEmail || null,
+    fromName: msg.fromName || null,
+    threadId: msg.threadId || null,
+    messageId: msg.messageId || null,
+    subject: msg.subject || null,
+    text: msg.text || msg.preview || '',
+    preview: msg.preview || null,
+    eventType: msg.eventType || null,
+    labels: Array.isArray(msg.labels) ? msg.labels.slice(0, 20) : []
+  };
+}
+
+export function enqueueEmailCallbackJob({
+  msg,
+  eventId = null,
+  source = 'agentmail.inbound',
+  runAt = Date.now(),
+  maxAttempts = 5,
+  idempotencyKey = null
+} = {}) {
+  if (!msg) return { queued: false, reason: 'missing_message' };
+  const intent = detectCallMeNowIntent({ subject: msg.subject, text: msg.text || msg.preview || '' });
+  if (!intent.wantsCall) {
+    return { queued: false, reason: intent.deferToSchedule ? 'defer_to_schedule' : (intent.reason || 'no_callback_intent') };
+  }
+  const resolvedPhone = resolveCallbackPhone(msg);
+  if (!resolvedPhone) {
+    log.warn('email_callback.no_phone', { fromEmail: msg.fromEmail, subject: msg.subject });
+    emit('email_callback.no_phone', { fromEmail: msg.fromEmail, subject: msg.subject });
+    return { queued: false, reason: 'no_phone' };
+  }
+
+  const stable = idempotencyKey || `email.callback:${callbackDedupKey({ msg, eventId }) || resolvedPhone}`;
+  const result = enqueueJob({
+    type: EMAIL_CALLBACK_JOB_TYPE,
+    payload: {
+      msg: compactCallbackMessage(msg),
+      eventId: eventId || null,
+      resolvedPhone,
+      source
+    },
+    idempotencyKey: stable,
+    runAt,
+    maxAttempts
+  });
+  emit(result.inserted ? 'email_callback.queued' : 'email_callback.duplicate', {
+    worker: 'caller',
+    fromEmail: msg.fromEmail || null,
+    threadId: msg.threadId || null,
+    messageId: msg.messageId || null,
+    eventId: eventId || null,
+    toPhone: resolvedPhone,
+    jobId: result.row?.id || null,
+    status: result.row?.status || null,
+    duplicate: !result.inserted,
+    source
+  });
+  return { queued: true, inserted: result.inserted, row: result.row, toPhone: resolvedPhone };
+}
+
+export async function handleEmailCallbackJob(payload = {}, job = null, { callbackFn = maybePlaceEmailCallback } = {}) {
+  const msg = payload.msg || {};
+  const result = await callbackFn({
+    msg,
+    eventId: payload.eventId || job?.id || null,
+    resolvedPhone: payload.resolvedPhone || null
+  });
+  if (result?.fired) {
+    return {
+      ok: true,
+      fired: true,
+      toPhone: result.toPhone || payload.resolvedPhone || null,
+      callId: result.callId || null,
+      providerCallId: result.providerCallId || null,
+      leadId: result.leadId || null
+    };
+  }
+
+  const reason = result?.reason || 'not_fired';
+  if (['agent_resolve_failed', 'no_agent_id', 'place_failed'].includes(reason)) {
+    const err = new Error(`email callback failed: ${reason}${result?.error ? `: ${result.error}` : ''}`);
+    err.reason = reason;
+    throw err;
+  }
+  return {
+    ok: true,
+    fired: false,
+    skipped: true,
+    reason,
+    toPhone: result?.phone || payload.resolvedPhone || null
+  };
+}
+
 function buildCallbackSystemPrompt({ fromEmail }) {
   return [
     'You are Callan, the live voice operator for callmemaybe (an agentic web agency that builds $500 same-day single-page websites for small businesses).',
@@ -147,13 +264,13 @@ function buildCallbackBeginMessage() {
  * Top-level handler. Returns null if no callback fired, or
  * { fired: true, toPhone, callId, providerCallId } if one did.
  */
-export async function maybePlaceEmailCallback({ msg, eventId }) {
+export async function maybePlaceEmailCallback({ msg, eventId, resolvedPhone = null }) {
   if (!msg) return null;
   const intent = detectCallMeNowIntent({ subject: msg.subject, text: msg.text });
   if (!intent.wantsCall) return null;
 
   // Dedupe — same webhook delivered twice, or a reply thread getting re-triggered.
-  const dedupKey = eventId || `${msg.threadId || ''}:${msg.messageId || ''}`;
+  const dedupKey = callbackDedupKey({ msg, eventId });
   if (dedupKey) {
     const now = Date.now();
     const last = recentByEvent.get(dedupKey);
@@ -173,12 +290,7 @@ export async function maybePlaceEmailCallback({ msg, eventId }) {
   //   3) phone in the subject
   //   4) generic DEMO_CALLBACK_PHONE fallback
   const senderEmail = String(msg.fromEmail || '').toLowerCase();
-  const senderPhone = senderEmail ? env.callbackPhoneByEmail?.[senderEmail] : null;
-  const phone =
-    (senderPhone && normalizePhone(senderPhone)) ||
-    extractPhoneFromText(msg.text) ||
-    extractPhoneFromText(msg.subject) ||
-    normalizePhone(env.defaultCallbackPhone || process.env.DEMO_CALLBACK_PHONE || '');
+  const phone = normalizePhone(resolvedPhone) || resolveCallbackPhone(msg);
 
   if (!phone) {
     log.warn('email_callback.no_phone', { fromEmail: msg.fromEmail, subject: msg.subject });
@@ -197,10 +309,12 @@ export async function maybePlaceEmailCallback({ msg, eventId }) {
   try {
     agent = await ensureAgentPhoneAgent({});
   } catch (err) {
+    clearRecentDedup(dedupKey);
     log.error('email_callback.agent_resolve_failed', { error: err?.message || String(err) });
     return { fired: false, reason: 'agent_resolve_failed' };
   }
   if (!agent?.id) {
+    clearRecentDedup(dedupKey);
     log.error('email_callback.no_agent_id');
     return { fired: false, reason: 'no_agent_id' };
   }
@@ -260,6 +374,7 @@ export async function maybePlaceEmailCallback({ msg, eventId }) {
       leadId: callRow?.lead_id || null
     };
   } catch (err) {
+    clearRecentDedup(dedupKey);
     log.error('email_callback.place_failed', {
       fromEmail: msg.fromEmail,
       toPhone: phone,
@@ -645,7 +760,14 @@ export async function sendCallbackInvoiceEmail({ recipient, transcript, stripeUr
       messageId: result?.messageId,
       trigger: 'callback_invoice'
     });
-    return { context, ...result };
+    return {
+      context,
+      checkoutUrl,
+      subject: payload.subject,
+      text: payload.text,
+      html: payload.html,
+      ...result
+    };
   } catch (err) {
     log.error('email_callback.invoice_send_failed', {
       callId, toEmail: recipient, error: err?.message || String(err)

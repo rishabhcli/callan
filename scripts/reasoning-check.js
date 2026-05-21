@@ -154,14 +154,58 @@ try {
 
 function validWebsiteBrief({ source, quote, brief }) {
   return {
+    schemaVersion: 2,
     brief,
     businessName: 'Mission Curl Room',
     targetCustomer: 'San Francisco customers looking for curl salon services.',
+    pages: [
+      { name: 'Home', path: '/', goal: 'Convert local salon searches into calls or inquiries.', sections: ['hero', 'services', 'proof', 'contact'] },
+      { name: 'Contact', path: '#contact', goal: 'Make the next step obvious.', sections: ['contact'] }
+    ],
+    hero: {
+      headline: 'Mission Curl Room',
+      subheadline: 'Curl salon services for San Francisco customers.',
+      primaryCta: 'Call for curl care',
+      secondaryCta: 'Send an inquiry',
+      proofLine: 'Only supplied business facts are used.'
+    },
     sections: [
       { name: 'Hero', goal: 'Say what the salon does and how to contact it.', content: ['Mission Curl Room', 'curl salon', 'San Francisco'] },
       { name: 'Services', goal: 'Make the core service easy to understand.', content: ['curl care', 'consultations'] },
       { name: 'Contact', goal: 'Make the next step obvious.', content: ['phone call', 'simple inquiry form'] }
     ],
+    services: [
+      { name: 'curl care', description: 'Curl care for San Francisco customers.', cta: 'Call for curl care' },
+      { name: 'consultations', description: 'Consultation requests by phone or form.', cta: 'Send an inquiry' }
+    ],
+    reviewProof: {
+      status: 'limited',
+      items: ['Mission Curl Room', 'curl salon', 'San Francisco'],
+      disclaimer: 'Do not invent reviews, awards, guarantees, licenses, or staff names.'
+    },
+    location: {
+      city: 'San Francisco',
+      address: null,
+      serviceArea: 'San Francisco',
+      hours: null
+    },
+    cta: {
+      primaryLabel: 'Call for curl care',
+      primaryHref: 'tel:+14155550100',
+      secondaryLabel: 'Send an inquiry',
+      secondaryHref: '#contact-form'
+    },
+    contactMethods: [
+      { type: 'phone', label: 'Phone', value: '+14155550100', href: 'tel:+14155550100' },
+      { type: 'form', label: 'Inquiry form', value: '#contact-form', href: '#contact-form' }
+    ],
+    commerceNeeds: [
+      { key: 'invoice', status: 'outside_site', detail: 'Payment is handled outside the public site.' }
+    ],
+    assets: [
+      { type: 'placeholder', alt: 'Mission Curl Room salon placeholder', url: null, caption: 'Replace with a real salon image before launch.' }
+    ],
+    disclaimers: ['Do not invent reviews, awards, guarantees, licenses, staff names, or online payment claims.'],
     style: {
       tone: 'warm and professional',
       palette: 'neutral with one lively accent',

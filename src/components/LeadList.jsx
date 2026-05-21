@@ -33,6 +33,23 @@ function labelize(value) {
   return String(value || '').replace(/_/g, ' ');
 }
 
+function parseResearchJson(lead) {
+  const raw = lead.research_json || lead.researchJson;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function leadIntelligence(lead) {
+  return parseResearchJson(lead)?.leadIntelligence || null;
+}
+
+function scoreValue(score) {
+  if (score == null) return null;
+  const value = typeof score === 'number' ? score : Number(score.score);
+  return Number.isFinite(value) ? Math.round(value) : null;
+}
+
 function presenceStrength(lead) {
   const direct = lead.onlinePresenceStrength || lead.online_presence_strength || lead.presence_strength;
   const normalized = String(direct || '').toLowerCase();
@@ -101,8 +118,16 @@ function leadBadges(lead) {
   const out = [];
   const presence = presenceStrength(lead);
   const riskStatus = lead.risk_status || '';
+  const intel = leadIntelligence(lead);
+  const totalScore = scoreValue(intel?.scores?.totalScore);
   if (presence) {
     out.push({ text: `${presence} presence`, tone: presenceTone(presence) });
+  }
+  if (totalScore != null) {
+    out.push({ text: `research fit ${totalScore}`, tone: totalScore >= 70 ? 'good' : totalScore >= 45 ? 'warn' : 'muted' });
+  }
+  if (intel?.callOpener?.text) {
+    out.push({ text: 'evidence opener', tone: 'info' });
   }
   if (presence === 'strong') {
     out.push({ text: 'not worth calling', tone: 'bad' });

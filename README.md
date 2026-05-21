@@ -12,7 +12,7 @@ The judge-facing line is simple: we are not selling an agent, we are selling an 
 | Supermemory | Durable per-customer memory, scoped by one `containerTag` per lead. | Supermemory is the long-lived customer file. It is not the low-latency in-call hot path and not lead scraping. | `SUPERMEMORY_API_KEY`; smoke writes/searches with `SMOKE_SUPERMEMORY_WRITE=true`. |
 | Moss | Sub-10ms retrieval for the live voice turn. | Moss is the call-time cache for pitch chunks and objection handling. It is not web search, not scraping, and not the durable source of truth. | `MOSS_PROJECT_ID`, `MOSS_PROJECT_KEY`, `MOSS_BASE_URL`; live call use also needs `LIVE_CALLS=true`; smoke with `SMOKE_MOSS_INDEX=true`. |
 | Browser Use | Cloud browser operator for lead research and for driving Lovable. | Browser Use is the hands in the browser: Yelp/Maps-style audits, screenshots, costs, recordings, and the Lovable session. It is not memory or the website builder itself. | `BROWSER_USE_API_KEY`, `BROWSER_USE_BASE_URL`; builds need `LIVE_BUILDS=true`; smoke with `SMOKE_BROWSER_USE=true`. |
-| Lovable | Customer-visible website build surface. | Lovable is where the site appears. Browser Use opens and drives Lovable; the app surfaces the resulting `liveUrl`. There is no direct app env key for Lovable. | Authenticated Lovable browser session for live builds; no `LOVABLE_*` env in this repo. |
+| Lovable | Customer-visible website build surface. | Lovable is where the site appears. Browser Use opens and drives Lovable; the app surfaces the resulting `liveUrl`. There is no direct app env key for Lovable. | Authenticated Lovable browser session for live builds; no `LOVABLE_*` env in this repo; navigation smoke with `SMOKE_LOVABLE_NAVIGATION=true`. |
 | AgentPhone | Outbound voice call and transcript provider. | AgentPhone places the call. The app still owns target allow-listing, recording-disclosure copy, DNC/opt-out handling, and when to call. | `AGENTPHONE_API_KEY`, `AGENTPHONE_BASE_URL`, `AGENTPHONE_AGENT_ID`, `AGENTPHONE_DEFAULT_VOICE`, `AGENTPHONE_WEBHOOK_SECRET`, `AGENTPHONE_FROM_NUMBER`; requires `LIVE_CALLS=true` and allow-listed `ALLOWED_TARGET_PHONES` for `demo_live`; smoke with `SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+1...`. |
 | AgentMail | Customer email thread for invoice, recap, ICS handoff, and replies. | AgentMail is the persistent customer communication channel after the call. It is not the payment processor. | `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`, `AGENTMAIL_DISPLAY_NAME`, `AGENTMAIL_WEBHOOK_SECRET`; requires `LIVE_EMAILS=true`; demo-live sends only to `ALLOWED_TARGET_EMAILS`; smoke with `SMOKE_AGENTMAIL_SEND=true SMOKE_TEST_EMAIL=...`. |
 | Stripe | Hosted invoice and paid-state webhook. | Stripe turns a verbal yes into payment state. AgentMail carries the invoice URL; Stripe owns invoice/payment status. | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_USD_CENTS`, `STRIPE_PRODUCT_NAME`, `STRIPE_SUCCESS_URL`, `STRIPE_CANCEL_URL`; requires `LIVE_PAYMENTS=true`; smoke with `SMOKE_STRIPE_INVOICE=true SMOKE_TEST_EMAIL=...`. |
@@ -156,6 +156,29 @@ POST /api/leads/:id/growth/replies
 npm run check:growth
 ```
 
+## Account Manager Aftercare
+
+After customer launch approval, Callan seeds a persisted `AccountManagerPlan` and `account_tasks` queue. The loop is enabled by default but dry-run by default: it writes scheduled tasks and preview messages, while live AgentMail sends still require `ACCOUNT_MANAGER_LIVE_SENDS=true`, `LIVE_EMAILS=true`, AgentMail credentials, run-mode allow-list approval, quiet-window/frequency gates, and operator approval.
+
+The account manager tracks promised edits, stale phone/hours facts, 24-hour launch follow-up, review capture, Google Business Profile hygiene, seasonal hours, service/menu changes, analytics/contact-flow checks, and hosting/subscription status. Customer portal state shows pending/recent aftercare, and the operator aftercare tab exposes approve/send/pause/complete/reassign plus "why now" evidence.
+
+Routes and checks:
+
+```sh
+GET  /api/account-manager/status
+POST /api/account-manager/run
+GET  /api/leads/:id/account-manager
+POST /api/leads/:id/account-manager/plan
+POST /api/leads/:id/account-manager/run
+GET  /api/account-tasks/:id/explain
+POST /api/account-tasks/:id/approve
+POST /api/account-tasks/:id/send
+POST /api/account-tasks/:id/pause
+POST /api/account-tasks/:id/complete
+POST /api/account-tasks/:id/reassign
+npm run check:aftercare
+```
+
 Source docs used for this implementation:
 
 - AgentMail messages and threads: https://docs.agentmail.to/messages
@@ -186,10 +209,11 @@ npm run check:autonomy   # deterministic outreach/compliance/payment recovery ch
 npm run check:reasoning  # deterministic Gemini structured-output, repair, and evidence-reference check
 npm run check:fulfillment # deterministic paid-invoice-to-site target fulfillment check
 npm run check:growth     # deterministic GrowthPlan, offer, opt-out, and handoff check
+npm run check:aftercare  # deterministic account-manager plan, scheduler, portal-seed, and send-gate check
 npm run check:production # read-only production readiness report
 npm run check:safety     # local safety, HMAC/replay, and idempotency checks
 npm run check:browser-console # seeds Browser Use session rows and verifies status API + UI build
-npm run drill:reliability # isolated reliability/backpressure drill
+npm run drill:reliability # isolated reliability/backpressure drill plus auto-started route proof
 npm run smoke:providers  # provider readiness and optional live smoke checks
 ```
 
@@ -266,7 +290,7 @@ Launch modes are intentionally separate:
 | `production_review` | no | no | no | no | no | no |
 | `production_live` | compliance-gated | compliance-gated | confirmed invoice consent | opt-in | compliance-gated | opt-in |
 
-`production_live` additionally requires `PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH`, `NODE_ENV=production`, public `https://` `APP_PUBLIC_URL`, configured webhooks, passing provider smoke rows, and the relevant `LIVE_*` flags.
+`production_live` additionally requires `PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH`, `NODE_ENV=production`, a strong `ADMIN_API_TOKEN`, public `https://` `APP_PUBLIC_URL`, configured webhooks, passing provider smoke rows, and the relevant `LIVE_*` flags.
 
 For a judge-safe live demo against owned targets only:
 
@@ -299,17 +323,20 @@ Do not use `autonomous_live` for the YC demo unless the targets, disclosure, opt
 
 ## Provider Smoke Commands
 
-`npm run smoke:providers` is dry by default: it reports configured/missing providers without causing side effects. Add one `SMOKE_*` toggle when you intentionally want a live check.
+`npm run smoke:providers` is dry by default: it reports configured/missing providers without causing side effects. Add one `SMOKE_*` toggle and `-- --provider <name>` when you intentionally want a live check; this keeps live proof scoped to one provider at a time.
+
+The boot schedulers also enqueue `ops.provider_posture` and `ops.recover_stuck`. Provider posture is a durable no-network refresh controlled by `OPS_PROVIDER_POSTURE_ENABLED` and `OPS_PROVIDER_POSTURE_INTERVAL_MS`; it appends fresh dry-run/config evidence for promotion review, but does not overwrite the latest live smoke row or erase live failure evidence. Stuck recovery is controlled by `OPS_RECOVERY_ENABLED` and `OPS_RECOVERY_INTERVAL_MS`; it releases expired job leases, closes stale calls with audit receipts, returns scheduled calls stuck in `placing` to `pending`, and lets the server recover paid build jobs through the builder path.
 
 ```sh
 npm run smoke:providers
-SMOKE_GEMINI=true npm run smoke:providers
-SMOKE_SUPERMEMORY_WRITE=true npm run smoke:providers
-SMOKE_MOSS_INDEX=true npm run smoke:providers
-SMOKE_BROWSER_USE=true npm run smoke:providers
-SMOKE_AGENTMAIL_SEND=true SMOKE_TEST_EMAIL=operator@example.com npm run smoke:providers
-SMOKE_STRIPE_INVOICE=true SMOKE_TEST_EMAIL=operator@example.com SMOKE_STRIPE_PRICE_CENTS=100 npm run smoke:providers
-SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+15555550100 npm run smoke:providers
+SMOKE_GEMINI=true npm run smoke:providers -- --provider gemini
+SMOKE_SUPERMEMORY_WRITE=true npm run smoke:providers -- --provider supermemory
+SMOKE_MOSS_INDEX=true npm run smoke:providers -- --provider moss
+SMOKE_BROWSER_USE=true npm run smoke:providers -- --provider browserUse
+SMOKE_LOVABLE_NAVIGATION=true npm run smoke:providers -- --provider lovable
+SMOKE_AGENTMAIL_SEND=true SMOKE_TEST_EMAIL=operator@example.com npm run smoke:providers -- --provider agentmail
+SMOKE_STRIPE_INVOICE=true SMOKE_TEST_EMAIL=operator@example.com SMOKE_STRIPE_PRICE_CENTS=100 npm run smoke:providers -- --provider stripe
+SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+15555550100 npm run smoke:providers -- --provider agentphone
 ```
 
 ## Production Readiness
@@ -321,6 +348,22 @@ npm run drill:reliability
 ```
 
 `check:production` is read-only. It reports provider configured status, webhook status, smoke status, last error, quota/cost status, blocker reasons, and the next action for every provider. It exits report-only by default unless the app is already in `production_live`; use `npm run check:production -- --strict` to make production blockers fail locally.
+
+The readiness payload also exposes separate promotion gates for `production_review` and `production_live`. Review mode requires production credentials, a strong `ADMIN_API_TOKEN`, webhook secrets, fresh dry-run/config smoke, healthy jobs, and no live side-effect flags. Live mode requires the explicit production ack, production `NODE_ENV`, public HTTPS URL, fresh webhooks, fresh live smoke for every required provider, enabled side-effect flags, and healthy compliance/reputation/job gates.
+
+Operator API reads and mutations accept `Authorization: Bearer $ADMIN_API_TOKEN`, `X-Admin-Token: $ADMIN_API_TOKEN`, or the console-managed same-origin admin cookie. Local mock/dev runs remain usable without a token unless `ADMIN_API_TOKEN` is set; `production_review`, `production_live`, and `NODE_ENV=production` require one before health/readiness internals, leads, jobs, ops dashboards, discovery, calls, builds, outreach controls, aftercare actions, backup, reset, export, self-check, or stuck-job recovery controls can be used. `/api/ping` is the intentionally public liveness probe; provider webhooks keep their provider signatures, customer share-link actions stay scoped to the portal token, and hosting accept/preview image routes remain scoped public links instead of operator-token routes.
+
+Safe-to-sell also enforces economics, provider-health, and worker-health guards over the last 24h of SQLite history. Tune `OPS_MAX_DAILY_COST_USD`, `OPS_MAX_DAILY_LOSS_USD`, and `OPS_MIN_MARGIN_PCT` to set the spend ceiling, loss ceiling, and paid-work margin floor; tune `OPS_PROVIDER_MAX_ISSUE_RATE_PCT`, `OPS_PROVIDER_MIN_EVENTS_FOR_ISSUE_RATE`, and `OPS_PROVIDER_MAX_AVG_LATENCY_MS` to block launch on flaky or slow providers even when the latest row looks superficially okay. Worker/job failure budgets are controlled by `OPS_WORKER_MAX_FAILURES_24H`, `OPS_WORKER_MAX_FAILURE_RATE_PCT`, `OPS_WORKER_MIN_RUNS_FOR_FAILURE_RATE`, and `OPS_JOB_MAX_ISSUES_24H`.
+
+Safe-to-sell reports include scheduler freshness for recurring ops jobs, so a quiet queue is not enough: backup, provider posture, stuck recovery, the daily safe-to-sell self-check, and enabled aftercare jobs need recent successful durable completions.
+
+`npm run safe-to-sell` is the fail-closed launch check: it prints the same summary, blocker list, and next actions, then exits nonzero when Callan is not safe to sell. Use `npm run safe-to-sell -- --report-only` only when you need a red/green report without failing the surrounding shell job.
+
+Safe-to-sell output, production-readiness reports, provider smoke CLI output, provider health events, and durable snapshots are redacted by default before they leave the process or land in SQLite. Emails, phone numbers, API keys, secrets, tokens, passwords, and host-local filesystem paths are masked while timestamps, backup filenames, and operational counters stay readable for audit/debugging.
+
+Admin export includes a redacted SQLite operations manifest, table counts, and capped row samples by default. Mock/demo reset refuses production mode, creates a SQLite backup, deletes transient test jobs, and archives matched demo leads without deleting append-only trust-ledger receipts.
+
+`drill:reliability` uses isolated SQLite data and no live side effects. By default it also starts a throwaway mock server on a loopback port, waits on the public `/api/ping` liveness probe, waits for the boot `ops.backup`, `ops.provider_posture`, `ops.recover_stuck`, `ops.safe_to_sell`, and `account_manager.run` jobs to complete, then verifies `/api/ping`, `/api/health`, `/api/jobs/health`, `/api/ops/command-center`, `/api/admin/export`, `/api/admin/backups`, and outreach route surfaces with GET-only requests. Use `--base-url` to check an already-running server, or `--no-server` when a port cannot be bound.
 
 The operator console shows the same readiness in the production checklist, the "cannot go live because" panel, and emergency pause/stop controls. The pause path is `POST /api/outreach/pause`; the hard stop path is `POST /api/emergency-stop`.
 

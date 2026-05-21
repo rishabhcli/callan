@@ -11,8 +11,8 @@ import { scoreOnlinePresence } from '../presenceScorer.js';
 import { enrichBusinessProfile } from '../profileEnrichment.js';
 import { browserResearchLiveEnabled, discoverBrowserUseResearchProfiles } from '../research/browserUseSwarm.js';
 
-const MOCK_SYSTEM = 'You invent plausible small-business records for hackathon demos. Match the requested niche and city exactly. Never repeat names. Evaluate online presence strength honestly. Include services, provenance, presence evidence, reasons, confidence, and a null notWorthCallingReason unless presence is strong. Do not invent external URLs or contact emails; use null for external URL/email fields in mock data. Output ONLY JSON matching the provided schema.';
-const NORMALIZE_SYSTEM = 'Normalize raw research into a BusinessProfile. Evaluate whether the business has no, weak, mixed, or strong online presence. Capture what the business does, what it likely needs, public phone/address provenance, website/social/listing evidence, business hours, services, reasons, a 0-1 confidence score, and explicit notWorthCallingReason when strong enough to block outreach. Never invent a website URL or contact email; only include URLs/emails visible in the provided source text. Output ONLY JSON matching the provided schema.';
+const MOCK_SYSTEM = 'You invent plausible small-business records for hackathon demos. Match the requested niche and city exactly. Never repeat names. Evaluate online presence strength honestly. Include services, provenance, presence evidence, leadIntelligence with cited review themes, positive proof, pain points, missing customer info, competitor gaps, website issues, listing consistency, CTA, scores, and a null notWorthCallingReason unless presence is strong. Do not invent external URLs or contact emails; use null for external URL/email fields in mock data. Output ONLY JSON matching the provided schema.';
+const NORMALIZE_SYSTEM = 'Normalize raw research into a BusinessProfile. Evaluate whether the business has no, weak, mixed, or strong online presence. Capture what the business does, what it likely needs, public phone/address provenance, website/social/listing evidence, business hours, services, reasons, a 0-1 confidence score, leadIntelligence with every claim cited to source evidence/source ids, and explicit notWorthCallingReason when strong enough to block outreach. Never invent a website URL or contact email; only include URLs/emails visible in the provided source text. Output ONLY JSON matching the provided schema.';
 
 const MAX_RAW_TEXT = 12000;
 const BROWSER_TASK_TIMEOUT_MS = 240000;
@@ -921,7 +921,7 @@ function candidatePrompt({ niche, city, count }) {
 }
 
 function mockProfilePrompt({ niche, city, candidate }) {
-  return `Expand this candidate into a full BusinessProfile. The business is a ${niche} in ${city}. Set hasWebsite=false, websiteUrl=null, onlinePresenceStrength="weak", onlinePresenceConfidence around 0.75, presenceConfidence around 0.75, and notWorthCallingReason=null. Fill onlinePresenceEvidence with no owned website, listing/social clues, gaps, and positiveSignals; onlinePresenceReasons with 3-5 concrete reasons; services; whatTheyDo (1-2 sentences); needs (3-5 concrete website/business needs); customerPersona; provenance; and signals (3-6 short tags like "cash-only", "instagram-active", "old-school", "owner-operated"). Candidate JSON:\n\n${JSON.stringify(candidate)}`;
+  return `Expand this candidate into a full BusinessProfile. The business is a ${niche} in ${city}. Set hasWebsite=false, websiteUrl=null, onlinePresenceStrength="weak", onlinePresenceConfidence around 0.75, presenceConfidence around 0.75, and notWorthCallingReason=null. Fill onlinePresenceEvidence with no owned website, listing/social clues, gaps, and positiveSignals; onlinePresenceReasons with 3-5 concrete reasons; services; whatTheyDo (1-2 sentences); needs (3-5 concrete website/business needs); customerPersona; provenance; signals (3-6 short tags like "cash-only", "instagram-active", "old-school", "owner-operated"); and leadIntelligence with review themes, proof, pain points, missing customer info, competitor gaps, website issues, listing consistency, CTA, scores, and exact call opener. Candidate JSON:\n\n${JSON.stringify(candidate)}`;
 }
 
 function listTaskPrompt({ niche, city, count }) {
@@ -941,7 +941,7 @@ function detailTaskPrompt({ candidate, niche, city }) {
   return [
     `Open and audit this public business source: ${target}.`,
     `Business hint: ${candidate?.businessName || 'unknown'} (${niche}, ${city}).`,
-    'Capture exact business name, public source URL, full phone number, full street address, hours if shown, business website/social URL if visible, whether the website is missing/weak/mixed/strong, presence evidence and reasons, confidence, owner/persona clues, what the business actually does, customer decision info, and 3-6 signal tags.',
+    'Capture exact business name, public source URL, full phone number, full street address, hours if shown, business website/social URL if visible, whether the website is missing/weak/mixed/strong, review themes, positive proof, complaints/pain points, missing customer info, competitor gaps, website issues, listing/social consistency, best CTA, presence evidence and reasons, confidence, owner/persona clues, what the business actually does, customer decision info, and 3-6 signal tags.',
     'Return labeled plain text. Include "Source URL:" and "Business website:" fields. If there is no website link, say "Business website: none". If the page is blocked, login-gated, or quota/network fails, say exactly what failed.'
   ].join(' ');
 }
@@ -950,7 +950,7 @@ function liveNormalizePrompt({ candidate, niche, city, rawDetail }) {
   return [
     `Normalize this public lead research into a BusinessProfile. Niche: ${niche}. City: ${city}.`,
     'Never invent a website URL or email. Use the provided source URL if it is the only evidence URL.',
-    'Include onlinePresenceEvidence.website/social/listings/gaps/positiveSignals, onlinePresenceReasons, onlinePresenceConfidence, presenceConfidence, services, provenance, and notWorthCallingReason only when the presence is strong enough to block outreach.',
+    'Include onlinePresenceEvidence.website/social/listings/gaps/positiveSignals, onlinePresenceReasons, onlinePresenceConfidence, presenceConfidence, services, provenance, leadIntelligence with evidenceIds/sourceIds on every claim, and notWorthCallingReason only when the presence is strong enough to block outreach.',
     `Candidate hint JSON:\n${JSON.stringify(candidate)}`,
     `Source text follows between BEGIN/END markers.\n\nBEGIN\n${rawDetail.slice(0, MAX_RAW_TEXT)}\nEND`
   ].join('\n\n');

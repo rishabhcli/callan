@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { env } from './env.js';
+import { redact } from './logger.js';
+import { operationalErrorSummary } from './operationalErrors.js';
 
 mkdirSync(env.dataDir, { recursive: true });
 const dbPath = join(env.dataDir, 'callmemaybe.db');
@@ -46,6 +48,25 @@ db.exec(`
     error TEXT,
     detail_json TEXT,
     FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    next_attempt_at INTEGER NOT NULL,
+    locked_by TEXT,
+    locked_at INTEGER,
+    lease_expires_at INTEGER,
+    error TEXT,
+    result_json TEXT,
+    idempotency_key TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS events (
@@ -100,6 +121,13 @@ db.exec(`
     live_url TEXT,
     project_url TEXT,
     status TEXT NOT NULL,
+    launch_status TEXT NOT NULL DEFAULT 'not_started',
+    launch_readiness_json TEXT,
+    operator_approved_at INTEGER,
+    customer_approved_at INTEGER,
+    launched_at INTEGER,
+    preview_html TEXT,
+    screenshot_url TEXT,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
@@ -192,12 +220,91 @@ db.exec(`
     FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE SET NULL
   );
 
+  CREATE TABLE IF NOT EXISTS portal_tokens (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    purpose TEXT NOT NULL DEFAULT 'build_share',
+    status TEXT NOT NULL DEFAULT 'active',
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    rotated_from TEXT,
+    metadata_json TEXT,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS customer_intake (
+    lead_id TEXT PRIMARY KEY,
+    contact_name TEXT,
+    contact_email TEXT,
+    preferred_phone TEXT,
+    service_area TEXT,
+    primary_goal TEXT,
+    brand_voice TEXT,
+    must_have_sections_json TEXT,
+    asset_urls_json TEXT,
+    notes TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS portal_actions (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    token_id TEXT,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    related_type TEXT,
+    related_id TEXT,
+    body_json TEXT,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE,
+    FOREIGN KEY(token_id) REFERENCES portal_tokens(id) ON DELETE SET NULL
+  );
+
   CREATE TABLE IF NOT EXISTS provider_smoke (
     provider TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     detail_json TEXT,
     checked_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS provider_health_events (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail_json TEXT,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    live INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    error TEXT,
+    checked_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_provider_health_events_provider_checked
+    ON provider_health_events(provider, checked_at);
+  CREATE INDEX IF NOT EXISTS idx_provider_health_events_status_checked
+    ON provider_health_events(status, checked_at);
+
+  CREATE TABLE IF NOT EXISTS safe_to_sell_reports (
+    id TEXT PRIMARY KEY,
+    ok INTEGER NOT NULL,
+    mode TEXT,
+    command TEXT,
+    dry_run_count INTEGER NOT NULL DEFAULT 0,
+    live_smoke_count INTEGER NOT NULL DEFAULT 0,
+    blocker_count INTEGER NOT NULL DEFAULT 0,
+    report_json TEXT NOT NULL,
+    generated_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_safe_to_sell_reports_generated
+    ON safe_to_sell_reports(generated_at);
+  CREATE INDEX IF NOT EXISTS idx_safe_to_sell_reports_ok_mode
+    ON safe_to_sell_reports(ok, mode, generated_at);
 
   CREATE TABLE IF NOT EXISTS webhook_events (
     provider TEXT NOT NULL,
@@ -298,6 +405,24 @@ db.exec(`
     source_url TEXT,
     metadata_json TEXT,
     dedupe_key TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS trust_ledger (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    lead_id TEXT,
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    channel TEXT,
+    direction TEXT,
+    subject_id TEXT,
+    decision_code TEXT,
+    summary TEXT NOT NULL,
+    source_url TEXT,
+    disclosure_text TEXT,
+    metadata_json TEXT,
+    dedupe_key TEXT,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE SET NULL
   );
 
   CREATE TABLE IF NOT EXISTS reasoning_traces (
@@ -440,8 +565,119 @@ db.exec(`
     FOREIGN KEY(growth_plan_id) REFERENCES growth_plans(id) ON DELETE SET NULL
   );
 
+  CREATE TABLE IF NOT EXISTS commerce_plans (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    type TEXT NOT NULL,
+    intake_json TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    risk_count INTEGER NOT NULL DEFAULT 0,
+    handoff_required INTEGER NOT NULL DEFAULT 0,
+    stripe_mode TEXT,
+    idempotency_key TEXT,
+    generated_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS handoff_cases (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT,
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    source_event_id TEXT,
+    source_url TEXT,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    status TEXT NOT NULL,
+    assigned_to TEXT,
+    summary TEXT NOT NULL,
+    evidence_json TEXT,
+    recommended_action TEXT,
+    copilot_json TEXT,
+    idempotency_key TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS handoff_case_actions (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    lead_id TEXT,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    note TEXT,
+    payload_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(case_id) REFERENCES handoff_cases(id) ON DELETE CASCADE,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS account_manager_plans (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    evidence_json TEXT,
+    risk_json TEXT,
+    idempotency_key TEXT,
+    generated_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS account_tasks (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    account_plan_id TEXT,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    due_at INTEGER NOT NULL,
+    priority TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL,
+    evidence_ids_json TEXT,
+    owner TEXT,
+    idempotency_key TEXT,
+    preview_json TEXT,
+    risk_json TEXT,
+    policy_json TEXT,
+    completion_notes TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_previewed_at INTEGER,
+    sent_at INTEGER,
+    completed_at INTEGER,
+    paused_until INTEGER,
+    provider_id TEXT,
+    thread_id TEXT,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE,
+    FOREIGN KEY(account_plan_id) REFERENCES account_manager_plans(id) ON DELETE SET NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS account_task_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    note TEXT,
+    metadata_json TEXT,
+    FOREIGN KEY(task_id) REFERENCES account_tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
   CREATE INDEX IF NOT EXISTS idx_events_lead ON events(lead_id);
+  CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_attempt_at, created_at);
+  CREATE INDEX IF NOT EXISTS idx_jobs_type_status ON jobs(type, status, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(status, lease_expires_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_lead_history_lead ON lead_history(lead_id);
   CREATE INDEX IF NOT EXISTS idx_runs_lead ON worker_runs(lead_id);
   CREATE INDEX IF NOT EXISTS idx_calls_lead_started ON calls(lead_id, started_at);
@@ -459,6 +695,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_contact_events_lead ON contact_events(lead_id);
   CREATE INDEX IF NOT EXISTS idx_contact_events_thread ON contact_events(thread_id);
   CREATE INDEX IF NOT EXISTS idx_contact_events_lead_created ON contact_events(lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_portal_tokens_lead_status ON portal_tokens(lead_id, status, expires_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_tokens_active_lead ON portal_tokens(lead_id, purpose) WHERE status = 'active';
+  CREATE INDEX IF NOT EXISTS idx_customer_intake_updated ON customer_intake(updated_at);
+  CREATE INDEX IF NOT EXISTS idx_portal_actions_lead_created ON portal_actions(lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_portal_actions_type_created ON portal_actions(type, created_at);
   CREATE INDEX IF NOT EXISTS idx_call_attempts_phone ON call_attempts(phone);
   CREATE INDEX IF NOT EXISTS idx_call_attempts_lead_created ON call_attempts(lead_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_moss_snippets_lead_status ON moss_snippets(lead_id, status, kind);
@@ -468,6 +709,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reasoning_traces_lead_created ON reasoning_traces(lead_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_reasoning_traces_schema_created ON reasoning_traces(schema_name, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_reasoning_traces_dedupe ON reasoning_traces(dedupe_key) WHERE dedupe_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_handoff_cases_status ON handoff_cases(status, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_handoff_cases_lead ON handoff_cases(lead_id, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_handoff_cases_category ON handoff_cases(category, severity, updated_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_handoff_cases_idempotency ON handoff_cases(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_handoff_case_actions_case ON handoff_case_actions(case_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_trust_ledger_lead_created ON trust_ledger(lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_trust_ledger_event_created ON trust_ledger(event_type, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_ledger_dedupe ON trust_ledger(dedupe_key) WHERE dedupe_key IS NOT NULL;
 
   CREATE TRIGGER IF NOT EXISTS audit_events_no_update
   BEFORE UPDATE ON audit_events
@@ -491,6 +740,18 @@ db.exec(`
   BEFORE DELETE ON compliance_decisions
   BEGIN
     SELECT RAISE(ABORT, 'compliance_decisions are append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trust_ledger_no_update
+  BEFORE UPDATE ON trust_ledger
+  BEGIN
+    SELECT RAISE(ABORT, 'trust_ledger rows are append-only');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trust_ledger_no_delete
+  BEFORE DELETE ON trust_ledger
+  BEGIN
+    SELECT RAISE(ABORT, 'trust_ledger rows are append-only');
   END;
 `);
 
@@ -547,6 +808,13 @@ ensureColumn('builds', 'submission_url', 'TEXT');
 ensureColumn('builds', 'provider_project_id', 'TEXT');
 ensureColumn('builds', 'provider_deployment_id', 'TEXT');
 ensureColumn('builds', 'attempt', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('builds', 'launch_status', "TEXT NOT NULL DEFAULT 'not_started'");
+ensureColumn('builds', 'launch_readiness_json', 'TEXT');
+ensureColumn('builds', 'operator_approved_at', 'INTEGER');
+ensureColumn('builds', 'customer_approved_at', 'INTEGER');
+ensureColumn('builds', 'launched_at', 'INTEGER');
+ensureColumn('builds', 'preview_html', 'TEXT');
+ensureColumn('builds', 'screenshot_url', 'TEXT');
 ensureColumn('audit_events', 'contact_event_id', 'TEXT');
 ensureColumn('audit_events', 'source_url', 'TEXT');
 ensureColumn('audit_events', 'decision_code', 'TEXT');
@@ -556,6 +824,15 @@ ensureColumn('compliance_decisions', 'contact_event_id', 'TEXT');
 ensureColumn('compliance_decisions', 'source_url', 'TEXT');
 ensureColumn('compliance_decisions', 'metadata_json', 'TEXT');
 ensureColumn('compliance_decisions', 'dedupe_key', 'TEXT');
+ensureColumn('trust_ledger', 'actor', 'TEXT');
+ensureColumn('trust_ledger', 'channel', 'TEXT');
+ensureColumn('trust_ledger', 'direction', 'TEXT');
+ensureColumn('trust_ledger', 'subject_id', 'TEXT');
+ensureColumn('trust_ledger', 'decision_code', 'TEXT');
+ensureColumn('trust_ledger', 'source_url', 'TEXT');
+ensureColumn('trust_ledger', 'disclosure_text', 'TEXT');
+ensureColumn('trust_ledger', 'metadata_json', 'TEXT');
+ensureColumn('trust_ledger', 'dedupe_key', 'TEXT');
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_leads_research_status ON leads(research_status, updated_at);
@@ -579,6 +856,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_compliance_decisions_subject ON compliance_decisions(subject_type, subject_id);
   CREATE INDEX IF NOT EXISTS idx_compliance_decisions_code_created ON compliance_decisions(decision_code, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_decisions_dedupe ON compliance_decisions(dedupe_key) WHERE dedupe_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_trust_ledger_lead_created ON trust_ledger(lead_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_trust_ledger_event_created ON trust_ledger(event_type, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_trust_ledger_dedupe ON trust_ledger(dedupe_key) WHERE dedupe_key IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_memory_documents_lead_updated ON memory_documents(lead_id, updated_at);
   CREATE INDEX IF NOT EXISTS idx_memory_documents_kind_status ON memory_documents(kind, write_status);
   CREATE INDEX IF NOT EXISTS idx_memory_documents_container ON memory_documents(container_tag);
@@ -591,6 +871,17 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_growth_plans_idempotency ON growth_plans(idempotency_key) WHERE idempotency_key IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_growth_followups_lead ON growth_followups(lead_id, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_growth_followups_idempotency ON growth_followups(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_commerce_plans_lead ON commerce_plans(lead_id, generated_at);
+  CREATE INDEX IF NOT EXISTS idx_commerce_plans_type ON commerce_plans(type, generated_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_commerce_plans_idempotency ON commerce_plans(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_account_manager_plans_lead ON account_manager_plans(lead_id, generated_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_account_manager_plans_idempotency ON account_manager_plans(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_account_tasks_lead_due ON account_tasks(lead_id, due_at);
+  CREATE INDEX IF NOT EXISTS idx_account_tasks_status_due ON account_tasks(status, due_at);
+  CREATE INDEX IF NOT EXISTS idx_account_tasks_owner_status ON account_tasks(owner, status);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tasks_idempotency ON account_tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_account_task_history_task ON account_task_history(task_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_account_task_history_lead ON account_task_history(lead_id, created_at);
 `);
 
 // experiments — A/B (or N-arm) bucketing + outcome capture for pitch/voice/price tests.
@@ -712,6 +1003,7 @@ db.exec(`
     attempts INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     fired_at INTEGER,
+    lease_expires_at INTEGER,
     placed_call_id TEXT,
     failure_reason TEXT,
     FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE
@@ -725,14 +1017,54 @@ db.exec(`
 backfillLeadDedupeKeys();
 backfillAuditEvents();
 backfillComplianceDecisions();
+backfillProviderHealthEvents();
 
 function ensureColumn(table, column, definition) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   if (!cols.includes(column)) db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
 }
 
+ensureColumn('scheduled_calls', 'lease_expires_at', 'INTEGER');
+
 function jsonText(value) {
   return value === undefined || value === null ? null : JSON.stringify(value);
+}
+
+function backfillProviderHealthEvents() {
+  const rows = db.prepare(`
+    SELECT provider, status, detail_json, checked_at
+    FROM provider_smoke AS smoke
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM provider_health_events AS event
+      WHERE event.provider = smoke.provider
+        AND event.status = smoke.status
+        AND event.checked_at = smoke.checked_at
+    )
+  `).all();
+  if (!rows.length) return;
+  const insert = db.prepare(`
+    INSERT INTO provider_health_events (
+      id, provider, status, detail_json, dry_run, live, duration_ms, error, checked_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  db.transaction((items) => {
+    for (const row of items) {
+      const detail = safeJson(row.detail_json) || {};
+      insert.run(
+        `phealth_${Number(row.checked_at || Date.now()).toString(36)}_${randomBytes(4).toString('hex')}`,
+        row.provider,
+        row.status,
+        row.detail_json,
+        detail.dryRun === true ? 1 : 0,
+        detail.live === true ? 1 : 0,
+        optionalMs(detail.durationMs ?? detail.latencyMs ?? detail.elapsedMs),
+        providerSmokeError(row.status, detail),
+        row.checked_at
+      );
+    }
+  })(rows);
 }
 
 function sourceUrlForLead(lead_id, fallback = null) {
@@ -821,6 +1153,49 @@ function insertComplianceDecision({
   return decisionId;
 }
 
+function insertTrustLedgerEvent({
+  id,
+  created_at,
+  lead_id,
+  event_type,
+  actor,
+  channel,
+  direction,
+  subject_id,
+  decision_code,
+  summary,
+  source_url,
+  disclosure_text,
+  metadata,
+  dedupe_key
+}) {
+  const eventId = id || `trust_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+  const leadId = lead_id || null;
+  db.prepare(`
+    INSERT OR IGNORE INTO trust_ledger (
+      id, created_at, lead_id, event_type, actor, channel, direction, subject_id,
+      decision_code, summary, source_url, disclosure_text, metadata_json, dedupe_key
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    eventId,
+    created_at || Date.now(),
+    leadId,
+    event_type,
+    actor || null,
+    channel || null,
+    direction || null,
+    subject_id || null,
+    decision_code || null,
+    summary || event_type,
+    sourceUrlForLead(leadId, source_url || null),
+    disclosure_text || null,
+    jsonText(metadata),
+    dedupe_key || null
+  );
+  return eventId;
+}
+
 function timelineRows(rows, kind) {
   return rows.map((row) => ({
     kind,
@@ -839,6 +1214,24 @@ function timelineRows(rows, kind) {
     source_url: row.source_url || null,
     decision_code: row.decision_code || null,
     decision_reason: row.decision_reason || null,
+    metadata: safeJson(row.metadata_json)
+  }));
+}
+
+function trustRows(rows) {
+  return rows.map((row) => ({
+    id: row.id,
+    created_at: row.created_at,
+    lead_id: row.lead_id || null,
+    event_type: row.event_type,
+    actor: row.actor || null,
+    channel: row.channel || null,
+    direction: row.direction || null,
+    subject_id: row.subject_id || null,
+    decision_code: row.decision_code || null,
+    summary: row.summary,
+    source_url: row.source_url || null,
+    disclosure_text: row.disclosure_text || null,
     metadata: safeJson(row.metadata_json)
   }));
 }
@@ -1543,6 +1936,311 @@ export const leads = {
   }
 };
 
+const DEFAULT_PORTAL_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export const portalTokens = {
+  ensureActive({ lead_id, purpose = 'build_share', expiresInMs = DEFAULT_PORTAL_TOKEN_TTL_MS, metadata = null, now = Date.now() } = {}) {
+    if (!lead_id) throw new Error('lead_id required');
+    const lead = leads.get(lead_id);
+    if (!lead) throw new Error(`lead ${lead_id} not found`);
+    this.expireStale(now);
+    const existing = db.prepare(`
+      SELECT * FROM portal_tokens
+      WHERE lead_id = ? AND purpose = ? AND status = 'active' AND expires_at > ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(lead_id, purpose, now);
+    if (existing) return { token: existing.token, row: hydratePortalToken(existing), reused: true };
+
+    const token = portalTokenValue();
+    const id = portalTokenId();
+    const expiresAt = now + Math.max(60_000, Number(expiresInMs) || DEFAULT_PORTAL_TOKEN_TTL_MS);
+    db.prepare(`
+      INSERT INTO portal_tokens (
+        id, lead_id, token, purpose, status, expires_at, created_at, metadata_json
+      ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+    `).run(id, lead_id, token, purpose, expiresAt, now, jsonText(metadata));
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'portal.token.created',
+      lead_id,
+      entity_type: 'portal_token',
+      entity_id: id,
+      action: 'created',
+      metadata: { purpose, expires_at: expiresAt, ...metadata },
+      dedupe_key: `portal_token:${id}:created`
+    });
+    insertTrustLedgerEvent({
+      created_at: now,
+      lead_id,
+      event_type: 'portal_token_event',
+      actor: 'portal',
+      channel: 'portal',
+      direction: 'outbound',
+      subject_id: id,
+      decision_code: 'portal_token.created',
+      summary: `Customer portal token created for ${purpose}.`,
+      metadata: { purpose, expires_at: expiresAt, ...(metadata || {}) },
+      dedupe_key: `trust_portal_token:${id}:created`
+    });
+    return { token, row: hydratePortalToken(this.get(id)), reused: false };
+  },
+  rotate({ lead_id, purpose = 'build_share', expiresInMs = DEFAULT_PORTAL_TOKEN_TTL_MS, metadata = null, reason = 'manual_rotation', now = Date.now() } = {}) {
+    if (!lead_id) throw new Error('lead_id required');
+    const active = db.prepare(`
+      SELECT * FROM portal_tokens
+      WHERE lead_id = ? AND purpose = ? AND status = 'active'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(lead_id, purpose);
+    if (active) {
+      db.prepare(`UPDATE portal_tokens SET status = 'revoked' WHERE id = ?`).run(active.id);
+      insertAuditEvent({
+        created_at: now,
+        event_type: 'portal.token.revoked',
+        lead_id,
+        entity_type: 'portal_token',
+        entity_id: active.id,
+        action: 'revoked',
+        decision_reason: reason,
+        metadata: { purpose, reason }
+      });
+      insertTrustLedgerEvent({
+        created_at: now,
+        lead_id,
+        event_type: 'portal_token_event',
+        actor: 'portal',
+        channel: 'portal',
+        direction: 'inbound',
+        subject_id: active.id,
+        decision_code: 'portal_token.revoked',
+        summary: `Customer portal token revoked: ${reason}.`,
+        metadata: { purpose, reason },
+        dedupe_key: `trust_portal_token:${active.id}:revoked`
+      });
+    }
+    const created = this.ensureActive({
+      lead_id,
+      purpose,
+      expiresInMs,
+      metadata: { ...(metadata || {}), rotatedFrom: active?.id || null, rotationReason: reason },
+      now
+    });
+    if (active) db.prepare(`UPDATE portal_tokens SET rotated_from = ? WHERE id = ?`).run(active.id, created.row.id);
+    return created;
+  },
+  resolve(token, { now = Date.now() } = {}) {
+    const raw = String(token || '').trim();
+    if (!raw) return { ok: false, reason: 'token_required', row: null, lead: null };
+    this.expireStale(now);
+    const row = db.prepare(`SELECT * FROM portal_tokens WHERE token = ?`).get(raw);
+    if (!row) return { ok: false, reason: 'not_found', row: null, lead: null };
+    if (row.status !== 'active') return { ok: false, reason: row.status || 'inactive', row: hydratePortalToken(row), lead: null };
+    if (row.expires_at <= now) {
+      db.prepare(`UPDATE portal_tokens SET status = 'expired' WHERE id = ? AND status = 'active'`).run(row.id);
+      insertTrustLedgerEvent({
+        created_at: now,
+        lead_id: row.lead_id,
+        event_type: 'portal_token_event',
+        actor: 'portal',
+        channel: 'portal',
+        direction: 'inbound',
+        subject_id: row.id,
+        decision_code: 'portal_token.expired',
+        summary: 'Customer portal token expired before access.',
+        metadata: { purpose: row.purpose, expires_at: row.expires_at },
+        dedupe_key: `trust_portal_token:${row.id}:expired`
+      });
+      return { ok: false, reason: 'expired', row: hydratePortalToken({ ...row, status: 'expired' }), lead: null };
+    }
+    db.prepare(`UPDATE portal_tokens SET last_used_at = ? WHERE id = ?`).run(now, row.id);
+    insertTrustLedgerEvent({
+      created_at: now,
+      lead_id: row.lead_id,
+      event_type: 'portal_token_event',
+      actor: 'portal',
+      channel: 'portal',
+      direction: 'inbound',
+      subject_id: row.id,
+      decision_code: 'portal_token.used',
+      summary: 'Customer portal token was used to view the build portal.',
+      metadata: { purpose: row.purpose, last_used_at: now },
+      dedupe_key: `trust_portal_token:${row.id}:first_used`
+    });
+    return { ok: true, reason: 'active', row: hydratePortalToken({ ...row, last_used_at: now }), lead: leads.get(row.lead_id) };
+  },
+  expireStale(now = Date.now()) {
+    return db.prepare(`
+      UPDATE portal_tokens
+      SET status = 'expired'
+      WHERE status = 'active' AND expires_at <= ?
+    `).run(now).changes;
+  },
+  get(id) {
+    return hydratePortalToken(db.prepare(`SELECT * FROM portal_tokens WHERE id = ?`).get(id));
+  },
+  listByLead(lead_id, { limit = 20 } = {}) {
+    return db.prepare(`
+      SELECT * FROM portal_tokens
+      WHERE lead_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit, 20, 100)).map(hydratePortalToken);
+  }
+};
+
+export const customerIntake = {
+  upsert(lead_id, patch = {}) {
+    if (!lead_id) throw new Error('lead_id required');
+    const now = Date.now();
+    const existing = this.get(lead_id);
+    const record = {
+      lead_id,
+      contact_name: stringOrNull(patch.contactName, existing?.contactName),
+      contact_email: stringOrNull(patch.contactEmail, existing?.contactEmail),
+      preferred_phone: stringOrNull(patch.preferredPhone, existing?.preferredPhone),
+      service_area: stringOrNull(patch.serviceArea, existing?.serviceArea),
+      primary_goal: stringOrNull(patch.primaryGoal, existing?.primaryGoal),
+      brand_voice: stringOrNull(patch.brandVoice, existing?.brandVoice),
+      must_have_sections_json: jsonText(arrayOrExisting(patch.mustHaveSections, existing?.mustHaveSections)),
+      asset_urls_json: jsonText(assetArrayOrExisting(patch.assetUrls, existing?.assetUrls)),
+      notes: stringOrNull(patch.notes, existing?.notes),
+      created_at: existing?.created_at || now,
+      updated_at: now
+    };
+    db.prepare(`
+      INSERT INTO customer_intake (
+        lead_id, contact_name, contact_email, preferred_phone, service_area,
+        primary_goal, brand_voice, must_have_sections_json, asset_urls_json,
+        notes, created_at, updated_at
+      ) VALUES (
+        @lead_id, @contact_name, @contact_email, @preferred_phone, @service_area,
+        @primary_goal, @brand_voice, @must_have_sections_json, @asset_urls_json,
+        @notes, @created_at, @updated_at
+      )
+      ON CONFLICT(lead_id) DO UPDATE SET
+        contact_name = excluded.contact_name,
+        contact_email = excluded.contact_email,
+        preferred_phone = excluded.preferred_phone,
+        service_area = excluded.service_area,
+        primary_goal = excluded.primary_goal,
+        brand_voice = excluded.brand_voice,
+        must_have_sections_json = excluded.must_have_sections_json,
+        asset_urls_json = excluded.asset_urls_json,
+        notes = excluded.notes,
+        updated_at = excluded.updated_at
+    `).run(record);
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'portal.intake.updated',
+      lead_id,
+      entity_type: 'customer_intake',
+      entity_id: lead_id,
+      action: 'updated',
+      metadata: { fields: Object.keys(patch || {}) }
+    });
+    return this.get(lead_id);
+  },
+  appendAsset(lead_id, asset) {
+    const existing = this.get(lead_id) || {};
+    const nextAsset = normalizeAsset(asset);
+    const current = Array.isArray(existing.assetUrls) ? existing.assetUrls : [];
+    const assetUrls = nextAsset ? dedupeAssets([...current, nextAsset]) : current;
+    return this.upsert(lead_id, { assetUrls });
+  },
+  get(lead_id) {
+    return hydrateCustomerIntake(db.prepare(`SELECT * FROM customer_intake WHERE lead_id = ?`).get(lead_id));
+  }
+};
+
+export const portalActions = {
+  add({
+    id,
+    lead_id,
+    token_id = null,
+    type,
+    status = 'submitted',
+    related_type = null,
+    related_id = null,
+    body = null,
+    metadata = null,
+    resolved_at = null
+  } = {}) {
+    if (!lead_id) throw new Error('lead_id required');
+    if (!type) throw new Error('portal action type required');
+    const createdAt = Date.now();
+    const actionId = id || portalActionId(type);
+    db.prepare(`
+      INSERT INTO portal_actions (
+        id, lead_id, token_id, type, status, related_type, related_id,
+        body_json, metadata_json, created_at, resolved_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      actionId,
+      lead_id,
+      token_id || null,
+      type,
+      status,
+      related_type || null,
+      related_id || null,
+      jsonText(body),
+      jsonText(metadata),
+      createdAt,
+      resolved_at || null
+    );
+    insertAuditEvent({
+      created_at: createdAt,
+      event_type: `portal.action.${type}`,
+      lead_id,
+      entity_type: 'portal_action',
+      entity_id: actionId,
+      action: status,
+      metadata: { related_type, related_id, body, ...metadata }
+    });
+    insertTrustLedgerEvent({
+      created_at: createdAt,
+      lead_id,
+      event_type: type === 'opt_out' || /opt.?out/i.test(type) ? 'opt_out' : 'portal_token_event',
+      actor: 'customer',
+      channel: 'portal',
+      direction: 'inbound',
+      subject_id: actionId,
+      decision_code: `portal.${type}`,
+      summary: `Customer portal action ${type} was recorded with status ${status}.`,
+      metadata: { token_id, related_type, related_id, body, ...metadata },
+      dedupe_key: `trust_portal_action:${actionId}`
+    });
+    return this.get(actionId);
+  },
+  get(id) {
+    return hydratePortalAction(db.prepare(`SELECT * FROM portal_actions WHERE id = ?`).get(id));
+  },
+  listByLead(lead_id, { limit = 100, type } = {}) {
+    if (type) {
+      return db.prepare(`
+        SELECT * FROM portal_actions
+        WHERE lead_id = ? AND type = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(lead_id, type, limitFor(limit, 100, 500)).map(hydratePortalAction);
+    }
+    return db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE lead_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit, 100, 500)).map(hydratePortalAction);
+  },
+  latest(lead_id, type) {
+    return hydratePortalAction(db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE lead_id = ? AND type = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(lead_id, type));
+  }
+};
+
 export const runs = {
   start({ id, lead_id, worker }) {
     const startedAt = Date.now();
@@ -1587,6 +2285,266 @@ export const runs = {
       return db.prepare(`SELECT * FROM worker_runs WHERE lead_id = ? ORDER BY started_at DESC LIMIT ?`).all(lead_id, limit);
     }
     return db.prepare(`SELECT * FROM worker_runs ORDER BY started_at DESC LIMIT ?`).all(limit);
+  }
+};
+
+export const durableJobs = {
+  enqueue({
+    id,
+    type,
+    payload = {},
+    idempotency_key,
+    runAt = Date.now(),
+    maxAttempts = 5,
+    now = Date.now()
+  } = {}) {
+    if (!type || typeof type !== 'string') throw new Error('job type is required');
+    const jobId = id || jobIdFor(type);
+    const record = {
+      id: jobId,
+      type,
+      payload_json: JSON.stringify(payload || {}),
+      status: 'queued',
+      attempts: 0,
+      max_attempts: boundedJobAttempts(maxAttempts),
+      next_attempt_at: Number.isFinite(runAt) ? Math.trunc(runAt) : now,
+      idempotency_key: idempotency_key || null,
+      created_at: now,
+      updated_at: now
+    };
+    const info = db.prepare(`
+      INSERT OR IGNORE INTO jobs (
+        id, type, payload_json, status, attempts, max_attempts, next_attempt_at,
+        idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        @id, @type, @payload_json, @status, @attempts, @max_attempts, @next_attempt_at,
+        @idempotency_key, @created_at, @updated_at
+      )
+    `).run(record);
+    const row = idempotency_key ? this.getByIdempotency(idempotency_key) : this.get(jobId);
+    return { inserted: info.changes > 0, row: hydrateJob(row) };
+  },
+  get(id) {
+    return db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(id);
+  },
+  getByIdempotency(idempotency_key) {
+    return db.prepare(`SELECT * FROM jobs WHERE idempotency_key = ?`).get(idempotency_key);
+  },
+  list({ status, type, limit = 100 } = {}) {
+    const capped = limitFor(limit, 100, 500);
+    if (status && type) {
+      return db.prepare(`
+        SELECT * FROM jobs
+        WHERE status = ? AND type = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(status, type, capped).map(hydrateJob);
+    }
+    if (status) {
+      return db.prepare(`
+        SELECT * FROM jobs
+        WHERE status = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(status, capped).map(hydrateJob);
+    }
+    if (type) {
+      return db.prepare(`
+        SELECT * FROM jobs
+        WHERE type = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(type, capped).map(hydrateJob);
+    }
+    return db.prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?`).all(capped).map(hydrateJob);
+  },
+  claimNext({ workerId, leaseMs = 5 * 60 * 1000, now = Date.now(), types = [] } = {}) {
+    const typeList = Array.isArray(types) ? types.filter(Boolean) : [];
+    const leaseExpiresAt = now + Math.max(1_000, Number(leaseMs) || 5 * 60 * 1000);
+    const claimOne = db.transaction(() => {
+      const whereTypes = typeList.length ? `AND type IN (${typeList.map(() => '?').join(', ')})` : '';
+      const row = db.prepare(`
+        SELECT * FROM jobs
+        WHERE (
+          (status IN ('queued', 'retry') AND next_attempt_at <= ?)
+          OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+        )
+        ${whereTypes}
+        ORDER BY next_attempt_at ASC, created_at ASC
+        LIMIT 1
+      `).get(now, now, ...typeList);
+      if (!row) return null;
+      const info = db.prepare(`
+        UPDATE jobs
+        SET status = 'running',
+            attempts = attempts + 1,
+            locked_by = ?,
+            locked_at = ?,
+            lease_expires_at = ?,
+            error = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND (
+            (status IN ('queued', 'retry') AND next_attempt_at <= ?)
+            OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+          )
+      `).run(workerId || 'job-worker', now, leaseExpiresAt, now, row.id, now, now);
+      if (info.changes <= 0) return null;
+      return db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(row.id);
+    });
+    return hydrateJob(claimOne());
+  },
+  complete(id, { result, now = Date.now() } = {}) {
+    db.prepare(`
+      UPDATE jobs
+      SET status = 'completed',
+          result_json = ?,
+          error = NULL,
+          locked_by = NULL,
+          locked_at = NULL,
+          lease_expires_at = NULL,
+          updated_at = ?,
+          finished_at = ?
+      WHERE id = ?
+    `).run(result === undefined ? null : JSON.stringify(result), now, now, id);
+    return hydrateJob(this.get(id));
+  },
+  fail(id, {
+    error,
+    result,
+    retryable,
+    now = Date.now(),
+    baseDelayMs = 30_000,
+    maxDelayMs = 15 * 60 * 1000
+  } = {}) {
+    const row = this.get(id);
+    if (!row) return null;
+    const terminal = retryable === false || row.attempts >= row.max_attempts;
+    const retryDelay = terminal ? 0 : retryDelayFor(row.attempts, { baseDelayMs, maxDelayMs });
+    const nextStatus = terminal ? 'failed' : 'retry';
+    db.prepare(`
+      UPDATE jobs
+      SET status = ?,
+          error = ?,
+          result_json = COALESCE(?, result_json),
+          next_attempt_at = ?,
+          locked_by = NULL,
+          locked_at = NULL,
+          lease_expires_at = NULL,
+          updated_at = ?,
+          finished_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END
+      WHERE id = ?
+    `).run(
+      nextStatus,
+      normalizeJobError(error),
+      result === undefined ? null : JSON.stringify(result),
+      now + retryDelay,
+      now,
+      nextStatus,
+      now,
+      id
+    );
+    return hydrateJob(this.get(id));
+  },
+  cancel(id, { reason = 'canceled', now = Date.now() } = {}) {
+    db.prepare(`
+      UPDATE jobs
+      SET status = 'canceled',
+          error = ?,
+          locked_by = NULL,
+          locked_at = NULL,
+          lease_expires_at = NULL,
+          updated_at = ?,
+          finished_at = ?
+      WHERE id = ? AND status NOT IN ('completed', 'failed', 'canceled')
+    `).run(reason, now, now, id);
+    return hydrateJob(this.get(id));
+  },
+  recoverExpiredLeases({ now = Date.now(), limit = 100 } = {}) {
+    const rows = db.prepare(`
+      SELECT * FROM jobs
+      WHERE status = 'running'
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at <= ?
+      ORDER BY lease_expires_at ASC
+      LIMIT ?
+    `).all(now, limitFor(limit, 100, 500));
+    const recover = db.transaction(() => {
+      for (const row of rows) {
+        const terminal = row.attempts >= row.max_attempts;
+        db.prepare(`
+          UPDATE jobs
+          SET status = ?,
+              error = ?,
+              next_attempt_at = ?,
+              locked_by = NULL,
+              locked_at = NULL,
+              lease_expires_at = NULL,
+              updated_at = ?,
+              finished_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END
+          WHERE id = ? AND status = 'running'
+        `).run(
+          terminal ? 'failed' : 'retry',
+          'lease_expired',
+          now,
+          now,
+          terminal ? 'failed' : 'retry',
+          now,
+          row.id
+        );
+      }
+    });
+    recover();
+    return rows.length;
+  },
+  summary({ now = Date.now(), staleAfterMs = 10 * 60 * 1000, recentLimit = 10 } = {}) {
+    const countsByStatus = Object.fromEntries(db.prepare(`
+      SELECT status, COUNT(*) AS n
+      FROM jobs
+      GROUP BY status
+    `).all().map((row) => [row.status, row.n]));
+    const countsByType = Object.fromEntries(db.prepare(`
+      SELECT type, status, COUNT(*) AS n
+      FROM jobs
+      GROUP BY type, status
+      ORDER BY type, status
+    `).all().map((row) => [`${row.type}:${row.status}`, row.n]));
+    const due = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM jobs
+      WHERE status IN ('queued', 'retry') AND next_attempt_at <= ?
+    `).get(now).n;
+    const staleRunning = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM jobs
+      WHERE status = 'running'
+        AND COALESCE(lease_expires_at, locked_at + ?) <= ?
+    `).get(staleAfterMs, now).n;
+    const oldest = db.prepare(`
+      SELECT MIN(created_at) AS oldestQueuedAt, MIN(next_attempt_at) AS nextDueAt
+      FROM jobs
+      WHERE status IN ('queued', 'retry')
+    `).get();
+    const recentFailures = db.prepare(`
+      SELECT id, type, attempts, max_attempts, error, updated_at, finished_at
+      FROM jobs
+      WHERE status IN ('failed', 'retry')
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(limitFor(recentLimit, 10, 100)).map((row) => ({
+      ...row,
+      error: row.error ? operationalErrorSummary(redact(row.error)) : null
+    }));
+    return {
+      countsByStatus,
+      countsByType,
+      due,
+      staleRunning,
+      oldestQueuedAt: oldest?.oldestQueuedAt || null,
+      nextDueAt: oldest?.nextDueAt || null,
+      recentFailures
+    };
   }
 };
 
@@ -1684,6 +2642,72 @@ export const calls = {
   },
   listByLead(lead_id) {
     return db.prepare(`SELECT * FROM calls WHERE lead_id = ? ORDER BY started_at DESC`).all(lead_id);
+  },
+  listStuck({ maxAgeMs = 45 * 60 * 1000, now = Date.now(), limit = 25 } = {}) {
+    const n = Math.max(1, Math.min(Number(limit) || 25, 500));
+    return db.prepare(`
+      SELECT *
+      FROM calls
+      WHERE state IN ('in_progress', 'ringing', 'active')
+        AND started_at < ?
+      ORDER BY started_at ASC
+      LIMIT ?
+    `).all(now - maxAgeMs, n);
+  },
+  recoverStuck({
+    maxAgeMs = 45 * 60 * 1000,
+    now = Date.now(),
+    limit = 25,
+    dryRun = false,
+    outcome = 'failed:stale_recovered'
+  } = {}) {
+    const rows = this.listStuck({ maxAgeMs, now, limit });
+    if (dryRun) {
+      return { dryRun: true, matched: rows.length, recovered: 0, rows };
+    }
+    const transcript = JSON.stringify([
+      {
+        role: 'system',
+        text: `Recovered stale call after ${maxAgeMs}ms without a terminal provider update.`,
+        at: new Date(now).toISOString()
+      }
+    ]);
+    const recover = db.transaction((items) => {
+      let recovered = 0;
+      for (const row of items) {
+        const result = db.prepare(`
+          UPDATE calls
+          SET state = 'ended',
+              outcome = ?,
+              transcript_json = COALESCE(transcript_json, ?),
+              ended_at = ?
+          WHERE id = ?
+            AND state IN ('in_progress', 'ringing', 'active')
+        `).run(outcome, transcript, now, row.id);
+        if (!result.changes) continue;
+        recovered += 1;
+        insertAuditEvent({
+          created_at: now,
+          event_type: 'call.recovered',
+          lead_id: row.lead_id,
+          entity_type: 'call',
+          entity_id: row.id,
+          action: 'recovered',
+          decision_code: 'STALE_CALL_RECOVERED',
+          decision_reason: `Call remained ${row.state} longer than ${maxAgeMs}ms.`,
+          metadata: {
+            previousState: row.state,
+            provider_call_id: row.provider_call_id,
+            started_at: row.started_at,
+            maxAgeMs,
+            outcome
+          },
+          dedupe_key: `call:${row.id}:stale_recovered`
+        });
+      }
+      return recovered;
+    });
+    return { dryRun: false, matched: rows.length, recovered: recover(rows), rows };
   }
 };
 
@@ -1708,16 +2732,32 @@ export const scheduledCalls = {
     return this.get(id);
   },
   markPlacing(id) {
+    const now = Date.now();
     // CAS: only flip a still-pending row. Caller checks info.changes.
     const info = db.prepare(`
-      UPDATE scheduled_calls SET status='placing', fired_at=?, attempts = attempts + 1
+      UPDATE scheduled_calls
+      SET status='placing',
+          fired_at=?,
+          lease_expires_at=?,
+          attempts = attempts + 1
       WHERE id = ? AND status='pending'
-    `).run(Date.now(), id);
+    `).run(now, now + 5 * 60 * 1000, id);
+    return info.changes === 1;
+  },
+  touchPlacing(id, { leaseMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+    const info = db.prepare(`
+      UPDATE scheduled_calls
+      SET fired_at = COALESCE(fired_at, ?),
+          lease_expires_at = ?
+      WHERE id = ? AND status='placing'
+    `).run(now, now + Math.max(1_000, Number(leaseMs) || 5 * 60 * 1000), id);
     return info.changes === 1;
   },
   markPlaced(id, { call_id } = {}) {
     db.prepare(`
-      UPDATE scheduled_calls SET status='placed', placed_call_id = ? WHERE id = ?
+      UPDATE scheduled_calls
+      SET status='placed', placed_call_id = ?, lease_expires_at = NULL
+      WHERE id = ?
     `).run(call_id || null, id);
     const row = this.get(id);
     insertAuditEvent({
@@ -1734,7 +2774,9 @@ export const scheduledCalls = {
   },
   markFailed(id, { reason } = {}) {
     db.prepare(`
-      UPDATE scheduled_calls SET status='failed', failure_reason=? WHERE id = ?
+      UPDATE scheduled_calls
+      SET status='failed', failure_reason=?, lease_expires_at = NULL
+      WHERE id = ?
     `).run(reason || null, id);
     const row = this.get(id);
     insertAuditEvent({
@@ -1752,7 +2794,9 @@ export const scheduledCalls = {
   },
   cancel(id, { reason } = {}) {
     db.prepare(`
-      UPDATE scheduled_calls SET status='canceled', failure_reason=? WHERE id = ? AND status='pending'
+      UPDATE scheduled_calls
+      SET status='canceled', failure_reason=?, lease_expires_at = NULL
+      WHERE id = ? AND status IN ('pending', 'placing')
     `).run(reason || null, id);
     const row = this.get(id);
     if (row?.status === 'canceled') {
@@ -1809,12 +2853,17 @@ export const scheduledCalls = {
     return this.get(id);
   },
   /** Sweep rows stuck in 'placing' for > maxAgeMs back to 'pending' (crash recovery). */
-  recoverStuck({ maxAgeMs = 60_000 } = {}) {
-    const cutoff = Date.now() - maxAgeMs;
+  recoverStuck({ maxAgeMs = 60_000, now = Date.now() } = {}) {
+    const cutoff = now - maxAgeMs;
     const info = db.prepare(`
-      UPDATE scheduled_calls SET status='pending', fired_at=NULL
-      WHERE status='placing' AND fired_at IS NOT NULL AND fired_at < ?
-    `).run(cutoff);
+      UPDATE scheduled_calls
+      SET status='pending', fired_at=NULL, lease_expires_at=NULL
+      WHERE status='placing'
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+          OR (lease_expires_at IS NULL AND fired_at IS NOT NULL AND fired_at < ?)
+        )
+    `).run(now, cutoff);
     return info.changes;
   }
 };
@@ -2716,6 +3765,21 @@ export const callAttempts = {
       metadata: decisionMetadata,
       dedupe_key: `call_attempt_audit:${attemptId}`
     });
+    insertTrustLedgerEvent({
+      created_at: now,
+      lead_id,
+      event_type: 'call_decision',
+      actor: 'compliance',
+      channel: 'phone',
+      direction: 'outbound',
+      subject_id: attemptId,
+      decision_code: code,
+      summary: allowed ? 'Outbound call allowed by compliance gates.' : 'Outbound call blocked by compliance gates.',
+      source_url,
+      disclosure_text: disclosure_text || null,
+      metadata: decisionMetadata,
+      dedupe_key: `trust_call_attempt:${attemptId}`
+    });
     return attemptId;
   },
   countSince({ phone, since }) {
@@ -2727,6 +3791,97 @@ export const callAttempts = {
     return db.prepare(`SELECT COUNT(*) AS n FROM call_attempts WHERE allowed = 1 AND created_at >= ?`).get(start.getTime()).n;
   }
 };
+
+function trustEventForContactEvent({
+  id,
+  lead_id,
+  type,
+  direction,
+  channel,
+  provider_id,
+  thread_id,
+  subject,
+  body,
+  metadata,
+  createdAt
+}) {
+  const meta = metadata || {};
+  const classification = meta.classification || {};
+  const deliveryRisk = meta.deliveryRisk || {};
+  const lowerType = String(type || '').toLowerCase();
+  const lowerChannel = String(channel || '').toLowerCase();
+  const base = {
+    created_at: createdAt,
+    lead_id,
+    actor: lowerChannel || null,
+    channel,
+    direction,
+    subject_id: id,
+    source_url: meta.sourceUrl || meta.source_url || null,
+    metadata: {
+      contactEventId: id,
+      providerId: provider_id || null,
+      threadId: thread_id || null,
+      subject: subject || null,
+      ...meta
+    }
+  };
+
+  const event = (event_type, summary, extra = {}) => ({
+    ...base,
+    event_type,
+    decision_code: extra.decision_code || meta.decisionCode || meta.decision_code || null,
+    summary,
+    dedupe_key: `trust_contact:${id}:${event_type}`,
+    ...extra
+  });
+
+  if (lowerChannel === 'outreach' && lowerType === 'outreach_queued') {
+    return event('why_contacted', body || meta.decisionReason || 'Lead was queued because research found a weak or mixed online-presence gap.');
+  }
+  if (lowerType === 'invoice_consent') {
+    return event('invoice_consent', body || 'Transcript-backed invoice consent was recorded.', {
+      decision_code: meta.decisionCode || 'invoice_consent.transcript_backed'
+    });
+  }
+  if (lowerType === 'invoice_email') {
+    return event('invoice_email_sent', 'Invoice email was sent after the invoice consent gate passed.', {
+      decision_code: meta.decisionCode || 'agentmail.outbound.invoice_email'
+    });
+  }
+  if (lowerChannel === 'portal') {
+    if (/opt.?out/.test(lowerType)) {
+      return event('opt_out', body || 'Customer opted out through the portal.', {
+        decision_code: meta.decisionCode || 'portal.opt_out'
+      });
+    }
+    return event('portal_token_event', body || `Customer portal event: ${type}`, {
+      decision_code: meta.decisionCode || `portal.${lowerType || 'event'}`
+    });
+  }
+  if (classification.kind === 'opt_out' || /opt.?out|unsubscribe|do_not_email|do_not_call/.test(`${lowerType} ${body || ''}`)) {
+    if (direction === 'outbound') {
+      return event('opt_out_confirmation', body || 'Opt-out confirmation was sent.');
+    }
+    return event('opt_out', body || classification.reason || 'Customer requested opt-out.');
+  }
+  if (deliveryRisk.flagged || lowerType === 'customer_reply_flagged') {
+    return event(deliveryRisk.kind === 'complaint' ? 'provider_complaint' : 'provider_flag', deliveryRisk.reason || body || 'Provider flagged the inbound message.', {
+      decision_code: `provider_flag.${deliveryRisk.kind || 'unknown'}`
+    });
+  }
+  if (lowerChannel === 'operator' && (lowerType.includes('opt_out') || lowerType.includes('blocked'))) {
+    return event(lowerType.includes('opt_out') ? 'opt_out' : 'operator_block', body || 'Operator changed trust state.', {
+      decision_code: meta.reasonCode || `operator.${lowerType}`
+    });
+  }
+  if (lowerChannel === 'outreach' && /^autonomy_/.test(lowerType)) {
+    return event('operator_control', body || type, {
+      decision_code: `outreach.${lowerType}`
+    });
+  }
+  return null;
+}
 
 export const contactEvents = {
   add({ id, lead_id, type, direction, channel, provider_id, thread_id, subject, body, metadata }) {
@@ -2783,6 +3938,20 @@ export const contactEvents = {
         dedupe_key: `contact_event_decision:${eventId}`
       });
     }
+    const trustEvent = trustEventForContactEvent({
+      id: eventId,
+      lead_id,
+      type,
+      direction,
+      channel,
+      provider_id,
+      thread_id,
+      subject,
+      body,
+      metadata,
+      createdAt
+    });
+    if (trustEvent) insertTrustLedgerEvent(trustEvent);
     return eventId;
   },
   listByLead(lead_id, { limit = 50 } = {}) {
@@ -2802,6 +3971,195 @@ export const contactEvents = {
       SELECT COUNT(*) AS n FROM contact_events
       WHERE channel = 'agentmail' AND direction = 'inbound' AND type = 'customer_reply'
     `).get().n;
+  }
+};
+
+export const handoffCases = {
+  createOrGet(row) {
+    const now = row.created_at || Date.now();
+    const record = {
+      id: row.id || handoffCaseId(row.category),
+      lead_id: row.lead_id || row.leadId || null,
+      source_type: row.source_type || row.sourceType || 'system',
+      source_id: row.source_id || row.sourceId || null,
+      source_event_id: row.source_event_id || row.sourceEventId || null,
+      source_url: row.source_url || row.sourceUrl || null,
+      severity: normalizeSeverity(row.severity),
+      category: normalizeCaseCode(row.category || 'operator_review'),
+      status: normalizeCaseStatus(row.status || 'open'),
+      assigned_to: row.assigned_to || row.assignedTo || null,
+      summary: cleanCaseText(row.summary || 'Operator review required.'),
+      evidence_json: jsonText(row.evidence || []),
+      recommended_action: cleanCaseText(row.recommended_action || row.recommendedAction || 'Review the evidence and choose the safest operator action.'),
+      copilot_json: jsonText(row.copilot || null),
+      idempotency_key: row.idempotency_key || row.idempotencyKey || null,
+      created_at: now,
+      updated_at: now,
+      resolved_at: row.resolved_at || row.resolvedAt || null
+    };
+    const info = db.prepare(`
+      INSERT OR IGNORE INTO handoff_cases (
+        id, lead_id, source_type, source_id, source_event_id, source_url, severity, category,
+        status, assigned_to, summary, evidence_json, recommended_action, copilot_json,
+        idempotency_key, created_at, updated_at, resolved_at
+      )
+      VALUES (
+        @id, @lead_id, @source_type, @source_id, @source_event_id, @source_url, @severity, @category,
+        @status, @assigned_to, @summary, @evidence_json, @recommended_action, @copilot_json,
+        @idempotency_key, @created_at, @updated_at, @resolved_at
+      )
+    `).run(record);
+    const found = record.idempotency_key ? this.getByIdempotency(record.idempotency_key) : this.get(record.id);
+    if (info.changes > 0) {
+      insertAuditEvent({
+        created_at: now,
+        event_type: 'handoff.case.created',
+        lead_id: record.lead_id,
+        contact_event_id: record.source_event_id,
+        entity_type: 'handoff_case',
+        entity_id: record.id,
+        action: 'created',
+        worker: 'operator',
+        source_url: record.source_url,
+        decision_code: record.category,
+        decision_reason: record.summary,
+        metadata: {
+          source_type: record.source_type,
+          source_id: record.source_id,
+          source_event_id: record.source_event_id,
+          severity: record.severity,
+          category: record.category,
+          status: record.status,
+          recommended_action: record.recommended_action,
+          evidence: row.evidence || [],
+          copilot: row.copilot || null
+        },
+        dedupe_key: `handoff_case:${record.id}:created`
+      });
+    }
+    return { inserted: info.changes > 0, case: found };
+  },
+  get(id) {
+    return parseHandoffCase(db.prepare(`SELECT * FROM handoff_cases WHERE id = ?`).get(id));
+  },
+  getByIdempotency(idempotency_key) {
+    if (!idempotency_key) return null;
+    return parseHandoffCase(db.prepare(`SELECT * FROM handoff_cases WHERE idempotency_key = ?`).get(idempotency_key));
+  },
+  list({ lead_id, status = 'open', category, limit = 80 } = {}) {
+    const clauses = [];
+    const args = [];
+    if (lead_id) {
+      clauses.push('h.lead_id = ?');
+      args.push(lead_id);
+    }
+    if (status && status !== 'all') {
+      if (status === 'open') clauses.push(`h.status NOT IN ('resolved', 'closed')`);
+      else {
+        clauses.push('h.status = ?');
+        args.push(normalizeCaseStatus(status));
+      }
+    }
+    if (category) {
+      clauses.push('h.category = ?');
+      args.push(normalizeCaseCode(category));
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return db.prepare(`
+      SELECT h.*, l.business_name
+      FROM handoff_cases h
+      LEFT JOIN leads l ON l.id = h.lead_id
+      ${where}
+      ORDER BY
+        CASE h.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+        h.updated_at DESC
+      LIMIT ?
+    `).all(...args, limitFor(limit, 80, 500)).map(parseHandoffCase);
+  },
+  listByLead(lead_id, { status = 'all', limit = 80 } = {}) {
+    return this.list({ lead_id, status, limit });
+  },
+  actions(case_id, { limit = 80 } = {}) {
+    return db.prepare(`
+      SELECT * FROM handoff_case_actions
+      WHERE case_id = ?
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(case_id, limitFor(limit, 80, 500)).map(parseHandoffAction);
+  },
+  update(id, patch = {}) {
+    const existing = this.get(id);
+    if (!existing) return null;
+    const now = Date.now();
+    const next = {
+      id,
+      severity: patch.severity ? normalizeSeverity(patch.severity) : existing.severity,
+      category: patch.category ? normalizeCaseCode(patch.category) : existing.category,
+      status: patch.status ? normalizeCaseStatus(patch.status) : existing.status,
+      assigned_to: patch.assigned_to ?? patch.assignedTo ?? existing.assigned_to ?? null,
+      summary: patch.summary ? cleanCaseText(patch.summary) : existing.summary,
+      evidence_json: patch.evidence ? jsonText(patch.evidence) : jsonText(existing.evidence || []),
+      recommended_action: patch.recommended_action || patch.recommendedAction || existing.recommended_action || null,
+      copilot_json: patch.copilot ? jsonText(patch.copilot) : jsonText(existing.copilot || null),
+      updated_at: now,
+      resolved_at: (patch.status === 'resolved' || patch.resolved_at || patch.resolvedAt)
+        ? (patch.resolved_at || patch.resolvedAt || existing.resolved_at || now)
+        : (patch.status && patch.status !== 'resolved' ? null : existing.resolved_at || null)
+    };
+    db.prepare(`
+      UPDATE handoff_cases
+      SET severity = @severity,
+          category = @category,
+          status = @status,
+          assigned_to = @assigned_to,
+          summary = @summary,
+          evidence_json = @evidence_json,
+          recommended_action = @recommended_action,
+          copilot_json = @copilot_json,
+          updated_at = @updated_at,
+          resolved_at = @resolved_at
+      WHERE id = @id
+    `).run(next);
+    return this.get(id);
+  },
+  recordAction({ id, case_id, lead_id, action, actor = 'operator', note, payload }) {
+    const actionId = id || handoffActionId(action);
+    const createdAt = Date.now();
+    const normalizedAction = normalizeCaseCode(action || 'note');
+    db.prepare(`
+      INSERT INTO handoff_case_actions (
+        id, case_id, lead_id, action, actor, note, payload_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(actionId, case_id, lead_id || null, normalizedAction, actor || 'operator', note || null, jsonText(payload || null), createdAt);
+    db.prepare(`UPDATE handoff_cases SET updated_at = ? WHERE id = ?`).run(createdAt, case_id);
+    insertAuditEvent({
+      created_at: createdAt,
+      event_type: `handoff.action.${normalizedAction}`,
+      lead_id,
+      entity_type: 'handoff_case',
+      entity_id: case_id,
+      action: normalizedAction,
+      worker: actor || 'operator',
+      decision_code: normalizedAction,
+      decision_reason: note || null,
+      metadata: { actionId, payload: payload || null },
+      dedupe_key: `handoff_action:${actionId}`
+    });
+    return this.actions(case_id).find((row) => row.id === actionId) || null;
+  },
+  summary() {
+    const rows = db.prepare(`
+      SELECT status, severity, COUNT(*) AS n
+      FROM handoff_cases
+      GROUP BY status, severity
+    `).all();
+    return {
+      total: rows.reduce((sum, row) => sum + row.n, 0),
+      open: rows.filter((row) => !['resolved', 'closed'].includes(row.status)).reduce((sum, row) => sum + row.n, 0),
+      high: rows.filter((row) => ['critical', 'high'].includes(row.severity) && !['resolved', 'closed'].includes(row.status)).reduce((sum, row) => sum + row.n, 0),
+      byStatus: Object.fromEntries(rows.map((row) => [`${row.status}:${row.severity}`, row.n]))
+    };
   }
 };
 
@@ -2870,6 +4228,43 @@ export const auditTrail = {
       ...timelineRows(auditRows, 'audit_event'),
       ...timelineRows(decisionRows, 'compliance_decision')
     ], n);
+  }
+};
+
+export const trustLedger = {
+  add(row) {
+    return insertTrustLedgerEvent(row);
+  },
+  listByLead(lead_id, { limit = 100 } = {}) {
+    const rows = db.prepare(`
+      SELECT * FROM trust_ledger
+      WHERE lead_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit));
+    return trustRows(rows);
+  },
+  recent({ eventType, sinceMs = Date.now() - 24 * 3600 * 1000, limit = 100 } = {}) {
+    const rows = eventType
+      ? db.prepare(`
+          SELECT * FROM trust_ledger
+          WHERE event_type = ? AND created_at >= ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(eventType, sinceMs, limitFor(limit))
+      : db.prepare(`
+          SELECT * FROM trust_ledger
+          WHERE created_at >= ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(sinceMs, limitFor(limit));
+    return trustRows(rows);
+  },
+  countSince(eventType, sinceMs) {
+    return db.prepare(`
+      SELECT COUNT(*) AS n FROM trust_ledger
+      WHERE event_type = ? AND created_at >= ?
+    `).get(eventType, sinceMs).n;
   }
 };
 
@@ -3925,23 +5320,801 @@ export const growthFollowups = {
   }
 };
 
+export const commercePlans = {
+  upsert({
+    id,
+    lead_id,
+    status = 'ready_for_truthful_site',
+    type,
+    intake,
+    plan,
+    risk_count,
+    handoff_required,
+    stripe_mode,
+    idempotency_key
+  }) {
+    const now = Date.now();
+    const record = {
+      id,
+      lead_id,
+      status: status || plan?.status || 'ready_for_truthful_site',
+      type: type || plan?.type || 'quote_request',
+      intake_json: jsonText(intake || plan?.intake || {}),
+      plan_json: jsonText(plan),
+      risk_count: risk_count ?? plan?.riskFlags?.length ?? 0,
+      handoff_required: handoff_required ?? (plan?.humanHandoff?.required ? 1 : 0),
+      stripe_mode: stripe_mode || plan?.stripeBoundary?.mode || null,
+      idempotency_key: idempotency_key || null,
+      generated_at: now,
+      updated_at: now
+    };
+    const existing = record.idempotency_key ? this.getByIdempotency(record.idempotency_key) : null;
+    if (existing) {
+      db.prepare(`
+        UPDATE commerce_plans
+        SET status = @status,
+            type = @type,
+            intake_json = @intake_json,
+            plan_json = @plan_json,
+            risk_count = @risk_count,
+            handoff_required = @handoff_required,
+            stripe_mode = @stripe_mode,
+            updated_at = @updated_at
+        WHERE id = @existing_id
+      `).run({ ...record, existing_id: existing.id });
+      insertAuditEvent({
+        created_at: now,
+        event_type: 'commerce.plan.updated',
+        lead_id,
+        entity_type: 'commerce_plan',
+        entity_id: existing.id,
+        action: 'updated',
+        worker: 'commerce',
+        metadata: {
+          type: record.type,
+          status: record.status,
+          risk_count: record.risk_count,
+          handoff_required: !!record.handoff_required,
+          stripe_mode: record.stripe_mode
+        }
+      });
+      return this.get(existing.id);
+    }
+
+    db.prepare(`
+      INSERT INTO commerce_plans (
+        id, lead_id, status, type, intake_json, plan_json, risk_count, handoff_required,
+        stripe_mode, idempotency_key, generated_at, updated_at
+      )
+      VALUES (
+        @id, @lead_id, @status, @type, @intake_json, @plan_json, @risk_count, @handoff_required,
+        @stripe_mode, @idempotency_key, @generated_at, @updated_at
+      )
+    `).run(record);
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'commerce.plan.created',
+      lead_id,
+      entity_type: 'commerce_plan',
+      entity_id: id,
+      action: 'created',
+      worker: 'commerce',
+      metadata: {
+        type: record.type,
+        status: record.status,
+        risk_count: record.risk_count,
+        handoff_required: !!record.handoff_required,
+        stripe_mode: record.stripe_mode
+      },
+      dedupe_key: `commerce_plan:${id}:created`
+    });
+    return this.get(id);
+  },
+  get(id) {
+    const row = db.prepare(`SELECT * FROM commerce_plans WHERE id = ?`).get(id);
+    return hydrateCommercePlan(row);
+  },
+  getByIdempotency(idempotency_key) {
+    const row = db.prepare(`SELECT * FROM commerce_plans WHERE idempotency_key = ?`).get(idempotency_key);
+    return hydrateCommercePlan(row);
+  },
+  getLatest(lead_id) {
+    const row = db.prepare(`
+      SELECT * FROM commerce_plans
+      WHERE lead_id = ?
+      ORDER BY generated_at DESC, updated_at DESC
+      LIMIT 1
+    `).get(lead_id);
+    return hydrateCommercePlan(row);
+  },
+  listByLead(lead_id, { limit = 20 } = {}) {
+    return db.prepare(`
+      SELECT * FROM commerce_plans
+      WHERE lead_id = ?
+      ORDER BY generated_at DESC, updated_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit, 20, 100)).map(hydrateCommercePlan);
+  },
+  summary() {
+    const rows = db.prepare(`SELECT type, COUNT(*) AS n FROM commerce_plans GROUP BY type`).all();
+    return {
+      total: db.prepare(`SELECT COUNT(*) AS n FROM commerce_plans`).get().n,
+      handoff: db.prepare(`SELECT COUNT(*) AS n FROM commerce_plans WHERE handoff_required = 1`).get().n,
+      paymentSetup: db.prepare(`SELECT COUNT(*) AS n FROM commerce_plans WHERE stripe_mode IN ('operator_checklist','sandbox_mock','operator_live_gate_ready')`).get().n,
+      byType: Object.fromEntries(rows.map((row) => [row.type, row.n]))
+    };
+  }
+};
+
+export const accountManagerPlans = {
+  upsert({
+    id,
+    lead_id,
+    status = 'ready',
+    plan,
+    evidence,
+    risk,
+    idempotency_key
+  }) {
+    const now = Date.now();
+    const record = {
+      id,
+      lead_id,
+      status,
+      plan_json: jsonText(plan),
+      evidence_json: jsonText(evidence || plan?.evidence || []),
+      risk_json: jsonText(risk || plan?.risk || {}),
+      idempotency_key: idempotency_key || null,
+      generated_at: now,
+      updated_at: now
+    };
+    const existing = record.idempotency_key ? this.getByIdempotency(record.idempotency_key) : null;
+    if (existing) {
+      db.prepare(`
+        UPDATE account_manager_plans
+        SET status = @status,
+            plan_json = @plan_json,
+            evidence_json = @evidence_json,
+            risk_json = @risk_json,
+            updated_at = @updated_at
+        WHERE id = @existing_id
+      `).run({ ...record, existing_id: existing.id });
+      insertAuditEvent({
+        created_at: now,
+        event_type: 'account_manager.plan.updated',
+        lead_id,
+        entity_type: 'account_manager_plan',
+        entity_id: existing.id,
+        action: 'updated',
+        worker: 'account_manager',
+        metadata: {
+          task_count: Array.isArray(plan?.tasks) ? plan.tasks.length : 0,
+          risk: risk || plan?.risk || {}
+        }
+      });
+      return this.get(existing.id);
+    }
+
+    db.prepare(`
+      INSERT INTO account_manager_plans (
+        id, lead_id, status, plan_json, evidence_json, risk_json,
+        idempotency_key, generated_at, updated_at
+      )
+      VALUES (
+        @id, @lead_id, @status, @plan_json, @evidence_json, @risk_json,
+        @idempotency_key, @generated_at, @updated_at
+      )
+    `).run(record);
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'account_manager.plan.created',
+      lead_id,
+      entity_type: 'account_manager_plan',
+      entity_id: id,
+      action: 'created',
+      worker: 'account_manager',
+      metadata: {
+        task_count: Array.isArray(plan?.tasks) ? plan.tasks.length : 0,
+        risk: risk || plan?.risk || {}
+      },
+      dedupe_key: `account_manager_plan:${id}:created`
+    });
+    return this.get(id);
+  },
+  get(id) {
+    const row = db.prepare(`SELECT * FROM account_manager_plans WHERE id = ?`).get(id);
+    return hydrateAccountPlan(row);
+  },
+  getByIdempotency(idempotency_key) {
+    const row = db.prepare(`SELECT * FROM account_manager_plans WHERE idempotency_key = ?`).get(idempotency_key);
+    return hydrateAccountPlan(row);
+  },
+  getLatest(lead_id) {
+    const row = db.prepare(`
+      SELECT * FROM account_manager_plans
+      WHERE lead_id = ?
+      ORDER BY generated_at DESC, updated_at DESC
+      LIMIT 1
+    `).get(lead_id);
+    return hydrateAccountPlan(row);
+  },
+  listByLead(lead_id, { limit = 20 } = {}) {
+    return db.prepare(`
+      SELECT * FROM account_manager_plans
+      WHERE lead_id = ?
+      ORDER BY generated_at DESC, updated_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit, 20, 100)).map(hydrateAccountPlan);
+  },
+  summary() {
+    return {
+      total: db.prepare(`SELECT COUNT(*) AS n FROM account_manager_plans`).get().n,
+      ready: db.prepare(`SELECT COUNT(*) AS n FROM account_manager_plans WHERE status = 'ready'`).get().n
+    };
+  }
+};
+
+export const accountTasks = {
+  insertOrUpdate(row) {
+    const now = Date.now();
+    const record = {
+      summary: null,
+      status: 'pending',
+      owner: 'account_manager',
+      evidence_ids: [],
+      preview: null,
+      risk: null,
+      policy: null,
+      completion_notes: null,
+      last_previewed_at: null,
+      sent_at: null,
+      completed_at: null,
+      paused_until: null,
+      provider_id: null,
+      thread_id: null,
+      created_at: now,
+      ...row,
+      updated_at: now
+    };
+    const existing = record.idempotency_key ? this.getByIdempotency(record.idempotency_key) : null;
+    if (existing) {
+      const terminal = ['completed', 'canceled'].includes(existing.status);
+      if (!terminal) {
+        db.prepare(`
+          UPDATE account_tasks
+          SET account_plan_id = COALESCE(@account_plan_id, account_plan_id),
+              kind = @kind,
+              title = @title,
+              summary = @summary,
+              due_at = @due_at,
+              priority = @priority,
+              channel = @channel,
+              evidence_ids_json = @evidence_ids_json,
+              owner = COALESCE(@owner, owner),
+              preview_json = COALESCE(@preview_json, preview_json),
+              risk_json = COALESCE(@risk_json, risk_json),
+              policy_json = COALESCE(@policy_json, policy_json),
+              updated_at = @updated_at
+          WHERE id = @existing_id
+        `).run({
+          ...record,
+          existing_id: existing.id,
+          account_plan_id: record.account_plan_id || null,
+          summary: record.summary || null,
+          owner: record.owner || null,
+          evidence_ids_json: jsonText(record.evidence_ids || []),
+          preview_json: jsonText(record.preview),
+          risk_json: jsonText(record.risk),
+          policy_json: jsonText(record.policy)
+        });
+        addAccountTaskHistory({
+          task_id: existing.id,
+          lead_id: existing.lead_id,
+          actor: 'account_manager',
+          action: 'refreshed',
+          note: 'Task refreshed from latest account-manager plan.',
+          metadata: { accountPlanId: record.account_plan_id || null }
+        });
+      }
+      return { inserted: false, row: this.get(existing.id) };
+    }
+
+    db.prepare(`
+      INSERT INTO account_tasks (
+        id, lead_id, account_plan_id, kind, title, summary, due_at, priority, channel, status,
+        evidence_ids_json, owner, idempotency_key, preview_json, risk_json, policy_json,
+        completion_notes, created_at, updated_at, last_previewed_at, sent_at, completed_at,
+        paused_until, provider_id, thread_id
+      )
+      VALUES (
+        @id, @lead_id, @account_plan_id, @kind, @title, @summary, @due_at, @priority, @channel, @status,
+        @evidence_ids_json, @owner, @idempotency_key, @preview_json, @risk_json, @policy_json,
+        @completion_notes, @created_at, @updated_at, @last_previewed_at, @sent_at, @completed_at,
+        @paused_until, @provider_id, @thread_id
+      )
+    `).run({
+      ...record,
+      account_plan_id: record.account_plan_id || null,
+      summary: record.summary || null,
+      evidence_ids_json: jsonText(record.evidence_ids || []),
+      owner: record.owner || null,
+      idempotency_key: record.idempotency_key || null,
+      preview_json: jsonText(record.preview),
+      risk_json: jsonText(record.risk),
+      policy_json: jsonText(record.policy),
+      completion_notes: record.completion_notes || null,
+      provider_id: record.provider_id || null,
+      thread_id: record.thread_id || null
+    });
+    addAccountTaskHistory({
+      task_id: record.id,
+      lead_id: record.lead_id,
+      actor: 'account_manager',
+      action: 'created',
+      note: 'Task created from account-manager plan.',
+      metadata: { accountPlanId: record.account_plan_id || null, kind: record.kind }
+    });
+    insertAuditEvent({
+      created_at: now,
+      event_type: 'account_manager.task.created',
+      lead_id: record.lead_id,
+      entity_type: 'account_task',
+      entity_id: record.id,
+      action: 'created',
+      worker: 'account_manager',
+      decision_reason: record.summary,
+      metadata: {
+        kind: record.kind,
+        due_at: record.due_at,
+        priority: record.priority,
+        channel: record.channel,
+        owner: record.owner,
+        evidence_ids: record.evidence_ids || []
+      },
+      dedupe_key: `account_task:${record.id}:created`
+    });
+    return { inserted: true, row: this.get(record.id) };
+  },
+  get(id) {
+    const row = db.prepare(`SELECT * FROM account_tasks WHERE id = ?`).get(id);
+    return hydrateAccountTask(row);
+  },
+  getByIdempotency(idempotency_key) {
+    const row = db.prepare(`SELECT * FROM account_tasks WHERE idempotency_key = ?`).get(idempotency_key);
+    return hydrateAccountTask(row);
+  },
+  listByLead(lead_id, { limit = 100, includeHistory = false } = {}) {
+    const rows = db.prepare(`
+      SELECT * FROM account_tasks
+      WHERE lead_id = ?
+      ORDER BY due_at ASC, created_at DESC
+      LIMIT ?
+    `).all(lead_id, limitFor(limit, 100, 500)).map(hydrateAccountTask);
+    if (!includeHistory) return rows;
+    return rows.map((row) => ({ ...row, history: this.history(row.id, { limit: 20 }) }));
+  },
+  listDue({ now = Date.now(), limit = 50, lead_id } = {}) {
+    const n = limitFor(limit, 50, 200);
+    if (lead_id) {
+      return db.prepare(`
+        SELECT * FROM account_tasks
+        WHERE lead_id = ?
+          AND due_at <= ?
+          AND status IN ('pending', 'approved')
+          AND (paused_until IS NULL OR paused_until <= ?)
+        ORDER BY due_at ASC, priority ASC
+        LIMIT ?
+      `).all(lead_id, now, now, n).map(hydrateAccountTask);
+    }
+    return db.prepare(`
+      SELECT * FROM account_tasks
+      WHERE due_at <= ?
+        AND status IN ('pending', 'approved')
+        AND (paused_until IS NULL OR paused_until <= ?)
+      ORDER BY due_at ASC, priority ASC
+      LIMIT ?
+    `).all(now, now, n).map(hydrateAccountTask);
+  },
+  listRecent({ limit = 50 } = {}) {
+    return db.prepare(`
+      SELECT * FROM account_tasks
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(limitFor(limit, 50, 200)).map(hydrateAccountTask);
+  },
+  history(task_id, { limit = 50 } = {}) {
+    return db.prepare(`
+      SELECT * FROM account_task_history
+      WHERE task_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(task_id, limitFor(limit, 50, 200)).map(hydrateAccountTaskHistory);
+  },
+  update(id, patch, { actor = 'operator', action = 'updated', note = null, metadata = null } = {}) {
+    const existing = this.get(id);
+    if (!existing) return null;
+    const allowed = new Set([
+      'status',
+      'owner',
+      'due_at',
+      'priority',
+      'channel',
+      'preview',
+      'risk',
+      'policy',
+      'completion_notes',
+      'last_previewed_at',
+      'sent_at',
+      'completed_at',
+      'paused_until',
+      'provider_id',
+      'thread_id'
+    ]);
+    const cols = Object.keys(patch || {}).filter((key) => allowed.has(key) && patch[key] !== undefined);
+    if (!cols.length) return existing;
+    const values = {
+      id,
+      updated_at: Date.now()
+    };
+    const sets = [];
+    for (const col of cols) {
+      if (col === 'preview') {
+        sets.push('preview_json = @preview_json');
+        values.preview_json = jsonText(patch.preview);
+      } else if (col === 'risk') {
+        sets.push('risk_json = @risk_json');
+        values.risk_json = jsonText(patch.risk);
+      } else if (col === 'policy') {
+        sets.push('policy_json = @policy_json');
+        values.policy_json = jsonText(patch.policy);
+      } else {
+        sets.push(`${col} = @${col}`);
+        values[col] = patch[col] ?? null;
+      }
+    }
+    sets.push('updated_at = @updated_at');
+    db.prepare(`UPDATE account_tasks SET ${sets.join(', ')} WHERE id = @id`).run(values);
+    const row = this.get(id);
+    addAccountTaskHistory({
+      task_id: id,
+      lead_id: existing.lead_id,
+      actor,
+      action,
+      note,
+      metadata: {
+        ...metadata,
+        patch
+      }
+    });
+    insertAuditEvent({
+      created_at: values.updated_at,
+      event_type: `account_manager.task.${action}`,
+      lead_id: existing.lead_id,
+      entity_type: 'account_task',
+      entity_id: id,
+      action,
+      worker: actor,
+      decision_reason: note,
+      metadata: { patch, ...metadata }
+    });
+    return row;
+  },
+  approve(id, { actor = 'operator', note = 'Approved for proactive account-manager send.' } = {}) {
+    return this.update(id, { status: 'approved' }, { actor, action: 'approved', note });
+  },
+  pause(id, { actor = 'operator', note = 'Paused by operator.', pausedUntil = null } = {}) {
+    return this.update(id, {
+      status: 'paused',
+      paused_until: pausedUntil
+    }, { actor, action: 'paused', note, metadata: { pausedUntil } });
+  },
+  complete(id, { actor = 'operator', note = 'Completed by operator.' } = {}) {
+    return this.update(id, {
+      status: 'completed',
+      completion_notes: note,
+      completed_at: Date.now()
+    }, { actor, action: 'completed', note });
+  },
+  reassign(id, { actor = 'operator', owner = 'operator', note = null } = {}) {
+    return this.update(id, { owner }, { actor, action: 'reassigned', note: note || `Reassigned to ${owner}.`, metadata: { owner } });
+  },
+  markPreviewed(id, { preview, policy = null, actor = 'account_manager', note = 'Preview generated.' } = {}) {
+    return this.update(id, {
+      preview,
+      policy,
+      last_previewed_at: Date.now(),
+      status: undefined
+    }, { actor, action: preview?.blocked ? 'blocked' : 'previewed', note, metadata: { policy } });
+  },
+  markSent(id, { provider_id, thread_id, preview, policy = null, actor = 'account_manager' } = {}) {
+    return this.update(id, {
+      status: 'sent',
+      sent_at: Date.now(),
+      provider_id: provider_id || null,
+      thread_id: thread_id || null,
+      preview,
+      policy
+    }, { actor, action: 'sent', note: 'Proactive account-manager message sent.', metadata: { provider_id, thread_id, policy } });
+  },
+  summary() {
+    const rows = db.prepare(`SELECT status, COUNT(*) AS n FROM account_tasks GROUP BY status`).all();
+    return {
+      total: db.prepare(`SELECT COUNT(*) AS n FROM account_tasks`).get().n,
+      due: db.prepare(`SELECT COUNT(*) AS n FROM account_tasks WHERE status IN ('pending','approved') AND due_at <= ?`).get(Date.now()).n,
+      byStatus: Object.fromEntries(rows.map((row) => [row.status, row.n]))
+    };
+  }
+};
+
 export const providerSmoke = {
-  set(provider, status, detail = {}) {
+  set(provider, status, detail = {}, options = {}) {
+    const checkedAt = Number.isFinite(Number(options.checkedAt)) ? Number(options.checkedAt) : Date.now();
+    const durationMs = optionalMs(options.durationMs ?? detail?.durationMs ?? detail?.latencyMs ?? detail?.elapsedMs);
+    const safeDetail = redact(detail);
+    const error = redact(providerSmokeError(status, detail, options));
     db.prepare(`
       INSERT INTO provider_smoke (provider, status, detail_json, checked_at)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(provider) DO UPDATE SET status = excluded.status, detail_json = excluded.detail_json, checked_at = excluded.checked_at
-    `).run(provider, status, JSON.stringify(detail), Date.now());
+    `).run(provider, status, jsonText(safeDetail), checkedAt);
+    insertProviderHealthEvent({ provider, status, detail: safeDetail, checkedAt, durationMs, error });
+  },
+  recordEvent(provider, status, detail = {}, options = {}) {
+    const checkedAt = Number.isFinite(Number(options.checkedAt)) ? Number(options.checkedAt) : Date.now();
+    const durationMs = optionalMs(options.durationMs ?? detail?.durationMs ?? detail?.latencyMs ?? detail?.elapsedMs);
+    const safeDetail = redact(detail);
+    const error = redact(providerSmokeError(status, detail, options));
+    insertProviderHealthEvent({ provider, status, detail: safeDetail, checkedAt, durationMs, error });
   },
   all() {
     const rows = db.prepare(`SELECT * FROM provider_smoke ORDER BY provider`).all();
     return Object.fromEntries(rows.map((r) => [r.provider, { status: r.status, checkedAt: r.checked_at, detail: safeJson(r.detail_json) }]));
+  },
+  latestEvent({ provider, dryRun = null, live = null, statuses = [] } = {}) {
+    if (!provider) return null;
+    const where = ['provider = ?'];
+    const params = [provider];
+    if (dryRun !== null) {
+      where.push('dry_run = ?');
+      params.push(dryRun ? 1 : 0);
+    }
+    if (live !== null) {
+      where.push('live = ?');
+      params.push(live ? 1 : 0);
+    }
+    if (Array.isArray(statuses) && statuses.length) {
+      where.push(`status IN (${statuses.map(() => '?').join(', ')})`);
+      params.push(...statuses);
+    }
+    const row = db.prepare(`
+      SELECT id, provider, status, detail_json, dry_run, live, duration_ms, error, checked_at
+      FROM provider_health_events
+      WHERE ${where.join(' AND ')}
+      ORDER BY checked_at DESC, id DESC
+      LIMIT 1
+    `).get(...params);
+    return row ? providerHealthEventFromRow(row) : null;
+  },
+  events({ provider = null, since = 0, limit = 100 } = {}) {
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
+    const checkedSince = Math.max(0, Number(since) || 0);
+    const params = [checkedSince];
+    let where = 'checked_at >= ?';
+    if (provider) {
+      where += ' AND provider = ?';
+      params.push(provider);
+    }
+    return db.prepare(`
+      SELECT id, provider, status, detail_json, dry_run, live, duration_ms, error, checked_at
+      FROM provider_health_events
+      WHERE ${where}
+      ORDER BY checked_at DESC
+      LIMIT ?
+    `).all(...params, cappedLimit).map(providerHealthEventFromRow);
+  },
+  issues({ since = 0, limit = 100 } = {}) {
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
+    const checkedSince = Math.max(0, Number(since) || 0);
+    return db.prepare(`
+      SELECT id, provider, status, detail_json, dry_run, live, duration_ms, error, checked_at
+      FROM provider_health_events
+      WHERE checked_at >= ?
+        AND (status IN ('failed', 'blocked', 'degraded') OR error IS NOT NULL)
+      ORDER BY checked_at DESC
+      LIMIT ?
+    `).all(checkedSince, cappedLimit).map(providerHealthEventFromRow);
+  },
+  historySummary({ since = Date.now() - 24 * 3600 * 1000 } = {}) {
+    const checkedSince = Math.max(0, Number(since) || 0);
+    const rows = db.prepare(`
+      SELECT provider,
+             COUNT(*) AS total,
+             SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_count,
+             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+             SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked_count,
+             SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END) AS degraded_count,
+             SUM(CASE WHEN live = 1 THEN 1 ELSE 0 END) AS live_count,
+             SUM(CASE WHEN dry_run = 1 THEN 1 ELSE 0 END) AS dry_run_count,
+             AVG(duration_ms) AS avg_duration_ms,
+             MAX(checked_at) AS last_checked_at
+      FROM provider_health_events
+      WHERE checked_at >= ?
+      GROUP BY provider
+      ORDER BY provider
+    `).all(checkedSince);
+    const current = this.all();
+    const latestErrors = db.prepare(`
+      SELECT provider, error
+      FROM provider_health_events
+      WHERE checked_at >= ? AND error IS NOT NULL
+      ORDER BY checked_at DESC
+    `).all(checkedSince);
+    const errorByProvider = new Map();
+    for (const row of latestErrors) {
+      if (!errorByProvider.has(row.provider)) errorByProvider.set(row.provider, row.error);
+    }
+    return rows.map((row) => ({
+      provider: row.provider,
+      currentStatus: current[row.provider]?.status || null,
+      total: row.total,
+      okCount: row.ok_count || 0,
+      failedCount: row.failed_count || 0,
+      blockedCount: row.blocked_count || 0,
+      degradedCount: row.degraded_count || 0,
+      liveCount: row.live_count || 0,
+      dryRunCount: row.dry_run_count || 0,
+      avgDurationMs: row.avg_duration_ms === null || row.avg_duration_ms === undefined ? null : Math.round(row.avg_duration_ms),
+      lastCheckedAt: row.last_checked_at || null,
+      lastError: errorByProvider.get(row.provider) || null
+    }));
   }
 };
+
+function insertProviderHealthEvent({ provider, status, detail = {}, checkedAt, durationMs = null, error = null }) {
+  db.prepare(`
+    INSERT INTO provider_health_events (
+      id, provider, status, detail_json, dry_run, live, duration_ms, error, checked_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    `phealth_${checkedAt.toString(36)}_${randomBytes(4).toString('hex')}`,
+    provider,
+    status,
+    jsonText(detail),
+    detail?.dryRun === true ? 1 : 0,
+    detail?.live === true ? 1 : 0,
+    durationMs,
+    error,
+    checkedAt
+  );
+}
+
+function providerHealthEventFromRow(row) {
+  return {
+    id: row.id,
+    provider: row.provider,
+    status: row.status,
+    detail: safeJson(row.detail_json) || {},
+    dryRun: row.dry_run === 1,
+    live: row.live === 1,
+    durationMs: row.duration_ms,
+    error: row.error || null,
+    checkedAt: row.checked_at
+  };
+}
+
+function optionalMs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+function providerSmokeError(status, detail = {}, options = {}) {
+  const value = options.error ?? detail?.error ?? detail?.lastError;
+  if (value) return value instanceof Error ? value.message : String(value);
+  if (['failed', 'blocked'].includes(status) && detail?.skipped) return String(detail.skipped);
+  return null;
+}
+
+export const safeToSellReports = {
+  record(report = {}, { id, now = Date.now() } = {}) {
+    const generatedAt = Number.isFinite(Date.parse(report.generatedAt)) ? Date.parse(report.generatedAt) : now;
+    const rowId = id || `safe_${now.toString(36)}_${randomBytes(4).toString('hex')}`;
+    const redactedReport = redact({
+      ...report,
+      decisionReceipt: {
+        ...(report.decisionReceipt || {}),
+        snapshotId: rowId,
+        durable: true
+      }
+    });
+    const row = {
+      id: rowId,
+      ok: report.ok ? 1 : 0,
+      mode: report.mode || null,
+      command: report.command || null,
+      dry_run_count: Array.isArray(report.dryRunVerified) ? report.dryRunVerified.length : 0,
+      live_smoke_count: Array.isArray(report.liveSmokeVerified) ? report.liveSmokeVerified.length : 0,
+      blocker_count: Array.isArray(report.stillBlocked) ? report.stillBlocked.length : 0,
+      report_json: jsonText(redactedReport) || '{}',
+      generated_at: generatedAt,
+      created_at: now
+    };
+    db.prepare(`
+      INSERT INTO safe_to_sell_reports (
+        id, ok, mode, command, dry_run_count, live_smoke_count, blocker_count, report_json, generated_at, created_at
+      )
+      VALUES (
+        @id, @ok, @mode, @command, @dry_run_count, @live_smoke_count, @blocker_count, @report_json, @generated_at, @created_at
+      )
+    `).run(row);
+    return hydrateSafeToSellReport(row);
+  },
+  latest() {
+    return hydrateSafeToSellReport(db.prepare(`
+      SELECT *
+      FROM safe_to_sell_reports
+      ORDER BY generated_at DESC, created_at DESC
+      LIMIT 1
+    `).get());
+  },
+  list({ since = 0, limit = 25 } = {}) {
+    const checkedSince = Math.max(0, Number(since) || 0);
+    const capped = limitFor(limit, 25, 200);
+    return db.prepare(`
+      SELECT *
+      FROM safe_to_sell_reports
+      WHERE generated_at >= ?
+      ORDER BY generated_at DESC, created_at DESC
+      LIMIT ?
+    `).all(checkedSince, capped).map(hydrateSafeToSellReport);
+  },
+  summary({ since = Date.now() - 24 * 3600 * 1000, limit = 10 } = {}) {
+    const checkedSince = Math.max(0, Number(since) || 0);
+    const counts = db.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_count,
+             SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS blocked_count,
+             MAX(generated_at) AS last_generated_at
+      FROM safe_to_sell_reports
+      WHERE generated_at >= ?
+    `).get(checkedSince);
+    return {
+      total: counts?.total || 0,
+      okCount: counts?.ok_count || 0,
+      blockedCount: counts?.blocked_count || 0,
+      lastGeneratedAt: counts?.last_generated_at || null,
+      latest: this.latest(),
+      recent: this.list({ since: checkedSince, limit })
+    };
+  }
+};
+
+function hydrateSafeToSellReport(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    ok: row.ok === 1,
+    mode: row.mode,
+    command: row.command,
+    dryRunCount: row.dry_run_count,
+    liveSmokeCount: row.live_smoke_count,
+    blockerCount: row.blocker_count,
+    generatedAt: row.generated_at,
+    createdAt: row.created_at,
+    report: safeJson(row.report_json) || {}
+  };
+}
 
 export const webhookEvents = {
   seen(provider, event_id) {
     return !!db.prepare(`SELECT 1 FROM webhook_events WHERE provider = ? AND event_id = ?`).get(provider, event_id);
+  },
+  lastReceived(provider) {
+    return db.prepare(`
+      SELECT MAX(received_at) AS received_at
+      FROM webhook_events
+      WHERE provider = ?
+    `).get(provider)?.received_at || null;
   },
   record({ provider, event_id, type, payload }) {
     const receivedAt = Date.now();
@@ -4033,8 +6206,157 @@ function parseReasoningTrace(row) {
   };
 }
 
+function parseHandoffCase(row) {
+  if (!row) return null;
+  const parsed = {
+    ...row,
+    evidence: safeJson(row.evidence_json) || [],
+    copilot: safeJson(row.copilot_json) || null,
+    actions: handoffCases.actions(row.id)
+  };
+  parsed.businessName = row.business_name || null;
+  return parsed;
+}
+
+function parseHandoffAction(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    payload: safeJson(row.payload_json) || null
+  };
+}
+
+function handoffCaseId(category) {
+  const safe = normalizeCaseCode(category || 'case').slice(0, 36);
+  return `handoff_${safe}_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+}
+
+function handoffActionId(action) {
+  const safe = normalizeCaseCode(action || 'action').slice(0, 36);
+  return `handoff_action_${safe}_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+}
+
+function normalizeCaseCode(value) {
+  return String(value || 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96) || 'unknown';
+}
+
+function normalizeSeverity(value) {
+  const text = normalizeCaseCode(value);
+  if (['critical', 'high', 'medium', 'low'].includes(text)) return text;
+  return 'medium';
+}
+
+function normalizeCaseStatus(value) {
+  const text = normalizeCaseCode(value);
+  if ([
+    'open',
+    'needs_operator',
+    'operator_reply_sent',
+    'paused',
+    'assigned',
+    'in_progress',
+    'resolved',
+    'closed'
+  ].includes(text)) return text;
+  return 'open';
+}
+
+function cleanCaseText(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 2000);
+}
+
 function safeJson(text) {
   try { return text ? JSON.parse(text) : null; } catch { return null; }
+}
+
+function hydrateJob(row) {
+  if (!row) return null;
+  const hydrated = {
+    ...row,
+    payload: safeJson(row.payload_json) || {},
+    result: safeJson(row.result_json)
+  };
+  delete hydrated.payload_json;
+  delete hydrated.result_json;
+  return hydrated;
+}
+
+function jobIdFor(type) {
+  const safe = String(type || 'job').replace(/[^a-zA-Z0-9_]+/g, '_').slice(0, 40);
+  return `job_${safe}_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+}
+
+function boundedJobAttempts(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 5;
+  return Math.max(1, Math.min(25, Math.trunc(n)));
+}
+
+function retryDelayFor(attempts, { baseDelayMs, maxDelayMs }) {
+  const n = Math.max(1, Number(attempts) || 1);
+  const base = Math.max(1_000, Number(baseDelayMs) || 30_000);
+  const max = Math.max(base, Number(maxDelayMs) || 15 * 60 * 1000);
+  return Math.min(max, base * (2 ** Math.min(8, n - 1)));
+}
+
+function normalizeJobError(error) {
+  if (!error) return null;
+  if (typeof error === 'string') return error.slice(0, 4000);
+  if (error instanceof Error) return `${error.name || 'Error'}: ${error.message}`.slice(0, 4000);
+  try { return JSON.stringify(error).slice(0, 4000); } catch { return String(error).slice(0, 4000); }
+}
+
+function addAccountTaskHistory({ task_id, lead_id, actor = 'system', action, note = null, metadata = null }) {
+  db.prepare(`
+    INSERT INTO account_task_history (task_id, lead_id, created_at, actor, action, note, metadata_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(task_id, lead_id, Date.now(), actor, action, note || null, jsonText(metadata));
+}
+
+function hydrateCommercePlan(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    handoff_required: Boolean(row.handoff_required),
+    intake: safeJson(row.intake_json) || {},
+    plan: safeJson(row.plan_json) || null
+  };
+}
+
+function hydrateAccountPlan(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    plan: safeJson(row.plan_json) || null,
+    evidence: safeJson(row.evidence_json) || [],
+    risk: safeJson(row.risk_json) || {}
+  };
+}
+
+function hydrateAccountTask(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    evidenceIds: safeJson(row.evidence_ids_json) || [],
+    preview: safeJson(row.preview_json) || null,
+    risk: safeJson(row.risk_json) || null,
+    policy: safeJson(row.policy_json) || null
+  };
+}
+
+function hydrateAccountTaskHistory(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    metadata: safeJson(row.metadata_json) || null
+  };
 }
 
 function paymentIdForStripe(stripeId) {
@@ -4058,9 +6380,101 @@ function qaIdFor({ build_id, attempt }) {
   return `qa_${safeBuild}_${attempt}`;
 }
 
+function portalTokenId() {
+  return `ptok_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
+}
+
+function portalTokenValue() {
+  return `pt_${randomBytes(32).toString('base64url')}`;
+}
+
+function portalActionId(type = 'action') {
+  const safeType = String(type || 'action').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 36);
+  return `pact_${safeType}_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+}
+
+function stringOrNull(value, fallback = null) {
+  if (value === undefined) return fallback ?? null;
+  if (value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed || null;
+}
+
+function arrayOrExisting(value, fallback = []) {
+  if (value === undefined) return Array.isArray(fallback) ? fallback : [];
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  return raw.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 20);
+}
+
+function assetArrayOrExisting(value, fallback = []) {
+  if (value === undefined) return Array.isArray(fallback) ? fallback : [];
+  const raw = Array.isArray(value) ? value : [value];
+  return dedupeAssets(raw);
+}
+
+function normalizeAsset(asset) {
+  if (!asset) return null;
+  const raw = typeof asset === 'string' ? { url: asset } : asset;
+  const url = String(raw.url || raw.href || '').trim();
+  if (!url) return null;
+  return {
+    url,
+    label: String(raw.label || raw.name || 'Customer asset').trim().slice(0, 120),
+    notes: String(raw.notes || raw.note || '').trim().slice(0, 500),
+    addedAt: raw.addedAt || Date.now()
+  };
+}
+
+function dedupeAssets(assets) {
+  const seen = new Set();
+  const out = [];
+  for (const asset of assets.map(normalizeAsset).filter(Boolean)) {
+    const key = asset.url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(asset);
+  }
+  return out.slice(-30);
+}
+
 function revisionIdFor({ build_id, attempt }) {
   const safeBuild = String(build_id || 'build').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 54);
   return `rev_${safeBuild}_${attempt}`;
+}
+
+function hydratePortalToken(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    metadata: safeJson(row.metadata_json) || null
+  };
+}
+
+function hydrateCustomerIntake(row) {
+  if (!row) return null;
+  return {
+    leadId: row.lead_id,
+    contactName: row.contact_name || '',
+    contactEmail: row.contact_email || '',
+    preferredPhone: row.preferred_phone || '',
+    serviceArea: row.service_area || '',
+    primaryGoal: row.primary_goal || '',
+    brandVoice: row.brand_voice || '',
+    mustHaveSections: safeJson(row.must_have_sections_json) || [],
+    assetUrls: safeJson(row.asset_urls_json) || [],
+    notes: row.notes || '',
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function hydratePortalAction(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    body: safeJson(row.body_json),
+    metadata: safeJson(row.metadata_json)
+  };
 }
 
 function hydrateHook(row) {

@@ -28,6 +28,17 @@ async function call(method, path, body) {
 
 const ACTIVE_STATUSES = new Set(['queued', 'starting', 'running', 'idle']);
 
+function scoreValue(score) {
+  if (score == null) return null;
+  if (typeof score === 'number') return score;
+  const value = Number(score.score);
+  return Number.isFinite(value) ? value : null;
+}
+
+function claimText(item) {
+  return item?.summary || item?.claim || item?.title || '';
+}
+
 function mergeSessionInto(prev, evt) {
   const existing = prev.find((s) => s.id === evt.sessionId);
   const merged = {
@@ -72,6 +83,11 @@ function mergeBusinessInto(prev, evt) {
         skipped: b.skipped && !!evt.skipped,
         skippedReason: b.skippedReason || evt.skippedReason || null,
         presenceStrength: b.presenceStrength || evt.presenceStrength || null,
+        callOpener: b.callOpener || evt.callOpener || null,
+        reviewThemes: b.reviewThemes?.length ? b.reviewThemes : (evt.reviewThemes || []),
+        competitorGaps: b.competitorGaps?.length ? b.competitorGaps : (evt.competitorGaps || []),
+        currentWebsiteIssues: b.currentWebsiteIssues?.length ? b.currentWebsiteIssues : (evt.currentWebsiteIssues || []),
+        scores: b.scores || evt.scores || null,
         sources,
         flashTs: Date.now()
       };
@@ -88,6 +104,11 @@ function mergeBusinessInto(prev, evt) {
       presenceStrength: evt.presenceStrength || null,
       skipped: !!evt.skipped,
       skippedReason: evt.skippedReason || null,
+      callOpener: evt.callOpener || null,
+      reviewThemes: evt.reviewThemes || [],
+      competitorGaps: evt.competitorGaps || [],
+      currentWebsiteIssues: evt.currentWebsiteIssues || [],
+      scores: evt.scores || null,
       sources: [sourcePatch],
       services: [],
       socialUrls: [],
@@ -376,19 +397,27 @@ export default function BrowserResearchConsole() {
         </div>
         {visibleBusinesses.slice(0, 16).map((business) => {
           const flashing = business.flashTs && Date.now() - business.flashTs < 4000;
+          const totalScore = scoreValue(business.scores?.totalScore);
+          const presenceScore = scoreValue(business.scores?.presenceWeakness);
+          const firstTheme = claimText((business.reviewThemes || [])[0]);
+          const firstGap = claimText((business.competitorGaps || [])[0]) || claimText((business.currentWebsiteIssues || [])[0]);
           return (
             <div className={`brc-row ${business.skipped ? 'brc-row-skipped' : ''} ${flashing ? 'brc-row-flash' : ''}`} key={business.businessName}>
               <div>
                 <strong>{business.businessName}</strong>
                 <small>{business.address || 'address pending'}</small>
+                {business.callOpener ? <small className="brc-opener">"{business.callOpener}"</small> : null}
               </div>
               <div className="mono">
                 <span className={`brc-presence brc-presence-${business.presenceStrength}`}>{business.presenceStrength || 'unknown'}</span>
+                {totalScore != null ? <small>fit score {totalScore}/100</small> : null}
+                {presenceScore != null ? <small>weakness {presenceScore}/100</small> : null}
                 {business.skippedReason ? <small>{business.skippedReason.replaceAll('_', ' ')}</small> : null}
               </div>
               <div className="mono">
                 {(business.sources || []).length} source{(business.sources || []).length === 1 ? '' : 's'}
-                <small>{(business.services || []).slice(0, 2).join(' · ') || 'services pending'}</small>
+                <small>{firstTheme || (business.services || []).slice(0, 2).join(' · ') || 'services pending'}</small>
+                {firstGap ? <small className="brc-gap">{firstGap}</small> : null}
               </div>
               <div className="mono">
                 {business.phone || 'phone pending'}
@@ -604,6 +633,11 @@ const styles = `
 }
 .brc-row strong { color: var(--ink-100); font-size: 12px; }
 .brc-row small { color: var(--ink-400); font-size: 10px; margin-top: 2px; }
+.brc-row .brc-opener {
+  color: var(--ink-300);
+  font-style: italic;
+}
+.brc-row .brc-gap { color: var(--warn); }
 .brc-row-skipped { opacity: 0.75; }
 .brc-row-flash {
   background: rgba(46, 160, 67, 0.12);

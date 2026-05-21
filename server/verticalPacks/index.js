@@ -118,8 +118,11 @@ export function applyPackToPitch(pitch, pack) {
 
   // 1. Tonal hook: weave the pack's hook into the value prop without losing
   // the call-script's own concrete signal text.
+  const packPriceCents = Number.isFinite(pack.priceCents) ? pack.priceCents : null;
   if (pack.valuePropHook) {
-    next.valueProp = mergeText(pitch.valueProp, pack.valuePropHook);
+    next.valueProp = mergeText(rewriteTextForPrice(pitch.valueProp, packPriceCents), pack.valuePropHook);
+  } else if (packPriceCents) {
+    next.valueProp = rewriteTextForPrice(pitch.valueProp, packPriceCents);
   }
 
   // 2. Objections: pack first, then existing pitch objections (deduped),
@@ -140,8 +143,8 @@ export function applyPackToPitch(pitch, pack) {
 
   // 3. Close: include the pack price so the dollar figure in the close
   // matches what the invoice will actually charge.
-  if (Number.isFinite(pack.priceCents) && typeof pitch.close === 'string') {
-    next.close = rewriteCloseForPrice(pitch.close, pack.priceCents);
+  if (packPriceCents && typeof pitch.close === 'string') {
+    next.close = rewriteCloseForPrice(pitch.close, packPriceCents);
   }
 
   return next;
@@ -161,6 +164,8 @@ function normalizePack(data) {
     objections: Array.isArray(data.objections)
       ? data.objections.filter((o) => o && typeof o === 'object' && o.objection && o.response)
       : [],
+    objectionMap: data.objectionMap && typeof data.objectionMap === 'object' ? data.objectionMap : {},
+    reviewValueProps: Array.isArray(data.reviewValueProps) ? data.reviewValueProps.map((v) => String(v)).filter(Boolean).slice(0, 8) : [],
     siteTemplateHint: data.siteTemplateHint || '',
     customerPersonaHint: data.customerPersonaHint || ''
   };
@@ -201,7 +206,7 @@ function dedupeObjections(items) {
 function padObjection(entry, pack) {
   const objection = padToMinLength(entry?.objection, MIN_OBJECTION_LENGTH, 'No thanks.');
   const response = padToMinLength(
-    entry?.response,
+    rewriteTextForPrice(entry?.response, pack?.priceCents),
     MIN_RESPONSE_LENGTH,
     `Totally fair. ${pack?.valuePropHook || 'The offer is one flat fee, hosted, with no monthly cost.'}`
   );
@@ -229,15 +234,24 @@ function mergeText(base, addition) {
 function rewriteCloseForPrice(close, priceCents) {
   const text = String(close || '').replace(/\s+/g, ' ').trim();
   if (!text) return text;
+  const rewritten = rewriteTextForPrice(text, priceCents);
+  if (rewritten !== text) return rewritten;
   const dollars = Math.round(priceCents / 100);
-  const dollarPattern = /\$\s*\d{1,5}(?:[.,]\d{2})?/g;
-  if (dollarPattern.test(text)) {
-    return text.replace(dollarPattern, `$${dollars}`);
-  }
   // No dollar amount in close — append the price phrase without breaking
   // the existing call-to-action language.
   const sep = /[.!?]$/.test(text) ? ' ' : '. ';
   return `${text}${sep}The flat fee is $${dollars}.`;
+}
+
+function rewriteTextForPrice(value, priceCents) {
+  if (!Number.isFinite(priceCents)) return value;
+  const text = value == null ? '' : String(value);
+  if (!text) return text;
+  const dollars = Math.round(priceCents / 100);
+  const replacement = `$${dollars}`;
+  return text
+    .replace(/\$\s*\d{1,5}(?:[.,]\d{2})?/g, replacement)
+    .replace(/\b(?:four|five|six)\s+hundred\b/gi, replacement);
 }
 
 // Test-only helper: clears the in-memory cache so unit tests can rerun

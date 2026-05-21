@@ -38,6 +38,10 @@ const {
 const { emit } = await import('../server/sse.js');
 const { recordPaidPayment } = await import('../server/paymentFlow.js');
 const { handleAgentMailInbound } = await import('../server/workers/mailer.js');
+const { ensurePortalTokenForLead } = await import('../server/customerPortal.js');
+const { runBuilder } = await import('../server/workers/builder.js');
+const { approveLaunch } = await import('../server/customerPortal.js');
+const { buildQaReadModel } = await import('../server/fulfillment/hooks/index.js');
 
 const demo = await seedLifecycle();
 
@@ -48,7 +52,7 @@ if (args.build) {
 
 let uiVerification = null;
 if (args.verifyUi) {
-  uiVerification = await verifyUiPath({ leadId: demo.leadId, dataDir, allowLiveEnv });
+  uiVerification = await verifyUiPath({ leadId: demo.leadId, portalToken: demo.portalToken, dataDir, allowLiveEnv });
 }
 
 const summary = {
@@ -57,6 +61,8 @@ const summary = {
   dataDir,
   leadId: demo.leadId,
   leadUrl: uiVerification ? `${uiVerification.baseUrl}` : null,
+  portalPath: demo.portalPath,
+  portalUrl: uiVerification ? `${uiVerification.baseUrl}${demo.portalPath}` : demo.portalPath,
   invoiceUrl: demo.invoiceUrl,
   agentmailThreadId: demo.threadId,
   inboundReplyEventId: demo.inboundReplyEventId,
@@ -64,6 +70,10 @@ const summary = {
   stripeEventId: demo.stripeEventId,
   liveBuildUrl: demo.liveUrl,
   projectUrl: demo.projectUrl,
+  launchStatus: demo.launchStatus,
+  qaScore: demo.qaScore,
+  qaErrors: demo.qaErrors,
+  launchChecklistStatus: demo.launchChecklistStatus,
   uiVerification,
   commandsRun
 };
@@ -86,13 +96,13 @@ async function seedLifecycle() {
     hasWebsite: false,
     websiteUrl: null,
     onlinePresenceStrength: 'weak',
-    onlinePresenceSummary: 'Google and Yelp listings exist, but there is no owned website for service areas, emergency repair, financing, or booking.',
+    onlinePresenceSummary: 'Google and Yelp listings exist, but there is no owned website for service areas, seasonal tuneups, replacement inquiries, or a clear contact path.',
     ownerHypothesis: 'Maria Luna, owner-operator',
-    customerPersona: 'Homeowners who need same-day repair and want proof the crew is local and insured.',
-    hours: 'Mon-Sat 7am-7pm; emergency calls by request',
+    customerPersona: 'Homeowners who need clear repair options and want proof the crew serves their neighborhood.',
+    hours: 'Mon-Sat 7am-7pm; urgent calls by request',
     whatTheyDo: 'Residential HVAC repair, seasonal tuneups, and furnace replacement.',
-    needs: ['owned service page', 'tap-to-call mobile CTA', 'emergency repair copy', 'trust proof', 'simple quote request'],
-    signals: ['weak owned presence', 'phone-forward business', 'reviews mention fast repair', 'no booking page'],
+    needs: ['owned service page', 'tap-to-call mobile CTA', 'repair and tuneup copy', 'trust proof', 'simple quote request'],
+    signals: ['weak owned presence', 'phone-forward business', 'listings mention responsive repair', 'no owned contact page'],
     bestContactEmail: invoiceEmail,
     yelpUrl: 'https://example.test/luna-ridge-hvac-yelp',
     sourceUrl: 'https://example.test/luna-ridge-hvac'
@@ -114,7 +124,8 @@ async function seedLifecycle() {
     consent_status: 'operator_demo',
     phone_classification: 'business',
     next_action: 'call',
-    source_url: profile.sourceUrl
+    source_url: profile.sourceUrl,
+    research_json: JSON.stringify(profile)
   });
   const leadId = insertResult.lead.id;
   const containerTag = insertResult.lead.container_tag;
@@ -221,7 +232,7 @@ async function seedLifecycle() {
     ],
     invoiceEmail,
     confirmedEmail: true,
-    customerQuestions: ['Can it show emergency repair?', 'Can customers call from mobile?'],
+    customerQuestions: ['Can it show repair and tuneup services?', 'Can customers call from mobile?'],
     followupEmailDraft: 'Thanks for the quick call. The invoice is below; once paid, we will start the Luna Ridge HVAC site with mobile call CTAs, service areas, and trust proof.'
   };
 
@@ -274,7 +285,7 @@ async function seedLifecycle() {
   const emailBody = [
     'Hi Maria,',
     '',
-    'Thanks for the quick call. The invoice is below. Once it is paid, we will start the Luna Ridge HVAC site with emergency repair copy, mobile call CTAs, service areas, and trust proof.',
+    'Thanks for the quick call. The invoice is below. Once it is paid, we will start the Luna Ridge HVAC site with repair/tuneup copy, mobile call CTAs, service areas, and trust proof.',
     '',
     `Invoice: ${effectiveInvoiceUrl}`,
     'Follow-up meeting: https://meet.new',
@@ -326,7 +337,7 @@ async function seedLifecycle() {
     messageId: `msg_demo_${suffix}`,
     from: { email: invoiceEmail },
     subject: 'Re: Your callmemaybe website invoice + meeting invite',
-    text: 'Paid it. Please make emergency repair and same-day scheduling obvious.',
+    text: 'Paid it. Please make repair services and mobile calling obvious.',
     leadId
   };
   const inboundEventId = `event:${inboundPayload.id}`;
@@ -394,76 +405,42 @@ async function seedLifecycle() {
     mock: true
   });
 
-  const builderRunId = startRun('builder', leadId, { triggeredBy: 'stripe.invoice.paid', mocked: true });
-  const buildId = paid.build?.row?.id || paidBuildTriggers[0]?.buildId || `bld_demo_${suffix}`;
-  const liveUrl = `/api/leads/${encodeURIComponent(leadId)}/build-preview`;
-  const projectUrl = `https://luna-ridge-hvac-${suffix.slice(-4)}.lovable.app`;
-  const brief = [
-    'Build a clean, mobile-first website for Luna Ridge HVAC in San Francisco.',
-    'Emphasize emergency HVAC repair, seasonal tuneups, furnace replacement, same-day scheduling, service areas, trust proof, and tap-to-call CTAs.',
-    'Use a dependable blue and white palette with one warm accent.'
-  ].join(' ');
-
-  if (paid.build?.row?.id) {
-    builds.update(buildId, {
-      status: 'running',
-      browser_session_id: null,
-      live_url: liveUrl,
-      lovable_url: `https://lovable.dev/?autosubmit=true#prompt=${encodeURIComponent(brief)}`,
-      brief,
-      started_at: Date.now()
-    });
-  } else {
-    builds.start({ id: buildId, lead_id: leadId, browser_session_id: null, live_url: liveUrl });
+  const buildPayload = paidBuildTriggers[0] || {
+    leadId,
+    buildId: paid.build?.row?.id || `bld_demo_${suffix}`,
+    target: 'lovable'
+  };
+  const builderResult = await runBuilder({ ...buildPayload, target: buildPayload.target || 'lovable' });
+  const latestBuild = builds.listByLead(leadId)[0];
+  if (!latestBuild?.id) throw new Error('demo builder did not persist a build row');
+  const qaReadModel = buildQaReadModel({ leadId, buildId: latestBuild.id });
+  if (!qaReadModel.latestQa?.passed) {
+    throw new Error(`demo build QA did not pass: ${(qaReadModel.latestQa?.errors || []).join(', ')}`);
   }
-  emit('builder.start', { worker: 'builder', leadId, runId: builderRunId, triggeredBy: 'stripe.invoice.paid', mock: true });
-  emit('builder.live_url', {
-    worker: 'builder',
+  const approval = await approveLaunch({ leadId });
+  const approvedBuild = builds.get(latestBuild.id);
+  const approvedReadModel = buildQaReadModel({ leadId, buildId: latestBuild.id });
+  const liveUrl = latestBuild.live_url || builderResult.liveUrl || `/api/leads/${encodeURIComponent(leadId)}/build-preview`;
+  const projectUrl = latestBuild.project_url || builderResult.projectUrl;
+  const portal = ensurePortalTokenForLead({
     leadId,
-    runId: builderRunId,
-    buildId,
-    liveUrl,
-    lovableUrl: `https://lovable.dev/?autosubmit=true#prompt=${encodeURIComponent(brief)}`,
-    brief,
-    mock: true
+    metadata: { source: 'demo_e2e', purpose: 'customer_operating_room' }
   });
-  emit('builder.progress', {
-    worker: 'builder',
-    leadId,
-    runId: builderRunId,
-    buildId,
-    summary: 'Generated the Lovable-ready brief from call, invoice, AgentMail, and research context.',
-    mock: true
-  });
-  emit('builder.progress', {
-    worker: 'builder',
-    leadId,
-    runId: builderRunId,
-    buildId,
-    summary: 'Mock Browser Use preview opened and is ready for the operator to watch.',
-    mock: true
-  });
-  emit('builder.progress', {
-    worker: 'builder',
-    leadId,
-    runId: builderRunId,
-    buildId,
-    summary: 'Final project URL captured and stored on the lead.',
-    mock: true
-  });
-  emit('builder.project_url', { worker: 'builder', leadId, runId: builderRunId, buildId, projectUrl, mock: true });
-  builds.update(buildId, { project_url: projectUrl, status: 'completed', finished_at: Date.now() });
-  leads.update(leadId, { website: projectUrl, status: 'shipped', next_action: 'demo_complete', outreach_status: 'shipped' });
-  finishRun(builderRunId, { state: 'completed', detail: { mock: true, liveUrl, projectUrl, buildId } });
-  emit('builder.done', { worker: 'builder', leadId, runId: builderRunId, buildId, liveUrl, projectUrl, mock: true });
 
   return {
     leadId,
+    portalToken: portal.token,
+    portalPath: portal.path,
     invoiceUrl: effectiveInvoiceUrl,
     threadId,
     stripeEventId,
     liveUrl,
     projectUrl,
+    launchStatus: approvedBuild.launch_status,
+    qaScore: qaReadModel.latestQa.score,
+    qaErrors: qaReadModel.latestQa.errors,
+    launchChecklistStatus: approvedReadModel.launchChecklist?.status,
+    approval,
     inboundReplyEventId: inboundEventId,
     autoReplyId: inboundResult.outboundContactEventId
   };
@@ -487,7 +464,7 @@ function completeRun({ worker, leadId, startEvent = {}, detail = {} }) {
   return runId;
 }
 
-async function verifyUiPath({ leadId, dataDir, allowLiveEnv }) {
+async function verifyUiPath({ leadId, portalToken, dataDir, allowLiveEnv }) {
   const port = await getFreePort();
   const childEnv = {
     ...process.env,
@@ -508,12 +485,16 @@ async function verifyUiPath({ leadId, dataDir, allowLiveEnv }) {
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
     await waitForHealth(baseUrl, child);
-    const [health, leadList, detail, html] = await Promise.all([
+    const previewPath = `/api/leads/${encodeURIComponent(leadId)}/build-preview`;
+    const [health, leadList, detail, portal, html, previewHtml] = await Promise.all([
       fetchJson(`${baseUrl}/api/health`),
       fetchJson(`${baseUrl}/api/leads`),
       fetchJson(`${baseUrl}/api/leads/${leadId}`),
-      fetchText(`${baseUrl}/`)
+      fetchJson(`${baseUrl}/api/share/build/${encodeURIComponent(portalToken)}`),
+      fetchText(`${baseUrl}/`),
+      fetchText(`${baseUrl}${previewPath}`)
     ]);
+    const previewChecks = generatedPreviewChecks(previewHtml, { businessName: 'Luna Ridge HVAC', phone: '+14155550137', email: 'maria@lunaridgehvac.test' });
 
     const found = (leadList.leads || []).some((lead) => lead.id === leadId);
     const analystRun = (detail.runs || []).find((run) => run.worker === 'analyst');
@@ -527,7 +508,12 @@ async function verifyUiPath({ leadId, dataDir, allowLiveEnv }) {
       invoicePaid: detail.latestInvoice?.status === 'paid',
       agentmailContact: (detail.contactEvents || []).some((event) => event.channel === 'agentmail'),
       buildCompleted: detail.buildStatus === 'completed',
-      htmlServed: html.includes('id="root"') || html.includes('callmemaybe')
+      portalBusiness: portal.business?.id === leadId,
+      portalInvoicePaid: portal.invoice?.status === 'paid',
+      portalLaunchApproved: Boolean(portal.approvals?.launch || portal.build?.launchStatus === 'customer_approved' || portal.build?.launch_status === 'customer_approved'),
+      portalNextAction: !!portal.nextAction?.label,
+      htmlServed: html.includes('id="root"') || html.includes('callmemaybe'),
+      ...previewChecks
     };
     const failures = Object.entries(checks).filter(([, ok]) => !ok).map(([key]) => key);
     if (failures.length) throw new Error(`UI/API verification failed: ${failures.join(', ')}`);
@@ -539,6 +525,9 @@ async function verifyUiPath({ leadId, dataDir, allowLiveEnv }) {
       leadStatus: detail.lead.status,
       paymentStatus: detail.latestInvoice?.status,
       buildStatus: detail.buildStatus,
+      portalPath: `/share/build/${encodeURIComponent(portalToken)}`,
+      previewPath,
+      portalNextAction: portal.nextAction,
       agentmailEvents: (detail.contactEvents || []).filter((event) => event.channel === 'agentmail').length
     };
   } finally {
@@ -608,6 +597,33 @@ async function fetchText(url) {
   return text;
 }
 
+function generatedPreviewChecks(html, { businessName, phone, email }) {
+  const source = String(html || '');
+  const visible = source
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const ids = new Set([...source.matchAll(/\bid=["']([^"']+)["']/gi)].map((match) => `#${match[1]}`));
+  const links = [...source.matchAll(/\bhref=["']([^"']+)["']/gi)].map((match) => match[1]).filter(Boolean);
+  const brokenAnchors = links.filter((href) => href.startsWith('#') && href !== '#' && !ids.has(href));
+  const internalCopyPattern = /\b(source:|presence:|memory_write|lead intelligence|evidence\/source|customer supplied|use it as context|existing website|current website|no owned|weak owned|owned service page|tap-to-call mobile cta|conversion path|call should ask|not captured yet|agentmail|stripe|browser-use cloud)\b|https?:\/\/example\.test/i;
+  const awkwardCopyPattern = /\bis\s+an?\s+hvac repair\b|\bfor San Francisco for San Francisco\b|\bNo public credibility proof\b|\bplaceholder\b/i;
+  return {
+    previewBusinessVisible: visible.includes(businessName),
+    previewServicesVisible: /\bDiagnostics\b/.test(visible) && /\bRepairs\b/.test(visible) && /\bSeasonal Tuneups\b/.test(visible),
+    previewContactPaths: source.includes(`tel:${phone}`) && source.includes(`mailto:${email}`) && /<form\b/i.test(source),
+    previewLocalBusinessSchema: /application\/ld\+json/i.test(source) && /"@type":"LocalBusiness"/.test(source),
+    previewResponsive: /name=["']viewport["']/i.test(source) && /@media \(max-width:\s*760px\)/i.test(source),
+    previewNoBrokenAnchors: brokenAnchors.length === 0,
+    previewNoInternalCopy: !internalCopyPattern.test(visible),
+    previewPolishedCopy: !awkwardCopyPattern.test(visible)
+  };
+}
+
 async function getFreePort() {
   return await new Promise((resolvePromise, reject) => {
     const server = net.createServer();
@@ -667,7 +683,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') parsed.help = true;
+    else if (arg === '--build') parsed.build = true;
     else if (arg === '--no-build') parsed.build = false;
+    else if (arg === '--verify-ui') parsed.verifyUi = true;
     else if (arg === '--no-verify-ui') parsed.verifyUi = false;
     else if (arg === '--reset-demo-data') parsed.resetDemoData = true;
     else if (arg === '--allow-live-env') parsed.allowLiveEnv = true;
@@ -691,7 +709,9 @@ Usage:
 
 Options:
   --no-build          Skip npm run build before API/static verification.
+  --build             Run npm run build before API/static verification. Default.
   --no-verify-ui     Seed the mocked lifecycle only; do not start a local server.
+  --verify-ui         Start a local server and verify the API/static path. Default.
   --data-dir <path>  SQLite data directory. Default: DATA_DIR or .data.
   --lead-id <id>     Use a specific lead id instead of a generated one.
   --reset-demo-data  Delete the target demo SQLite files before seeding.

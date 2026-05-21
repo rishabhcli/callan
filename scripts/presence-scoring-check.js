@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { scoreOnlinePresence } from '../server/presenceScorer.js';
+import { buildLeadIntelligence } from '../server/research/leadIntelligence.js';
 
 const weak = scoreOnlinePresence({
   businessName: 'Mission Curl Room',
@@ -41,4 +42,45 @@ const mixed = scoreOnlinePresence({
 assert.equal(mixed.onlinePresenceStrength, 'mixed');
 assert.equal(mixed.callRecommendation.shouldCall, true);
 
-console.log('[PASS] presence scoring classifies weak, mixed, and strong leads with call/no-call reasoning.');
+const weakIntel = buildLeadIntelligence({
+  profile: {
+    businessName: 'Mission Curl Room',
+    niche: 'salon',
+    city: 'San Francisco',
+    phone: '(415) 555-0101',
+    hasWebsite: false,
+    websiteUrl: null,
+    onlinePresenceStrength: weak.onlinePresenceStrength,
+    presenceConfidence: weak.presenceConfidence,
+    onlinePresenceEvidence: weak.onlinePresenceEvidence,
+    onlinePresenceSummary: weak.onlinePresenceSummary
+  }
+}, { sourceType: 'directory', sourceUrl: 'https://www.yelp.com/biz/mission-curl-room-san-francisco' });
+
+assert.equal(weakIntel.doNotCallBecauseAlreadyStrong.skip, false);
+assert.ok(weakIntel.scores.presenceWeakness.score >= 70);
+assert.ok(weakIntel.scores.websiteValue.score >= 80);
+assert.ok(weakIntel.callOpener.evidenceIds.length);
+
+const strongIntel = buildLeadIntelligence({
+  profile: {
+    businessName: 'Hayes Valley Physical Therapy',
+    niche: 'physical therapy',
+    city: 'San Francisco',
+    phone: '(415) 555-0222',
+    hasWebsite: true,
+    websiteUrl: 'https://hayesvalleypt.example.com',
+    onlinePresenceStrength: strong.onlinePresenceStrength,
+    presenceConfidence: strong.presenceConfidence,
+    onlinePresenceEvidence: strong.onlinePresenceEvidence,
+    onlinePresenceSummary: strong.onlinePresenceSummary,
+    notWorthCallingReason: strong.notWorthCallingReason
+  }
+}, { sourceType: 'website', sourceUrl: 'https://hayesvalleypt.example.com' });
+
+assert.equal(strongIntel.doNotCallBecauseAlreadyStrong.skip, true);
+assert.ok(strongIntel.doNotCallBecauseAlreadyStrong.reason);
+assert.ok(strongIntel.scores.presenceWeakness.score < 30);
+assert.match(strongIntel.callOpener.text, /not a fit/i);
+
+console.log('[PASS] presence scoring classifies weak, mixed, and strong leads with cited intelligence scores and call/no-call reasoning.');

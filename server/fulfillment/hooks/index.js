@@ -1,5 +1,5 @@
 import { emit } from '../../sse.js';
-import { buildHooks, buildQaResults, buildRevisions } from '../../db.js';
+import { buildHooks, buildQaResults, buildRevisions, builds, payments } from '../../db.js';
 import { createLovablePromptUrl, inspectGeneratedSite, browserUseSiteInspectionEnabled } from '../../providers/browserUse.js';
 import { buildWebsiteBrief, createLovableBuildPrompt, renderMockGeneratedSite, validateWebsiteBrief } from './brief.js';
 import { createRevisionPlan } from './revision.js';
@@ -166,8 +166,9 @@ export async function runBuildQaGate({
           accepted: true,
           qaResultId: latestQa.id,
           attempt,
-          shippedUrl: inspectedUrl,
-          summary: 'QA passed; build can be marked shipped.'
+          previewUrl: inspectedUrl,
+          launchStatus: 'internal_complete',
+          summary: 'QA passed; build is internally complete and ready for approval.'
         })
       });
       return { accepted: true, qa: latestQa, revisions, finalAccept: accepted, projectUrl: inspectedUrl };
@@ -208,6 +209,7 @@ export async function runBuildQaGate({
 
     if (mock) {
       inspectedHtml = renderMockGeneratedSite({ brief: websiteBrief, revisionPrompt: plan.prompt });
+      try { builds.update(buildId, { preview_html: inspectedHtml }); } catch {}
       buildRevisions.finish(revision.id, {
         status: 'submitted',
         result: { mock: true, projectUrl: inspectedUrl, promptLength: plan.prompt.length }
@@ -255,21 +257,86 @@ export async function runBuildQaGate({
 }
 
 export function buildQaReadModel({ leadId, buildId }) {
-  const hooks = buildId ? buildHooks.listByBuild(buildId) : buildHooks.listByLead(leadId);
-  const qaResults = buildId ? buildQaResults.listByBuild(buildId) : buildQaResults.listByLead(leadId);
-  const revisions = buildId ? buildRevisions.listByBuild(buildId) : buildRevisions.listByLead(leadId);
+  const latestBuild = buildId ? builds.get(buildId) : (leadId ? builds.listByLead(leadId)[0] : null);
+  const effectiveBuildId = buildId || latestBuild?.id || null;
+  const hooks = effectiveBuildId ? buildHooks.listByBuild(effectiveBuildId) : buildHooks.listByLead(leadId);
+  const qaResults = effectiveBuildId ? buildQaResults.listByBuild(effectiveBuildId) : buildQaResults.listByLead(leadId);
+  const revisions = effectiveBuildId ? buildRevisions.listByBuild(effectiveBuildId) : buildRevisions.listByLead(leadId);
   const latestQa = qaResults[0] || null;
   const validation = [...hooks].reverse().find((row) => row.hook === 'briefValidate')?.output || null;
+  const websiteBrief = parseJson(latestBuild?.website_brief_json) || [...hooks].reverse().find((row) => row.hook === 'preBrief')?.output || null;
+  const latestPayment = leadId ? payments.listByLead(leadId)[0] || null : null;
+  const launchChecklist = buildLaunchChecklist({ build: latestBuild, qa: latestQa, websiteBrief, latestPayment });
   return {
     leadId,
-    buildId: buildId || null,
+    buildId: effectiveBuildId,
     status: latestQa ? (latestQa.passed ? 'passed' : 'failed') : hooks.length ? 'running' : 'not_started',
+    build: latestBuild,
+    websiteBrief,
     hooks,
     validation,
     qaResults,
     latestQa,
     revisions,
+    launchChecklist,
     maxRevisions: maxRevisionCount()
+  };
+}
+
+export function buildLaunchChecklist({ build, qa, websiteBrief, latestPayment } = {}) {
+  const qaItems = new Map((qa?.checklist || []).map((item) => [item.key, item]));
+  const paymentPaid = latestPayment?.status === 'paid' || latestPayment?.paid_at;
+  const launchStatus = build?.launch_status || 'not_started';
+  const operatorApproved = Boolean(build?.operator_approved_at || launchStatus === 'ready_for_customer' || launchStatus === 'customer_approved' || launchStatus === 'launched');
+  const customerApproved = Boolean(build?.customer_approved_at || launchStatus === 'customer_approved' || launchStatus === 'launched');
+  const launched = Boolean(build?.launched_at || launchStatus === 'launched');
+  const items = [
+    fromQa(qaItems, 'mobile_sanity', 'Mobile layout'),
+    fromQa(qaItems, 'desktop_sanity', 'Desktop layout'),
+    fromQa(qaItems, 'primary_cta', 'Primary CTA'),
+    fromQa(qaItems, 'contact_paths', 'Phone/email/form'),
+    fromQa(qaItems, 'localbusiness_schema', 'LocalBusiness schema'),
+    fromQa(qaItems, 'hours_address_area', 'Hours/address/area'),
+    fromQa(qaItems, 'image_alt_text', 'Image alt text'),
+    fromQa(qaItems, 'no_hallucinated_claims', 'No fake claims'),
+    fromQa(qaItems, 'no_broken_links', 'No broken links'),
+    {
+      key: 'invoice_payment_state',
+      label: 'Invoice/payment state',
+      passed: Boolean(paymentPaid),
+      severity: 'launch_gate',
+      detail: paymentPaid ? 'Invoice is paid.' : 'Invoice is not marked paid yet.'
+    },
+    {
+      key: 'operator_approval',
+      label: 'Operator approval',
+      passed: operatorApproved,
+      severity: 'launch_gate',
+      detail: operatorApproved ? 'Internal QA approved the build for customer review.' : 'Operator/internal approval is pending.'
+    },
+    {
+      key: 'customer_approval',
+      label: 'Customer approval',
+      passed: customerApproved,
+      severity: 'launch_gate',
+      detail: customerApproved ? 'Customer approved launch from the portal.' : 'Customer approval is still pending.'
+    }
+  ];
+  const errors = items.filter((item) => !item.passed).map((item) => item.key);
+  const launchBlocking = items.filter((item) => !item.passed && item.severity === 'launch_gate').map((item) => item.key);
+  return {
+    status: launched ? 'launched' : customerApproved ? 'customer_approved' : operatorApproved ? 'ready_for_customer' : qa?.passed ? 'internal_complete' : 'not_ready',
+    readyToLaunch: qa?.passed === true && paymentPaid && operatorApproved && customerApproved,
+    launched,
+    score: Math.round((items.filter((item) => item.passed).length / items.length) * 100),
+    errors,
+    launchBlocking,
+    finalUrl: build?.project_url || null,
+    previewUrl: build?.live_url || null,
+    screenshotUrls: qa?.claims?.screenshots || [],
+    inspectedUrl: qa?.url || qa?.claims?.inspectedUrl || null,
+    businessName: websiteBrief?.businessName || null,
+    items
   };
 }
 
@@ -298,16 +365,17 @@ async function inspectAndPersist({
       browserUse: Boolean(adapter && sessionId && browserUseSiteInspectionEnabled())
     },
     fn: async () => {
+      const qaBrief = withLaunchApproval(websiteBrief, builds.get(buildId));
       const deterministic = await inspectGeneratedSite({
         url: inspectedUrl,
         html: inspectedHtml,
-        brief: websiteBrief,
+        brief: qaBrief,
         lead,
         mock
       });
 
       if (adapter && sessionId && browserUseSiteInspectionEnabled()) {
-        const browserUse = await adapter.inspectPublishedSite({ sessionId, url: inspectedUrl, brief: websiteBrief });
+        const browserUse = await adapter.inspectPublishedSite({ sessionId, url: inspectedUrl, brief: qaBrief });
         return mergeQaResults(deterministic, browserUse);
       }
 
@@ -331,6 +399,13 @@ async function inspectAndPersist({
   });
 
   const result = { ...qa, id: row.id, attempt };
+  try {
+    builds.update(buildId, {
+      launch_readiness_json: JSON.stringify(qa.launchReadiness || null),
+      screenshot_url: qa.screenshots?.[0]?.url || qa.claims?.screenshots?.[0]?.url || null,
+      ...(inspectedHtml ? { preview_html: inspectedHtml } : {})
+    });
+  } catch {}
   emit('builder.qa', {
     worker: 'builder',
     leadId,
@@ -473,6 +548,42 @@ function maxRevisionCount() {
   return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : DEFAULT_MAX_REVISIONS;
 }
 
+function fromQa(qaItems, key, fallbackLabel) {
+  const item = qaItems.get(key);
+  if (item) return {
+    key,
+    label: item.label || fallbackLabel,
+    passed: Boolean(item.passed),
+    severity: item.severity || 'warn',
+    detail: item.detail || ''
+  };
+  return {
+    key,
+    label: fallbackLabel,
+    passed: false,
+    severity: 'warn',
+    detail: 'No QA evidence recorded yet.'
+  };
+}
+
+function withLaunchApproval(websiteBrief, build) {
+  if (!websiteBrief || typeof websiteBrief !== 'object') return websiteBrief;
+  return {
+    ...websiteBrief,
+    launchApproval: {
+      operatorApproved: Boolean(build?.operator_approved_at || build?.launch_status === 'ready_for_customer' || build?.launch_status === 'customer_approved' || build?.launch_status === 'launched'),
+      customerApproved: Boolean(build?.customer_approved_at || build?.launch_status === 'customer_approved' || build?.launch_status === 'launched'),
+      operatorApprovedAt: build?.operator_approved_at || null,
+      customerApprovedAt: build?.customer_approved_at || null,
+      launchedAt: build?.launched_at || null
+    }
+  };
+}
+
 function unique(items) {
   return [...new Set(items.filter(Boolean))];
+}
+
+function parseJson(text) {
+  try { return text ? JSON.parse(text) : null; } catch { return null; }
 }

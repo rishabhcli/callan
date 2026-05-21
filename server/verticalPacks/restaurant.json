@@ -48,6 +48,19 @@
       "response": "Most independents do not. We start with whatever you have on your phone or Yelp and leave clean placeholders; you can swap photos in any time without paying again."
     }
   ],
+  "objectionMap": {
+    "skeptical": "Fair question. I am Callan from callmemaybe. I was checking public restaurant listings for whether hungry customers can quickly see menu, hours, address, and phone.",
+    "ai_disclosure": "Yes, I am an AI voice operator for callmemaybe, and this call is automated and recorded. I can explain the restaurant page offer briefly or remove you.",
+    "number_source": "I used public business listing research for the restaurant, not a private contact list. If you want no more calls, say stop and I will mark it.",
+    "pricing": "It is a flat $500 for a menu-hours-address page with map and phone front and center. Nothing starts unless you choose to pay the invoice.",
+    "send_info": "I can send the short version through AgentMail. What email should I use? I will read it back before sending.",
+    "call_later": "No problem. What exact day and time works around service? I do not want to catch you during a rush again."
+  },
+  "reviewValueProps": [
+    "Use review themes about favorite dishes, hospitality, and atmosphere as proof near the menu.",
+    "Make menu, hours, address, map link, and phone visible for customers deciding at meal time.",
+    "Turn repeated review mentions of signature items into concrete menu highlights."
+  ],
   "siteTemplateHint": "Use a warm hospitality template: appetite-friendly photo hero, palette inspired by the cuisine with one accent, menu section rendered as readable text (not just an image), hours, address with a map link, and a sticky phone CTA.",
   "customerPersonaHint": "Hungry locals or visitors searching by name or cuisine on a phone, deciding in seconds whether to come in, looking for hours, the menu, and a clear address with a phone number."
 }

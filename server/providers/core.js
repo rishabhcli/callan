@@ -1,4 +1,5 @@
 import { log } from '../logger.js';
+import { recordProviderRuntimeIncident } from '../providerIncidents.js';
 
 const DEFAULT_RETRYABLE = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
@@ -26,10 +27,12 @@ export async function withProviderRetry(provider, action, fn, options = {}) {
     retries = 2,
     baseDelayMs = 250,
     retryableStatuses = DEFAULT_RETRYABLE,
-    classify = normalizeProviderError
+    classify = normalizeProviderError,
+    recordRuntimeIncident = true
   } = options;
 
   let lastError;
+  let lastRetryable;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
       return await fn({ attempt });
@@ -38,6 +41,7 @@ export async function withProviderRetry(provider, action, fn, options = {}) {
       const retryable = lastError.retryable !== false && (
         !lastError.status || retryableStatuses.has(Number(lastError.status))
       );
+      lastRetryable = retryable;
       log.warn('provider.retry', { provider, action, attempt, retryable, error: lastError.message, status: lastError.status });
       if (!retryable || attempt === retries) break;
       await delay(baseDelayMs * 2 ** attempt);
@@ -49,8 +53,11 @@ export async function withProviderRetry(provider, action, fn, options = {}) {
   error.action = action;
   error.status = lastError?.status;
   error.code = lastError?.code;
-  error.retryable = lastError?.retryable;
+  error.retryable = lastError?.retryable ?? lastRetryable;
   error.cause = lastError?.cause;
+  if (recordRuntimeIncident) {
+    recordProviderRuntimeIncident({ provider, action, error });
+  }
   throw error;
 }
 

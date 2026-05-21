@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CallScript, toGeminiJsonSchema } from './reasoning/schemas.js';
+import { compactLeadIntelligence, evidenceTraceText } from './research/leadIntelligence.js';
 
 export const CallScriptSchema = toGeminiJsonSchema(CallScript);
 
@@ -76,6 +77,7 @@ export function buildPitchResearchContext({ profile = {}, lead = {} }) {
     profile.onlinePresenceSummary,
     `${businessName} is a ${niche}${city ? ` in ${city}` : ''}.`
   );
+  const leadIntelligence = compactLeadIntelligence(profile.leadIntelligence, { evidenceLimit: 10 });
 
   return {
     lead: {
@@ -99,7 +101,9 @@ export function buildPitchResearchContext({ profile = {}, lead = {} }) {
       services: textList(profile.services, 8),
       needs: textList(profile.needs, 6),
       signals: textList(profile.signals, 8),
-      bestContactEmailKnown: Boolean(profile.bestContactEmail)
+      bestContactEmailKnown: Boolean(profile.bestContactEmail),
+      leadIntelligence,
+      evidenceTrace: leadIntelligence ? evidenceTraceText(leadIntelligence, { limit: 8 }) : ''
     }
   };
 }
@@ -107,7 +111,7 @@ export function buildPitchResearchContext({ profile = {}, lead = {} }) {
 export function validateGeneratedPitch(raw, { disclosure, profile, lead } = {}) {
   const shaped = parseStrictPitch(raw, 'generated');
   const normalized = normalizePitch(shaped, { disclosure, profile, lead });
-  return validatePitch(normalized, { disclosure, source: 'generated.normalized' });
+  return attachPitchEvidence(validatePitch(normalized, { disclosure, source: 'generated.normalized' }), { raw, profile, lead });
 }
 
 export function createFallbackPitch({ disclosure, profile = {}, lead = {} } = {}) {
@@ -115,17 +119,22 @@ export function createFallbackPitch({ disclosure, profile = {}, lead = {} } = {}
   const businessName = context.lead.businessName;
   const niche = context.lead.niche;
   const cityPhrase = context.lead.city ? ` in ${context.lead.city}` : '';
+  const intelligence = context.research.leadIntelligence;
   const signal = context.research.signals[0] || context.research.needs[0] || context.research.onlinePresenceSummary;
+  const intelligenceIssue = intelligence?.currentWebsiteIssues?.[0]?.summary ||
+    intelligence?.missingCustomerInfo?.[0]?.summary ||
+    intelligence?.whyThisLeadIsWorthCalling?.summary;
+  const bestCta = intelligence?.bestCtaRecommendation?.title || intelligence?.bestCtaRecommendation?.claim || 'one obvious next step';
   const websiteGap = context.research.hasWebsite
-    ? `I saw you already have some web presence, but a clear focused page can make ${plainList(context.research.needs, 'services, proof, and contact details')} easier for customers to act on.`
+    ? `I saw you already have some web presence, but the research points to this specific opportunity: ${intelligenceIssue || `make ${plainList(context.research.needs, 'services, proof, and contact details')} easier for customers to act on`}.`
     : `I could not find a clear owned website that explains ${plainList(context.research.needs, 'services, proof, and contact details')} for customers.`;
-  const concreteSignal = signal
+  const concreteSignal = intelligence?.callOpener?.text || (signal
     ? `I noticed ${businessName} ${lowerFirst(signal)}.`
-    : `I noticed ${businessName} looks like a real ${niche}${cityPhrase}.`;
+    : `I noticed ${businessName} looks like a real ${niche}${cityPhrase}.`);
 
-  return validatePitch(normalizePitch({
-    openingLine: `${concreteSignal} Quick question: would a simple same-day page that shows what you do and how to book help?`,
-    valueProp: `${websiteGap} callmemaybe builds a concise single-page site for a flat $500, hosts it, and keeps the copy focused on what customers need before they call or visit.`,
+  const pitch = validatePitch(normalizePitch({
+    openingLine: `${concreteSignal} Quick question: would a simple same-day page with ${bestCta} help?`,
+    valueProp: `${websiteGap} callmemaybe builds a concise single-page site for a flat $500, hosts it, and keeps the copy focused on the exact proof customers need before they call or visit.`,
     discoveryQuestions: [
       'What do customers usually ask before they decide to book or visit?',
       'Which service or offer would you most want a new customer to notice first?',
@@ -159,10 +168,11 @@ export function createFallbackPitch({ disclosure, profile = {}, lead = {} } = {}
     ],
     close: 'If this sounds useful, I can send the $500 invoice and the project can start from the business details I already found.',
     emailAsk: 'What is the best email for the invoice?',
-    emailReadbackInstruction: 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.',
+    emailReadbackInstruction: 'Once the owner says an email address, read it back exactly, ask them to confirm it, and only say the invoice is sending after they confirm.',
     invoiceClose: 'AgentMail will send the invoice, and you can reply to that email with questions or corrections.',
     beginMessage: `${disclosure} ${concreteSignal} I wanted to ask one quick website question.`
   }, { disclosure, profile, lead }), { disclosure, source: 'fallback' });
+  return attachPitchEvidence(pitch, { profile, lead });
 }
 
 export function buildPitchHotStrategy({ pitch = {}, profile = {}, lead = {} } = {}) {
@@ -172,11 +182,40 @@ export function buildPitchHotStrategy({ pitch = {}, profile = {}, lead = {} } = 
     : 'services, proof, and a clear contact step';
   return [
     `Open with this concrete business signal: ${pitch.openingLine || context.research.whatTheyDo}`,
+    context.research.leadIntelligence?.callOpener?.text ? `Evidence-based opener: ${context.research.leadIntelligence.callOpener.text}` : null,
+    context.research.evidenceTrace ? `Cited evidence trail: ${context.research.evidenceTrace}` : null,
     `Tie the offer to these customer needs: ${needs}.`,
     `Use this value prop when the owner gives you a few seconds: ${pitch.valueProp || 'A focused $500 same-day website can make the next customer action obvious.'}`,
     `Close only after positive intent: ${pitch.close || 'If this sounds useful, ask for the best invoice email and send the invoice.'}`,
-    `If the owner agrees, follow this rule exactly: ${pitch.emailReadbackInstruction || 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.'}. Do NOT ask them to confirm or repeat the email.`
+    `If the owner agrees, follow this rule exactly: ${pitch.emailReadbackInstruction || 'Read the email back exactly and ask the owner to confirm it before saying the invoice is sending.'}. If the readback is wrong, ask for the correction and read it back again.`
   ].filter(Boolean);
+}
+
+function attachPitchEvidence(pitch, { raw = {}, profile = {}, lead = {} } = {}) {
+  const context = buildPitchResearchContext({ profile, lead });
+  const intelligence = context.research.leadIntelligence;
+  const cited = Array.isArray(raw.sourceEvidence) && raw.sourceEvidence.length
+    ? raw.sourceEvidence
+    : (intelligence?.evidence || []).slice(0, 8).map((item) => ({
+      source: item.sourceUrl || item.source || item.id,
+      quote: item.claim || item.quote,
+      weight: item.confidence >= 0.8 ? 'high' : item.confidence >= 0.55 ? 'medium' : 'low',
+      evidenceId: item.id,
+      sourceId: item.sourceId
+    }));
+  return {
+    ...pitch,
+    exactEvidenceBasedOpener: intelligence?.callOpener?.text || pitch.openingLine,
+    callOpenerEvidenceIds: intelligence?.callOpener?.evidenceIds || [],
+    leadIntelligenceSummary: intelligence ? {
+      bestCtaRecommendation: intelligence.bestCtaRecommendation,
+      whyThisLeadIsWorthCalling: intelligence.whyThisLeadIsWorthCalling,
+      doNotCallBecauseAlreadyStrong: intelligence.doNotCallBecauseAlreadyStrong,
+      scores: intelligence.scores,
+      evidenceTrace: context.research.evidenceTrace
+    } : null,
+    sourceEvidence: cited.slice(0, 8)
+  };
 }
 
 function parseStrictPitch(raw, source) {
@@ -261,7 +300,7 @@ function createFallbackSkeleton({ disclosure, profile = {}, lead = {} }) {
     ],
     close: 'If this sounds useful, I can send the $500 invoice and keep the next step simple.',
     emailAsk: 'What is the best email for the invoice?',
-    emailReadbackInstruction: 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.',
+    emailReadbackInstruction: 'Once the owner says an email address, read it back exactly, ask them to confirm it, and only say the invoice is sending after they confirm.',
     invoiceClose: 'AgentMail will send the invoice, and you can reply to that email with questions.',
     beginMessage: `${disclosure} I noticed ${businessName} and wanted to ask one quick website question.`
   };
@@ -286,8 +325,8 @@ function semanticIssues(pitch, disclosure) {
   if (!/email/i.test(pitch.emailAsk) || !/invoice/i.test(pitch.emailAsk)) {
     issues.push('emailAsk must ask for the invoice email');
   }
-  if (/\b(read.{0,20}back|repeat.{0,20}back|confirm|are you sure|is that (?:right|correct))\b/i.test(pitch.emailReadbackInstruction || '')) {
-    issues.push('emailReadbackInstruction must NOT ask the customer to confirm — capture the email and send the invoice immediately');
+  if (!/\b(read.{0,20}back|repeat.{0,20}back)\b/i.test(pitch.emailReadbackInstruction || '') || !/\b(confirm|is that (?:right|correct)|did i get that right)\b/i.test(pitch.emailReadbackInstruction || '')) {
+    issues.push('emailReadbackInstruction must require reading the email back and confirming before promising the invoice');
   }
   if (!/AgentMail/i.test(pitch.invoiceClose) || !/reply|question/i.test(pitch.invoiceClose)) {
     issues.push('invoiceClose must mention AgentMail and the reply path');
@@ -317,13 +356,10 @@ function ensureEmailAsk(value) {
 
 function ensureReadbackInstruction(value) {
   const text = String(value || '');
-  // Reject any model output that smuggles readback/confirmation language back in;
-  // we want the agent to capture the email and send the invoice immediately.
-  if (/\b(read.{0,20}back|repeat.{0,20}back|confirm|are you sure|is that (?:right|correct))\b/i.test(text)) {
-    return 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.';
+  if (/\b(read.{0,20}back|repeat.{0,20}back)\b/i.test(text) && /\b(confirm|is that (?:right|correct)|did i get that right)\b/i.test(text)) {
+    return text;
   }
-  if (text.length > 12) return text;
-  return 'Once the owner says an email address, capture it, tell them the invoice is sending right now, and end the call.';
+  return 'Once the owner says an email address, read it back exactly, ask them to confirm it, and only say the invoice is sending after they confirm.';
 }
 
 function ensureInvoiceClose(value) {

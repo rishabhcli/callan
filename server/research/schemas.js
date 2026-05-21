@@ -11,7 +11,8 @@ export const LEAD_EVIDENCE_REQUIRED_FIELDS = Object.freeze([
   'reviews',
   'sourceEvidence',
   'onlinePresenceStrength',
-  'presenceConfidence'
+  'presenceConfidence',
+  'leadIntelligence'
 ]);
 
 export const LeadEvidenceSchema = Object.freeze({
@@ -55,8 +56,10 @@ export const LeadEvidenceSchema = Object.freeze({
       items: {
         type: 'object',
         additionalProperties: true,
-        required: ['sourceType', 'sourceUrl', 'field', 'evidenceText'],
+        required: ['id', 'sourceType', 'sourceUrl', 'field', 'evidenceText'],
         properties: {
+          id: { type: 'string', description: 'Stable evidence id used by every downstream claim.' },
+          sourceId: { type: 'string', nullable: true, description: 'Stable source id when different from evidence id.' },
           sourceType: { type: 'string', enum: SOURCE_TYPES },
           sourceUrl: { type: 'string' },
           field: { type: 'string' },
@@ -80,6 +83,97 @@ export const LeadEvidenceSchema = Object.freeze({
       type: 'string',
       nullable: true,
       description: 'Short reason to call or skip.'
+    },
+    leadIntelligence: {
+      type: 'object',
+      additionalProperties: true,
+      required: [
+        'evidence',
+        'reviewThemes',
+        'positiveProof',
+        'complaintsPainPoints',
+        'missingCustomerInfo',
+        'competitorComparison',
+        'currentWebsiteIssues',
+        'socialListingConsistency',
+        'contactConfidence',
+        'bestCtaRecommendation',
+        'whyThisLeadIsWorthCalling',
+        'doNotCallBecauseAlreadyStrong',
+        'scores',
+        'callOpener'
+      ],
+      properties: {
+        evidence: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            additionalProperties: true,
+            required: ['id', 'sourceId', 'sourceType', 'sourceUrl', 'claim', 'quote', 'confidence'],
+            properties: {
+              id: { type: 'string' },
+              sourceId: { type: 'string' },
+              sourceType: { type: 'string' },
+              sourceUrl: { type: 'string' },
+              claim: { type: 'string' },
+              quote: { type: 'string' },
+              confidence: { type: 'number' }
+            }
+          }
+        },
+        reviewThemes: { type: 'array', items: citedClaimSchema('Review themes mined from reviews/listings.') },
+        positiveProof: { type: 'array', items: citedClaimSchema('Public proof that makes the lead real.') },
+        complaintsPainPoints: { type: 'array', items: citedClaimSchema('Complaints, pain points, or hesitation triggers.') },
+        missingCustomerInfo: { type: 'array', items: citedClaimSchema('Missing customer info customers would ask for.') },
+        competitorComparison: { type: 'array', items: citedClaimSchema('Competitor gap or market comparison.') },
+        currentWebsiteIssues: { type: 'array', items: citedClaimSchema('Current website or owned-presence issue.') },
+        socialListingConsistency: { type: 'array', items: citedClaimSchema('NAP/social/listing consistency finding.') },
+        contactConfidence: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            hours: contactConfidenceSchema(),
+            address: contactConfidenceSchema(),
+            phone: contactConfidenceSchema()
+          }
+        },
+        bestCtaRecommendation: citedClaimSchema('Best CTA recommendation.'),
+        whyThisLeadIsWorthCalling: citedClaimSchema('Reason the cold call is earned.'),
+        doNotCallBecauseAlreadyStrong: {
+          type: 'object',
+          additionalProperties: true,
+          required: ['skip', 'reason', 'evidenceIds'],
+          properties: {
+            skip: { type: 'boolean' },
+            reason: { type: 'string', nullable: true },
+            evidenceIds: { type: 'array', items: { type: 'string' } }
+          }
+        },
+        scores: {
+          type: 'object',
+          additionalProperties: true,
+          required: ['presenceWeakness', 'urgency', 'websiteValue', 'contactability', 'verticalFit', 'totalScore'],
+          properties: {
+            presenceWeakness: scoreSchema(),
+            urgency: scoreSchema(),
+            websiteValue: scoreSchema(),
+            contactability: scoreSchema(),
+            verticalFit: scoreSchema(),
+            totalScore: { type: 'integer' }
+          }
+        },
+        callOpener: {
+          type: 'object',
+          additionalProperties: true,
+          required: ['text', 'evidenceIds'],
+          properties: {
+            text: { type: 'string' },
+            evidenceIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+            sourceIds: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      }
     }
   }
 });
@@ -114,4 +208,50 @@ export function validateSourceType(value) {
 
 export function requiredLeadEvidenceFields() {
   return [...LEAD_EVIDENCE_REQUIRED_FIELDS];
+}
+
+function citedClaimSchema(description) {
+  return {
+    type: 'object',
+    description,
+    additionalProperties: true,
+    required: ['id', 'summary', 'evidenceIds'],
+    properties: {
+      id: { type: 'string' },
+      title: { type: 'string', nullable: true },
+      claim: { type: 'string', nullable: true },
+      summary: { type: 'string' },
+      evidenceIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+      sourceIds: { type: 'array', items: { type: 'string' } },
+      sourceUrls: { type: 'array', items: { type: 'string' } },
+      confidence: { type: 'number' }
+    }
+  };
+}
+
+function contactConfidenceSchema() {
+  return {
+    type: 'object',
+    additionalProperties: true,
+    required: ['value', 'confidence', 'evidenceIds'],
+    properties: {
+      value: { type: 'string', nullable: true },
+      confidence: { type: 'number' },
+      evidenceIds: { type: 'array', items: { type: 'string' } },
+      note: { type: 'string' }
+    }
+  };
+}
+
+function scoreSchema() {
+  return {
+    type: 'object',
+    additionalProperties: true,
+    required: ['score', 'reason', 'evidenceIds'],
+    properties: {
+      score: { type: 'integer' },
+      reason: { type: 'string' },
+      evidenceIds: { type: 'array', items: { type: 'string' } }
+    }
+  };
 }

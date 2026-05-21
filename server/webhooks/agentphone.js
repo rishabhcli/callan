@@ -5,19 +5,22 @@ import { calls, db, leads, webhookEvents } from '../db.js';
 import { emit } from '../sse.js';
 import { addDoc, containerTagFor } from '../memory.js';
 import { recordOptOut, transcriptHasOptOut, normalizePhone } from '../compliance.js';
+import { recordProviderFlag } from '../reputation.js';
 import {
   classifyAgentPhoneFailure,
   endAgentPhoneCall,
   fetchAgentPhoneFinalTranscript,
   normalizeAgentPhoneTranscript
 } from '../providers/agentphone.js';
-import { maybeFireInboundEmail } from '../inboundIntent.js';
-import { hydrateInboundCall, persistInboundSummary } from '../inboundMemory.js';
 import { startInboundCallerResearch, maybeKickOffBusinessResearch } from '../inboundResearch.js';
-import { maybeMarkDemoMode, isDemoModeCall, clearDemoModeCall, fireDemoFollowupEmail } from '../demoMode.js';
-import { shouldTransfer, transferCallToOperator, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
+import { maybeMarkDemoMode } from '../demoMode.js';
+import { shouldTransfer, OPERATOR_TRANSFER_NUMBER } from '../operatorTransfer.js';
 import { getCallbackContext } from '../emailCallback.js';
 import { recordAgentPhoneCallCost } from '../costs.js';
+import { enqueueCallAnalysis } from '../analysisQueue.js';
+import { enqueueInboundVoiceFollowup } from '../inboundVoiceQueue.js';
+import { enqueueOperatorTransferJob } from '../operatorTransferQueue.js';
+import { enqueueInboundMemoryHydration } from '../inboundMemoryQueue.js';
 
 const AGENTPHONE_REPLAY_WINDOW_SECONDS = 300;
 
@@ -69,6 +72,7 @@ export async function handleAgentPhoneWebhook(req) {
   });
 
   let callRow = findCallRow(normalized.providerCallId || normalized.internalCallId);
+  const providerFlag = agentPhoneProviderFlag(normalized);
   let bootstrappedInbound = false;
   if (!callRow && isInboundCall(normalized)) {
     callRow = ensureInboundCallRow(normalized);
@@ -76,18 +80,46 @@ export async function handleAgentPhoneWebhook(req) {
   }
   if (bootstrappedInbound && callRow?.lead_id) {
     const lead = leads.get(callRow.lead_id);
-    // Fire-and-forget — hydrate looks up Supermemory + (maybe) personalizes greeting.
-    hydrateInboundCall({ callRow, lead, fromNumber: normalized.fromNumber })
-      .catch((err) => log.warn('inbound.memory.hydrate_failed', {
-        callId: callRow.id, error: err?.message || String(err)
-      }));
+    const hydration = enqueueInboundMemoryHydration({
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      fromNumber: normalized.fromNumber,
+      source: 'agentphone.webhook',
+      eventId
+    });
+    emit('inbound.memory_hydrate.queued', {
+      worker: 'caller',
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      jobId: hydration.row?.id
+    });
     // Light up the dashboard's Scraper box with a 5-lane synthetic research burst
     // keyed off the caller's phone. Looks like we're actively probing them.
     startInboundCallerResearch({ callRow, lead, fromNumber: normalized.fromNumber });
   }
   if (!callRow) {
+    if (providerFlag) {
+      recordProviderFlag({
+        provider: 'agentphone',
+        kind: providerFlag.kind,
+        severity: providerFlag.severity,
+        reason: providerFlag.reason,
+        metadata: { eventId, eventType: normalized.eventType, providerCallId: normalized.providerCallId }
+      });
+    }
     log.warn('agentphone.webhook.call_missing', { eventType: normalized.eventType, providerCallId: normalized.providerCallId, direction: normalized.direction });
     return { ok: true, eventId, ignored: 'call_not_found' };
+  }
+  if (providerFlag) {
+    recordProviderFlag({
+      provider: 'agentphone',
+      kind: providerFlag.kind,
+      leadId: callRow.lead_id,
+      phone: callRow.to_phone || normalized.toNumber || normalized.fromNumber,
+      severity: providerFlag.severity,
+      reason: providerFlag.reason,
+      metadata: { eventId, eventType: normalized.eventType, providerCallId: normalized.providerCallId, callId: callRow.id }
+    });
   }
 
   const turns = normalizeAgentPhoneTranscript(normalized.transcript);
@@ -118,16 +150,23 @@ export async function handleAgentPhoneWebhook(req) {
     );
     const decision = shouldTransfer(mergedForTransfer);
     if (decision.transfer) {
-      transferCallToOperator({
+      const transfer = enqueueOperatorTransferJob({
         providerCallId: callRow.provider_call_id,
         leadId: callRow.lead_id,
         callId: callRow.id,
-        reason: decision.reason
-      }).catch((err) => log.warn('operator.transfer.webhook_failed', {
+        reason: decision.reason,
+        source: 'agentphone.webhook',
+        eventId
+      });
+      emit('operator.transfer.queued', {
+        worker: 'caller',
         callId: callRow.id,
+        leadId: callRow.lead_id,
         providerCallId: callRow.provider_call_id,
-        error: err?.message || String(err)
-      }));
+        reason: decision.reason,
+        jobId: transfer.row?.id,
+        source: 'agentphone.webhook'
+      });
     }
   }
 
@@ -146,8 +185,21 @@ export async function handleAgentPhoneWebhook(req) {
     const overrideEmail = callRow.decision_reason === 'agentphone_email_callback'
       ? getCallbackContext(callRow.provider_call_id)?.fromEmail || null
       : null;
-    maybeFireInboundEmail({ callRow, lead, transcript: merged, overrideEmail }).catch((err) => {
-      log.warn('inbound.email.fire_failed', { callId: callRow.id, error: err?.message || String(err) });
+    const followup = enqueueInboundVoiceFollowup({
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      transcript: merged,
+      eventId,
+      stage: 'partial',
+      fromPhone: normalized.fromNumber || callRow.to_phone || lead?.phone || null,
+      overrideEmail
+    });
+    emit('inbound.voice_followup.queued', {
+      worker: 'caller',
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      jobId: followup.row?.id,
+      stage: 'partial'
     });
 
     // "Enter Demo Mode" trigger — only on inbound. Demo mode persona switch
@@ -160,11 +212,9 @@ export async function handleAgentPhoneWebhook(req) {
     // job against it. De-duped per call so we only fire once.
     const businessHit = extractBusinessMention(merged);
     if (businessHit) {
-      maybeKickOffBusinessResearch({ callRow, businessName: businessHit.name, city: businessHit.city })
-        .catch((err) => log.warn('inbound.research.kick_off_failed', {
-          callId: callRow.id, error: err?.message || String(err)
-        }));
+      maybeKickOffBusinessResearch({ callRow, businessName: businessHit.name, city: businessHit.city });
     }
+
   }
 
   const optedOut = await handleWebhookOptOut({ callRow, turns, normalized });
@@ -203,25 +253,27 @@ export async function handleAgentPhoneWebhook(req) {
     if (callRow.decision_reason === 'agentphone_inbound') {
       maybeMarkDemoMode({ callRow, transcript: finalTurns });
     }
-    await maybeFireInboundEmail({ callRow, lead, transcript: finalTurns, overrideEmail })
-      .catch((err) => log.warn('inbound.email.terminal_fire_failed', {
-        callId: callRow.id, error: err?.message || String(err)
-      }));
-    if (isDemoModeCall(callRow.id)) {
-      await fireDemoFollowupEmail({ callRow, transcript: finalTurns })
-        .catch((err) => log.warn('inbound.demo_mode.email_failed', {
-          callId: callRow.id, error: err?.message || String(err)
-        }));
-      clearDemoModeCall(callRow.id);
-    }
-    persistInboundSummary({ callRow, lead, transcript: finalTurns, outcome })
-      .catch((err) => log.warn('inbound.memory.persist_failed', {
-        callId: callRow.id, error: err?.message || String(err)
-      }));
+    const followup = enqueueInboundVoiceFollowup({
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      transcript: finalTurns,
+      eventId: `${eventId}:terminal`,
+      stage: 'terminal',
+      fromPhone: normalized.fromNumber || callRow.to_phone || lead?.phone || null,
+      overrideEmail,
+      outcome
+    });
+    emit('inbound.voice_followup.queued', {
+      worker: 'caller',
+      callId: callRow.id,
+      leadId: callRow.lead_id,
+      jobId: followup.row?.id,
+      stage: 'terminal'
+    });
   }
 
   const failure = outcome.startsWith('failed:') ? classifyAgentPhoneFailure(normalized) : null;
-  updateLeadAfterTerminalWebhook(callRow.lead_id, { outcome, failure });
+  updateLeadAfterTerminalWebhook(callRow.lead_id, { outcome, failure, decisionReason: callRow.decision_reason });
   emit('caller.done', {
     worker: 'caller',
     leadId: callRow.lead_id,
@@ -538,7 +590,7 @@ function outcomeForWebhook(normalized, transcript) {
   return 'ended';
 }
 
-function updateLeadAfterTerminalWebhook(leadId, { outcome, failure }) {
+function updateLeadAfterTerminalWebhook(leadId, { outcome, failure, decisionReason = null }) {
   if (outcome === 'opt-out') {
     leads.update(leadId, { outreach_status: 'blocked', risk_status: 'opt-out', next_action: 'do_not_call' });
     return;
@@ -547,6 +599,12 @@ function updateLeadAfterTerminalWebhook(leadId, { outcome, failure }) {
     leads.update(leadId, failure.retryable
       ? { outreach_status: 'retry', risk_status: failure.category, next_action: 'retry_call' }
       : { outreach_status: 'blocked', risk_status: failure.category, next_action: 'operator_review_call' });
+    return;
+  }
+  if (decisionReason === 'agentphone_inbound') {
+    const lead = leads.get(leadId);
+    if (lead?.next_action && lead.next_action !== 'live_inbound') return;
+    leads.update(leadId, { outreach_status: lead?.outreach_status || 'inbound', next_action: 'inbound_intake_review' });
     return;
   }
   leads.update(leadId, { outreach_status: 'called', next_action: 'analyze_call' });
@@ -565,11 +623,21 @@ async function safeAddCallMemory(callRow, transcript, outcome) {
 }
 
 function fireAnalyst(leadId, callId) {
-  setTimeout(() => {
-    import('../workers/analyst.js').then(({ runAnalyst }) => runAnalyst({ leadId, callId })).catch((err) => {
-      log.warn('agentphone.webhook.analyst_failed', { leadId, callId, error: err?.message || String(err) });
+  try {
+    const result = enqueueCallAnalysis({ leadId, callId, source: 'agentphone.webhook' });
+    emit('analyst.queued', {
+      worker: 'analyst',
+      leadId,
+      callId,
+      source: 'agentphone.webhook',
+      jobId: result.row?.id || null,
+      duplicate: !result.inserted
     });
-  }, 0);
+    return result.row || null;
+  } catch (err) {
+    log.warn('agentphone.webhook.analyst_queue_failed', { leadId, callId, error: err?.message || String(err) });
+    return null;
+  }
 }
 
 function recordWebhookOnce(args) {
@@ -603,6 +671,23 @@ function isTerminalWebhook(eventType, status, outcome, failureReason) {
 function failureSignal(normalized) {
   const value = `${normalized.eventType || ''} ${normalized.status || ''} ${normalized.outcome || ''} ${normalized.failureReason || ''}`.toLowerCase().replace(/_/g, '-');
   return /\b(failed|failure|error|busy|voicemail|no-answer|not-answered|blocked|invalid|rejected|dnc)\b/.test(value);
+}
+
+function agentPhoneProviderFlag(normalized = {}) {
+  const value = [
+    normalized.eventType,
+    normalized.status,
+    normalized.outcome,
+    normalized.failureReason,
+    JSON.stringify(normalized.raw || {})
+  ].filter(Boolean).join(' ').toLowerCase().replace(/_/g, '-');
+  if (/\b(complaint|abuse|carrier-complaint|spam-report|tcpa|fcc)\b/.test(value)) {
+    return { kind: 'provider_complaint', severity: 'alert', reason: normalized.failureReason || normalized.outcome || 'AgentPhone reported a complaint or abuse signal.' };
+  }
+  if (/\b(carrier-block|blocked-by-provider|spam-likely|dnc|do-not-call)\b/.test(value)) {
+    return { kind: 'provider_flag', severity: 'warn', reason: normalized.failureReason || normalized.outcome || 'AgentPhone reported a provider/carrier flag.' };
+  }
+  return null;
 }
 
 function normalizeEventType(value) {
