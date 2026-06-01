@@ -8,6 +8,7 @@ import { enqueueJob } from './jobs.js';
 import { env } from './env.js';
 import { log, redact } from './logger.js';
 import { operationalErrorSummary } from './operationalErrors.js';
+import { buildSafeToRenewStatus, safeToRenewNextActions } from './safeToRenew.js';
 
 export const SAFE_TO_SELL_JOB_TYPE = 'ops.safe_to_sell';
 export const SAFE_TO_SELL_REPORT_VERSION = 2;
@@ -72,6 +73,7 @@ export async function buildSafeToSellReport({
   const evalResult = evals || runEvalCheck();
   const backups = latestBackupManifest();
   const backupFresh = backupFreshness(backups, { now });
+  const renewal = buildSafeToRenewStatus({ now });
 
   const dryRunVerified = Object.entries(readiness.providers || {})
     .map(([provider, row]) => [provider, row.dryRunSmoke?.status !== 'not_run' ? row.dryRunSmoke : row.smoke])
@@ -107,18 +109,20 @@ export async function buildSafeToSellReport({
   const stillBlocked = unique([
     ...(readiness.productionBlockers || []),
     ...opsBlockers,
-    ...evalBlockers
+    ...evalBlockers,
+    ...(renewal.safeToRenew === false ? renewal.blockers || [] : [])
   ]);
   const nextActions = buildSafeToSellNextActions({
     readiness,
     observability,
     backupFresh,
-    evalResult
+    evalResult,
+    renewal
   });
 
   const report = {
     version: SAFE_TO_SELL_REPORT_VERSION,
-    ok: readiness.canGoLive && evalResult.ok && opsBlockers.length === 0,
+    ok: readiness.canGoLive && evalResult.ok && opsBlockers.length === 0 && renewal.safeToRenew !== false,
     generatedAt: new Date(now).toISOString(),
     command: 'npm run safe-to-sell',
     mode: readiness.mode,
@@ -138,6 +142,7 @@ export async function buildSafeToSellReport({
       nextActions: readiness.nextActions
     },
     promotionGates: readiness.promotionGates,
+    renewal,
     evals: {
       ok: evalResult.ok,
       summary: evalResult.summary,
@@ -231,7 +236,8 @@ export function buildSafeToSellNextActions({
   readiness = {},
   observability = {},
   backupFresh = null,
-  evalResult = null
+  evalResult = null,
+  renewal = null
 } = {}) {
   return unique([
     ...liveSmokeNextActions(readiness),
@@ -247,7 +253,8 @@ export function buildSafeToSellNextActions({
       : null,
     evalResult && evalResult.ok === false
       ? 'run npm run check:evals and fix the failing production eval cases'
-      : null
+      : null,
+    ...safeToRenewNextActions(renewal)
   ]);
 }
 
@@ -434,6 +441,7 @@ export function buildSafeToSellDecisionReceipt(report = {}) {
   const backup = report.backups || report.backup || {};
   const evals = report.evals || {};
   const evalSummary = evals.summary || {};
+  const renewal = report.renewal || {};
 
   return {
     generatedAt: report.generatedAt || new Date().toISOString(),
@@ -449,7 +457,10 @@ export function buildSafeToSellDecisionReceipt(report = {}) {
       requiredProviders: requiredProviderProof.length,
       requiredLiveReady: liveReady.length,
       blockedProviders: blockedProviders.length,
-      missingCredentialProviders: missingCredentials.length
+      missingCredentialProviders: missingCredentials.length,
+      safeToRenew: renewal.safeToRenew !== false,
+      activeSubscriptions: renewal.activeSubscriptionCount || 0,
+      renewalBlockers: renewal.blockers?.length || 0
     },
     gates: {
       evals: evals.ok === true,
@@ -458,6 +469,7 @@ export function buildSafeToSellDecisionReceipt(report = {}) {
       providers: (observability.providerHealthSlo || report.providerHealthSlo)?.ok !== false,
       workers: (observability.workerHealthSlo || report.workerHealthSlo)?.ok !== false,
       schedulers: (observability.schedulerHealth || report.schedulerHealth)?.ok !== false,
+      safeToRenew: renewal.safeToRenew !== false,
       productionReview: promotionGates.productionReview?.ok === true,
       productionLive: promotionGates.productionLive?.ok === true
     },
@@ -468,6 +480,15 @@ export function buildSafeToSellDecisionReceipt(report = {}) {
       skipped: evalSummary.skipped || 0
     },
     economics: observability.dailyEconomics || report.economics || null,
+    renewal: renewal ? {
+      status: renewal.status || null,
+      safeToRenew: renewal.safeToRenew !== false,
+      activeSubscriptionCount: renewal.activeSubscriptionCount || 0,
+      hostingTaskCount: renewal.hostingTaskCount || 0,
+      dueHostingTaskCount: renewal.dueHostingTaskCount || 0,
+      dryRunProofCount: renewal.dryRunProofCount || 0,
+      blockerCount: renewal.blockers?.length || 0
+    } : null,
     blockerCount: stillBlocked.length,
     topBlockers: stillBlocked.slice(0, 8),
     providerBlockers: blockedProviders.slice(0, 8).map((row) => ({
@@ -523,6 +544,9 @@ function compactSafeToSellReceiptRow(snapshot) {
     requiredProviders: receipt.proof?.requiredProviders || 0,
     requiredLiveReady: receipt.proof?.requiredLiveReady || 0,
     blockedProviders: receipt.proof?.blockedProviders || 0,
+    safeToRenew: receipt.proof?.safeToRenew !== false,
+    activeSubscriptions: receipt.proof?.activeSubscriptions || 0,
+    renewalBlockers: receipt.proof?.renewalBlockers || receipt.renewal?.blockerCount || 0,
     topBlockers: (receipt.topBlockers || []).slice(0, 5),
     nextActions: (receipt.nextActions || []).slice(0, 5)
   };
@@ -673,6 +697,9 @@ export function printSafeToSellReport(report) {
   if (report.observability.schedulerHealth) {
     const scheduler = report.observability.schedulerHealth;
     console.log(`recurring ops jobs: ${scheduler.healthy}/${scheduler.enabled} healthy`);
+  }
+  if (report.renewal) {
+    console.log(`safe-to-renew: ${report.renewal.safeToRenew ? 'ready' : 'blocked'} (${report.renewal.activeSubscriptionCount || 0} active subscriptions, ${report.renewal.dryRunProofCount || 0} renewal proofs)`);
   }
   if (report.maintenance && !report.maintenance.skipped) {
     const refreshed = Number(report.maintenance.refreshed || 0);

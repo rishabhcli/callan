@@ -38,11 +38,29 @@ export function loadAllPacks() {
 export function getPackByKey(key) {
   if (!key) return null;
   const normalized = String(key).toLowerCase().trim();
-  return loadAllPacks().find((pack) => pack.key === normalized) || null;
+  const underscoreKey = normalized.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return loadAllPacks().find((pack) => pack.key === normalized || pack.key === underscoreKey) || null;
 }
 
 export function getDefaultPack() {
   return getPackByKey(DEFAULT_PACK_KEY) || loadAllPacks()[0] || null;
+}
+
+export function listInstalledPacks() {
+  return loadAllPacks().filter((pack) => pack.status !== 'retired');
+}
+
+export function listRetiredPacks() {
+  return loadAllPacks().filter((pack) => pack.status === 'retired');
+}
+
+export function getPackVersion(key) {
+  return getPackByKey(key)?.version || null;
+}
+
+export function isPackInstalled(key) {
+  const pack = getPackByKey(key);
+  return Boolean(pack && pack.status !== 'retired');
 }
 
 /**
@@ -69,11 +87,11 @@ export function normalizeNiche(value) {
  *     compiled and tested; everything else is treated as a substring.
  */
 export function pickPack(lead = {}) {
-  const packs = loadAllPacks();
+  const packs = listInstalledPacks();
   if (!packs.length) return null;
 
   const explicit = getPackByKey(lead?.vertical_pack);
-  if (explicit) return explicit;
+  if (explicit && explicit.status !== 'retired') return explicit;
 
   const normalized = normalizeNiche(lead?.niche);
   if (normalized) {
@@ -84,7 +102,7 @@ export function pickPack(lead = {}) {
       }
     }
   }
-  return getDefaultPack();
+  return packs.find((pack) => pack.key === DEFAULT_PACK_KEY) || getDefaultPack();
 }
 
 /**
@@ -157,6 +175,12 @@ function normalizePack(data) {
   return {
     key,
     name: data.name || key,
+    version: normalizePackVersion(data.version),
+    status: normalizePackStatus(data.status),
+    installedAt: normalizePackTimestamp(data.installedAt),
+    retiredAt: normalizePackTimestamp(data.retiredAt),
+    retiredReason: data.retiredReason ? String(data.retiredReason).replace(/\s+/g, ' ').trim() : '',
+    supersededByKey: data.supersededByKey ? String(data.supersededByKey).toLowerCase().trim() : '',
     matchNiches: Array.isArray(data.matchNiches) ? data.matchNiches.map((m) => String(m)) : [],
     priceCents: Number.isFinite(data.priceCents) ? Number(data.priceCents) : 50000,
     pitchTone: data.pitchTone || '',
@@ -167,7 +191,114 @@ function normalizePack(data) {
     objectionMap: data.objectionMap && typeof data.objectionMap === 'object' ? data.objectionMap : {},
     reviewValueProps: Array.isArray(data.reviewValueProps) ? data.reviewValueProps.map((v) => String(v)).filter(Boolean).slice(0, 8) : [],
     siteTemplateHint: data.siteTemplateHint || '',
-    customerPersonaHint: data.customerPersonaHint || ''
+    customerPersonaHint: data.customerPersonaHint || '',
+    marketSignals: normalizeManifestList(data.marketSignals, 12),
+    leadSources: normalizeManifestList(data.leadSources, 12),
+    compliance: normalizeManifestObject(data.compliance),
+    serviceOffer: normalizeServiceOffer(data.serviceOffer, data.priceCents),
+    fulfillmentRequirements: normalizeManifestList(data.fulfillmentRequirements, 12),
+    vendorRequirements: normalizeManifestList(data.vendorRequirements, 12),
+    qaRules: normalizeManifestList(data.qaRules, 12),
+    portalCopy: normalizeManifestObject(data.portalCopy),
+    trustRequirements: normalizeManifestList(data.trustRequirements, 12),
+    reviewStrategy: normalizeManifestList(data.reviewStrategy, 12),
+    growthPaths: normalizeManifestList(data.growthPaths, 12),
+    retentionLoops: normalizeManifestList(data.retentionLoops, 12),
+    marginModel: normalizeMarginModel(data.marginModel, data.priceCents),
+    launchChecklist: normalizeManifestList(data.launchChecklist, 16),
+    evals: normalizeManifestList(data.evals, 12)
+  };
+}
+
+function normalizePackVersion(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return /^\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?$/i.test(text) ? text : '1.0.0';
+}
+
+function normalizePackStatus(value) {
+  const text = String(value || 'installed').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return ['installed', 'retired', 'draft'].includes(text) ? text : 'installed';
+}
+
+function normalizePackTimestamp(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  if (Number.isFinite(number) && number > 0) return number;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeManifestList(value, max = 12) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeManifestValue(item))
+    .filter((item) => {
+      if (!item) return false;
+      if (typeof item === 'string') return item.length > 0;
+      return Object.keys(item).length > 0;
+    })
+    .slice(0, max);
+}
+
+function normalizeManifestObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = normalizeManifestValue(item);
+    if (normalized == null) continue;
+    out[String(key)] = normalized;
+  }
+  return out;
+}
+
+function normalizeManifestValue(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return normalizeManifestList(value, 20);
+  if (typeof value === 'object') return normalizeManifestObject(value);
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'boolean') return value;
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  return text || null;
+}
+
+function normalizeServiceOffer(value, fallbackPriceCents) {
+  const offer = normalizeManifestObject(value);
+  const packages = normalizeManifestList(value?.packages, 8).map((pkg, index) => {
+    if (typeof pkg === 'string') {
+      return {
+        key: `package-${index + 1}`,
+        name: pkg,
+        priceCents: Number.isFinite(fallbackPriceCents) ? fallbackPriceCents : 50000
+      };
+    }
+    return {
+      key: pkg.key || `package-${index + 1}`,
+      name: pkg.name || pkg.key || `Package ${index + 1}`,
+      description: pkg.description || '',
+      priceCents: Number.isFinite(Number(pkg.priceCents)) ? Number(pkg.priceCents) : (Number.isFinite(fallbackPriceCents) ? fallbackPriceCents : 50000)
+    };
+  });
+  return {
+    headline: offer.headline || '',
+    customerOutcome: offer.customerOutcome || '',
+    packages,
+    refundPolicy: offer.refundPolicy || '',
+    proofAssets: normalizeManifestList(value?.proofAssets, 8)
+  };
+}
+
+function normalizeMarginModel(value, fallbackPriceCents) {
+  const model = normalizeManifestObject(value);
+  const basePriceCents = Number(model.basePriceCents);
+  const estimatedFulfillmentCostCents = Number(model.estimatedFulfillmentCostCents);
+  const targetGrossMarginPct = Number(model.targetGrossMarginPct);
+  const maxAcquisitionCostPct = Number(model.maxAcquisitionCostPct);
+  return {
+    basePriceCents: Number.isFinite(basePriceCents) ? basePriceCents : (Number.isFinite(fallbackPriceCents) ? fallbackPriceCents : 50000),
+    estimatedFulfillmentCostCents: Number.isFinite(estimatedFulfillmentCostCents) ? estimatedFulfillmentCostCents : null,
+    targetGrossMarginPct: Number.isFinite(targetGrossMarginPct) ? targetGrossMarginPct : 35,
+    maxAcquisitionCostPct: Number.isFinite(maxAcquisitionCostPct) ? maxAcquisitionCostPct : 18,
+    notes: model.notes || ''
   };
 }
 

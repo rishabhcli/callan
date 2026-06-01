@@ -54,5 +54,96 @@
     "Turn review mentions of water heaters, drains, leaks, and repipes into concrete service chips."
   ],
   "siteTemplateHint": "Use the dependable trades template: white background with deep blue and a clean accent, service-area hero with a giant tap-to-call number, emergency-friendly copy, service grid (drain, water heater, leak, repipe) using only confirmed services, and review proof if present.",
-  "customerPersonaHint": "Homeowners with an active plumbing problem searching on a phone late at night or before work, looking for a local number to call and confirmation that the plumber covers their zip."
+  "customerPersonaHint": "Homeowners with an active plumbing problem searching on a phone late at night or before work, looking for a local number to call and confirmation that the plumber covers their zip.",
+  "marketSignals": [
+    { "key": "urgent_problem", "label": "Leak, drain, sewer, or water-heater urgency is present.", "evidenceHint": "Public reviews or listing copy mention emergency repair, leaks, drains, sewer, or water heaters." },
+    { "key": "callback_gap", "label": "Missed-call or slow-response complaints create owned-page value.", "evidenceHint": "Review themes mention no callback, late arrival, unanswered phone, or unclear availability." },
+    { "key": "service_menu_gap", "label": "Customers cannot quickly see which plumbing jobs are accepted.", "evidenceHint": "Owned web page is missing or public profiles only list broad categories." }
+  ],
+  "leadSources": [
+    "Google Maps plumber category",
+    "drain cleaning directories",
+    "water heater repair searches",
+    "local emergency plumber listings"
+  ],
+  "compliance": {
+    "restrictedClaims": ["licensed unless verified", "insured unless verified", "emergency availability unless confirmed", "fixed repair prices unless owner confirms"],
+    "requiredDisclosures": ["automated call disclosure", "public-source phone explanation", "do-not-call opt out"],
+    "licenseVerification": "Verify plumbing license before using license or bonded copy."
+  },
+  "serviceOffer": {
+    "headline": "Urgent plumbing service-area page",
+    "customerOutcome": "Homeowners can confirm coverage, services, and a direct phone path before the leak gets worse.",
+    "packages": [
+      { "key": "plumbing-page", "name": "Plumbing service page", "description": "Emergency-friendly service area, tap-to-call, job categories, proof, and hosting.", "priceCents": 60000 },
+      { "key": "drain-offer", "name": "Drain offer page", "description": "Focused drain or sewer page with verified service boundaries.", "priceCents": 22000 }
+    ],
+    "refundPolicy": "Refund before build work starts if service coverage or claim safety cannot be confirmed.",
+    "proofAssets": ["service category evidence", "review themes", "license lookup if available"]
+  },
+  "fulfillmentRequirements": [
+    "service area confirmed",
+    "emergency or after-hours copy verified",
+    "license claims verified or omitted",
+    "job types listed only when evidence supports them",
+    "tap-to-call QA complete"
+  ],
+  "vendorRequirements": [
+    "licensed plumber for any non-digital dispatch",
+    "insurance certificate before subcontracted work",
+    "backup vendor for emergency claims"
+  ],
+  "qaRules": [
+    "no fake license, bond, insurance, or 24/7 claims",
+    "drain, leak, sewer, and water-heater claims match evidence",
+    "phone CTA is visible on mobile",
+    "refund and scope boundaries are clear"
+  ],
+  "portalCopy": {
+    "intakePrompt": "Confirm service area, emergency hours, license language, and the plumbing jobs to show.",
+    "approvalLabel": "Approve plumbing page",
+    "revisionLabel": "Update service menu or coverage"
+  },
+  "trustRequirements": [
+    "license evidence or explicit omission",
+    "service-area source",
+    "review proof source"
+  ],
+  "reviewStrategy": [
+    "request reviews about response time, clean work, and problem solved",
+    "capture repeated job-type mentions for future service chips"
+  ],
+  "growthPaths": [
+    "drain cleaning landing page",
+    "water heater service page",
+    "missed-call rescue",
+    "review capture loop"
+  ],
+  "retentionLoops": [
+    "quarterly service menu review",
+    "review proof update",
+    "seasonal freeze or storm copy refresh"
+  ],
+  "marginModel": {
+    "basePriceCents": 60000,
+    "estimatedFulfillmentCostCents": 18000,
+    "targetGrossMarginPct": 47,
+    "maxAcquisitionCostPct": 18,
+    "notes": "Emergency plumbing has strong conversion value, but claim safety and licensing gates are mandatory."
+  },
+  "launchChecklist": [
+    "service-area evidence captured",
+    "license-sensitive copy reviewed",
+    "emergency claim approved or omitted",
+    "offer price confirmed",
+    "mobile tap-to-call QA",
+    "owner approval recorded",
+    "aftercare scheduled"
+  ],
+  "evals": [
+    "license-claim safety",
+    "urgent CTA clarity",
+    "service menu evidence",
+    "review proof quality"
+  ]
 }

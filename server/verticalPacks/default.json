@@ -41,5 +41,94 @@
     "Make hours, location, and the next step visible without sending prospects through scattered listings."
   ],
   "siteTemplateHint": "Use the default style: clean and professional, neutral base with one brand accent, hero with name and tap-to-call CTA, short service section, and a contact section.",
-  "customerPersonaHint": "Local prospects who searched for the business by name or category and want to confirm legitimacy and how to reach them."
+  "customerPersonaHint": "Local prospects who searched for the business by name or category and want to confirm legitimacy and how to reach them.",
+  "marketSignals": [
+    { "key": "weak_owned_site", "label": "No clear owned site or the site hides the next customer action.", "evidenceHint": "Website missing, thin, broken, or scattered across listings." },
+    { "key": "listing_dependency", "label": "Customers must rely on third-party listings to understand the business.", "evidenceHint": "Public listing has hours, phone, or services that are not present on an owned page." },
+    { "key": "review_question_gap", "label": "Reviews reveal repeated customer questions that a one-page site can answer.", "evidenceHint": "Review themes mention hours, location, services, availability, or contact friction." }
+  ],
+  "leadSources": [
+    "Google Maps category searches",
+    "public directory listings",
+    "review pages with weak owned-site links",
+    "local chamber or neighborhood business pages"
+  ],
+  "compliance": {
+    "restrictedClaims": ["guaranteed revenue", "fake reviews", "unverified credentials"],
+    "requiredDisclosures": ["automated call disclosure", "public-source phone explanation", "do-not-call opt out"],
+    "approvalRequiredFor": ["new regulated service claims", "medical, legal, or financial advice"]
+  },
+  "serviceOffer": {
+    "headline": "Same-day owned web page for a local business",
+    "customerOutcome": "Prospects can understand the business and take one clear next step without digging through listings.",
+    "packages": [
+      { "key": "single-page", "name": "Single-page launch", "description": "Owned page with service summary, proof, contact CTA, and hosting.", "priceCents": 50000 }
+    ],
+    "refundPolicy": "Refund before build work starts if the owner declines the scoped page.",
+    "proofAssets": ["public listing facts", "review themes", "business contact details"]
+  },
+  "fulfillmentRequirements": [
+    "confirmed business name and service area",
+    "safe public copy with no unverified claims",
+    "contact CTA and owner correction path",
+    "hosted page with basic QA"
+  ],
+  "vendorRequirements": [
+    "human designer or builder only when automated build QA fails",
+    "operator review for regulated categories"
+  ],
+  "qaRules": [
+    "phone, email, and form paths work",
+    "hours, address, and service claims match evidence",
+    "page renders on mobile first viewport",
+    "no fake testimonials, awards, or credentials"
+  ],
+  "portalCopy": {
+    "intakePrompt": "Confirm the services, hours, service area, and preferred customer action.",
+    "approvalLabel": "Approve owned page",
+    "revisionLabel": "Request copy or contact changes"
+  },
+  "trustRequirements": [
+    "source every business claim to public evidence or owner input",
+    "keep opt-out and privacy links visible where outreach is involved",
+    "store correction history"
+  ],
+  "reviewStrategy": [
+    "turn real review themes into proof copy",
+    "request a review after successful launch and owner approval"
+  ],
+  "growthPaths": [
+    "local SEO section expansion",
+    "review capture loop",
+    "contact automation",
+    "simple offer or coupon landing page"
+  ],
+  "retentionLoops": [
+    "quarterly business info check",
+    "review summary update",
+    "seasonal offer refresh"
+  ],
+  "marginModel": {
+    "basePriceCents": 50000,
+    "estimatedFulfillmentCostCents": 14000,
+    "targetGrossMarginPct": 45,
+    "maxAcquisitionCostPct": 18,
+    "notes": "Default one-page work should stay mostly automated with human review only for exceptions."
+  },
+  "launchChecklist": [
+    "public evidence captured",
+    "owner contact method verified",
+    "offer and price confirmed",
+    "page copy generated",
+    "QA complete",
+    "owner approval recorded",
+    "hosting live",
+    "aftercare scheduled"
+  ],
+  "evals": [
+    "owned site clarity",
+    "mobile CTA visibility",
+    "claim-source alignment",
+    "payment-to-launch handoff"
+  ]
 }

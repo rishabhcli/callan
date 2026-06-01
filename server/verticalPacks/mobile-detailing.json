@@ -1,0 +1,27 @@
+{
+  "key": "mobile_detailing",
+  "name": "Mobile detailing",
+  "matchNiches": ["mobile detailing", "car detailing", "auto detailing", "ceramic coating", "mobile car wash"],
+  "priceCents": 65000,
+  "pitchTone": "Visual, route-aware, and package-focused. Make area, packages, and prep requirements obvious.",
+  "valuePropHook": "A mobile detailing booking page that clarifies packages, service area, vehicle prep, and quote boundaries before the detailer drives out.",
+  "reviewValueProps": ["before/after proof", "package clarity", "service-area visibility"],
+  "marketSignals": ["package confusion", "service-area uncertainty", "DM-only scheduling"],
+  "leadSources": ["detailing directories", "social profiles", "review mentions of package confusion"],
+  "compliance": { "restrictedClaims": ["guaranteed coating durability", "unverified insurance", "bait-and-switch pricing"], "requiredDisclosures": ["quote boundary", "vehicle condition caveat"] },
+  "serviceOffer": {
+    "headline": "Mobile detailing package and booking setup",
+    "customerOutcome": "Drivers can pick the right package, confirm service area, and request a booking with prep expectations clear.",
+    "packages": [{ "key": "detailing-booking", "name": "Detailing booking page", "description": "Package menu, service-area gate, prep notes, proof gallery, and booking CTA.", "priceCents": 65000 }],
+    "proofAssets": ["package list", "service area", "before/after photos"]
+  },
+  "fulfillmentRequirements": ["package menu approved", "service radius confirmed", "prep copy reviewed"],
+  "vendorRequirements": ["insurance proof before claims", "photo permission policy"],
+  "qaRules": ["packages are distinct", "area gate visible", "no coating guarantee"],
+  "trustRequirements": ["photo permission", "quote disclaimer"],
+  "growthPaths": ["maintenance detail reminders", "review capture"],
+  "retentionLoops": ["seasonal detail reminder", "fleet inquiry follow-up"],
+  "marginModel": { "basePriceCents": 65000, "estimatedFulfillmentCostCents": 18000, "targetGrossMarginPct": 50, "maxAcquisitionCostPct": 18 },
+  "launchChecklist": ["packages captured", "service area approved", "photo proof reviewed", "booking QA", "owner approval recorded"],
+  "evals": ["package clarity", "quote-boundary safety"]
+}

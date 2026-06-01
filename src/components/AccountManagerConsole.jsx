@@ -10,7 +10,8 @@ const KIND_LABELS = {
   seasonal_hours: 'Seasonal hours',
   service_menu_changes: 'Service/menu',
   analytics_contact_flow_check: 'Analytics/contact',
-  hosting_subscription_status: 'Hosting'
+  hosting_subscription_status: 'Hosting',
+  renewal_closeout_health_check: 'Renewal closeout'
 };
 
 export default function AccountManagerConsole({ detail, focusedLeadId, onLeadChanged }) {
@@ -20,6 +21,10 @@ export default function AccountManagerConsole({ detail, focusedLeadId, onLeadCha
   const state = detail?.accountManager || {};
   const plan = state.plan;
   const tasks = state.tasks || [];
+  const operatorBoard = state.operatorBoard || {};
+  const boardItems = operatorBoard.workItems || [];
+  const boardReceipts = operatorBoard.lifecycleReceipts || [];
+  const boardRetentionFeedback = operatorBoard.retentionFeedbackReceipts || [];
   const evidence = useMemo(() => new Map((plan?.evidence || []).map((item) => [item.id, item])), [plan]);
   const pending = tasks.filter((task) => ['pending', 'approved', 'paused', 'blocked'].includes(task.status));
   const recent = tasks.filter((task) => ['sent', 'completed'].includes(task.status));
@@ -39,12 +44,40 @@ export default function AccountManagerConsole({ detail, focusedLeadId, onLeadCha
       if (action === 'pause') await api.pauseAccountTask(task.id, { note: 'Paused from operator console.' });
       if (action === 'complete') await api.completeAccountTask(task.id, { note: 'Completed from operator console.' });
       if (action === 'reassign') await api.reassignAccountTask(task.id, { owner: body.owner || 'operator' });
+      if (action === 'escalate') await api.escalateAccountTask(task.id, {
+        actor: 'operator_console',
+        evidence: [{ id: `operator-console-escalation-${task.id}`, source: 'operator_console', summary: 'Operator escalated account-manager task into board review.' }]
+      });
       if (action === 'why') {
         const data = await api.explainAccountTask(task.id);
         setExplain((prev) => ({ ...prev, [task.id]: data }));
         return;
       }
       onLeadChanged?.(focusedLeadId || task?.lead_id);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runBoard(action, item, body = {}) {
+    const key = `board-${action}:${item.id}`;
+    setBusy(key);
+    setError(null);
+    try {
+      if (action === 'claim') await api.claimAccountOperatorBoardWorkItem(item.id, {
+        actor: 'operator_console',
+        evidence: [{ id: `operator-console-board-claim-${item.id}`, source: 'operator_console', summary: 'Operator claimed account-manager board work locally.' }]
+      });
+      if (action === 'resolve') await api.resolveAccountOperatorBoardWorkItem(item.id, {
+        actor: 'operator_console',
+        proofKey: item.instructions?.requiredProof,
+        proof: body.proof || { reviewed: true, source: 'operator_console' },
+        note: 'Resolved from operator console without live side effects.',
+        evidence: [{ id: `operator-console-board-resolve-${item.id}`, source: 'operator_console', summary: 'Operator resolved account-manager board work locally.' }]
+      });
+      onLeadChanged?.(focusedLeadId || item.lead_id);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -105,6 +138,14 @@ export default function AccountManagerConsole({ detail, focusedLeadId, onLeadCha
         onRun={run}
       />
 
+      <OperatorBoardList
+        items={boardItems}
+        receipts={boardReceipts}
+        retentionFeedback={boardRetentionFeedback}
+        busy={busy}
+        onRun={runBoard}
+      />
+
       <TaskList
         title="recent aftercare"
         tasks={recent}
@@ -115,6 +156,54 @@ export default function AccountManagerConsole({ detail, focusedLeadId, onLeadCha
         compact
       />
     </div>
+  );
+}
+
+function OperatorBoardList({ items, receipts, retentionFeedback, busy, onRun }) {
+  const receiptCount = new Map();
+  for (const receipt of receipts || []) {
+    receiptCount.set(receipt.operator_board_work_item_id, (receiptCount.get(receipt.operator_board_work_item_id) || 0) + 1);
+  }
+  const retentionCount = new Map();
+  for (const receipt of retentionFeedback || []) {
+    retentionCount.set(receipt.operator_board_work_item_id, (retentionCount.get(receipt.operator_board_work_item_id) || 0) + 1);
+  }
+  return (
+    <section className="growth-opportunities">
+      <div className="section-head">
+        <span className="hd">operator board</span>
+        <span className="mono note">{items.length} work items</span>
+      </div>
+      {items.length ? (
+        <div className="growth-list">
+          {items.map((item) => (
+            <div key={item.id} className={`growth-item account-task account-task-${item.status}`}>
+              <div className="growth-item-top">
+                <span className="growth-section mono">{item.work_item_kind}</span>
+                <span className={`thread-flag thread-flag-${statusTone(item.status, item.priority)}`}>{item.status}</span>
+              </div>
+              <div className="growth-item-title">{item.title}</div>
+              <div className="growth-item-copy">
+                {(item.instructions?.checklist || []).slice(0, 2).join(' ')}
+              </div>
+              <div className="account-task-meta mono">
+                due {formatDate(item.due_at)} · {item.priority} · receipts {receiptCount.get(item.id) || 0} · retention {retentionCount.get(item.id) || 0}
+              </div>
+              <div className="account-actions">
+                <button className="btn btn-mini" disabled={!!busy || item.status === 'resolved'} onClick={() => onRun('claim', item)}>
+                  {busy === `board-claim:${item.id}` ? 'claiming...' : 'claim'}
+                </button>
+                <button className="btn btn-mini btn-primary" disabled={!!busy || item.status === 'resolved'} onClick={() => onRun('resolve', item)}>
+                  {busy === `board-resolve:${item.id}` ? 'resolving...' : 'resolve'}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="growth-empty mono">// no account-manager board work yet.</div>
+      )}
+    </section>
   );
 }
 
@@ -181,6 +270,9 @@ function TaskCard({ task, evidence, busy, explain, onRun, compact }) {
           <button className="btn btn-mini" disabled={!!busy} onClick={() => onRun('reassign', task, { owner: task.owner === 'operator' ? 'account_manager' : 'operator' })}>
             reassign
           </button>
+          <button className="btn btn-mini" disabled={!!busy} onClick={() => onRun('escalate', task)}>
+            {busy === key('escalate') ? 'escalating...' : 'board'}
+          </button>
           <button className="btn btn-mini" disabled={!!busy} onClick={() => onRun('why', task)}>
             {busy === key('why') ? 'checking...' : 'why now'}
           </button>
@@ -219,7 +311,7 @@ function EvidencePill({ id, evidence }) {
 
 function statusTone(status, priority) {
   if (status === 'blocked') return 'bad';
-  if (status === 'approved' || status === 'sent' || status === 'completed') return 'good';
+  if (status === 'approved' || status === 'sent' || status === 'completed' || status === 'resolved') return 'good';
   if (priority === 'urgent' || priority === 'high') return 'warn';
   if (status === 'paused') return 'muted';
   return 'info';

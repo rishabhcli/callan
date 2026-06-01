@@ -35,6 +35,19 @@ export default function ShareView({ token }) {
     commerceBusy: false,
     commerceError: null,
     commerceMessage: null,
+    renewalBusy: null,
+    renewalError: null,
+    renewalMessage: null,
+    renewalChangeBusy: null,
+    renewalChangeError: null,
+    renewalChangeMessage: null,
+    renewalChangeNotes: {},
+    renewalConfirmationBusy: null,
+    renewalConfirmationError: null,
+    renewalConfirmationMessage: null,
+    renewalConfirmationAcceptBusy: null,
+    renewalConfirmationAcceptError: null,
+    renewalConfirmationAcceptMessage: null,
     optOutBusy: false,
     optOutError: null,
     optOutDone: false
@@ -107,6 +120,8 @@ export default function ShareView({ token }) {
   const verticalPack = data?.vertical_pack || null;
   const commerce = data?.commerce || null;
   const aftercare = data?.aftercare || { pending: [], recent: [] };
+  const subscriptionManagement = data?.subscriptionManagement || { subscriptions: [] };
+  const subscriptions = Array.isArray(subscriptionManagement.subscriptions) ? subscriptionManagement.subscriptions : [];
   const trust = data?.trust || null;
   const accepted = quoteStatus === 'accepted' || quoteStatus === 'paid';
   const paid = quoteStatus === 'paid';
@@ -287,6 +302,104 @@ export default function ShareView({ token }) {
       setActionState((s) => ({ ...s, commerceBusy: false, commerceError: err.message }));
     }
   }, [actionState.commerceText, postAction, load]);
+
+  const handleRenewalChangeNoteChange = useCallback((subscriptionId, value) => {
+    setActionState((s) => ({
+      ...s,
+      renewalChangeNotes: { ...(s.renewalChangeNotes || {}), [subscriptionId]: value }
+    }));
+  }, []);
+
+  const handleRenewalChangeRequest = useCallback(async (subscriptionId) => {
+    const note = String(actionState.renewalChangeNotes?.[subscriptionId] || '').trim();
+    setActionState((s) => ({ ...s, renewalChangeBusy: subscriptionId, renewalChangeError: null, renewalChangeMessage: null }));
+    try {
+      await postAction('/renewal/change-request', {
+        subscriptionId,
+        note: note || `Renewal change requested for ${business.name || 'this account'} from the customer portal.`,
+        requestType: 'change'
+      });
+      setActionState((s) => ({
+        ...s,
+        renewalChangeBusy: null,
+        renewalChangeMessage: 'Renewal change request sent for operator review.',
+        renewalChangeNotes: { ...(s.renewalChangeNotes || {}), [subscriptionId]: '' }
+      }));
+      load();
+    } catch (err) {
+      setActionState((s) => ({ ...s, renewalChangeBusy: null, renewalChangeError: err.message }));
+    }
+  }, [actionState.renewalChangeNotes, business.name, postAction, load]);
+
+  const handleRenewalReview = useCallback(async (subscriptionId) => {
+    setActionState((s) => ({ ...s, renewalBusy: subscriptionId, renewalError: null, renewalMessage: null }));
+    try {
+      await postAction('/renewal/review', {
+        subscriptionId,
+        note: `Renewal plan reviewed from the customer portal for ${business.name || 'this account'}.`
+      });
+      setActionState((s) => ({
+        ...s,
+        renewalBusy: null,
+        renewalMessage: 'Renewal plan reviewed.'
+      }));
+      load();
+    } catch (err) {
+      setActionState((s) => ({ ...s, renewalBusy: null, renewalError: err.message }));
+    }
+  }, [business.name, postAction, load]);
+
+  const handleRenewalConfirmationAcknowledge = useCallback(async (confirmationId) => {
+    setActionState((s) => ({
+      ...s,
+      renewalConfirmationBusy: confirmationId,
+      renewalConfirmationError: null,
+      renewalConfirmationMessage: null
+    }));
+    try {
+      await postAction(`/renewal/confirmations/${encodeURIComponent(confirmationId)}/acknowledge`, {
+        note: `Renewal confirmation acknowledged from the customer portal for ${business.name || 'this account'}.`
+      });
+      setActionState((s) => ({
+        ...s,
+        renewalConfirmationBusy: null,
+        renewalConfirmationMessage: 'Renewal confirmation acknowledged.'
+      }));
+      load();
+    } catch (err) {
+      setActionState((s) => ({
+        ...s,
+        renewalConfirmationBusy: null,
+        renewalConfirmationError: err.message
+      }));
+    }
+  }, [business.name, postAction, load]);
+
+  const handleRenewalConfirmationAccept = useCallback(async (confirmationId) => {
+    setActionState((s) => ({
+      ...s,
+      renewalConfirmationAcceptBusy: confirmationId,
+      renewalConfirmationAcceptError: null,
+      renewalConfirmationAcceptMessage: null
+    }));
+    try {
+      await postAction(`/renewal/confirmations/${encodeURIComponent(confirmationId)}/accept`, {
+        note: `Renewal confirmation accepted from the customer portal for ${business.name || 'this account'}.`
+      });
+      setActionState((s) => ({
+        ...s,
+        renewalConfirmationAcceptBusy: null,
+        renewalConfirmationAcceptMessage: 'Renewal confirmation accepted.'
+      }));
+      load();
+    } catch (err) {
+      setActionState((s) => ({
+        ...s,
+        renewalConfirmationAcceptBusy: null,
+        renewalConfirmationAcceptError: err.message
+      }));
+    }
+  }, [business.name, postAction, load]);
 
   const handleOptOut = useCallback(async () => {
     const ok = window.confirm(
@@ -857,6 +970,136 @@ export default function ShareView({ token }) {
               </div>
             ))}
           </div>
+        </section>
+      ) : null}
+
+      {subscriptions.length ? (
+        <section className="nyna-share-aftercare">
+          <div className="nyna-card-title">subscription</div>
+          <div className="nyna-share-aftercare-grid">
+            {subscriptions.slice(0, 4).map((subscription) => (
+              <div key={subscription.id} className="nyna-share-aftercare-item">
+                <div>
+                  <div className="nyna-share-aftercare-title">
+                    {labelize(subscription.plan || 'care plan')} · {formatMoney(subscription.amountCents, subscription.currency)}
+                  </div>
+                  <div className="nyna-share-aftercare-copy">
+                    {subscription.renewal?.recommendedMotion
+                      ? labelize(subscription.renewal.recommendedMotion)
+                      : 'Your care plan is tracked here.'}
+                  </div>
+                  {subscription.renewal?.nextSteps?.length ? (
+                    <div className="nyna-share-aftercare-copy">
+                      {subscription.renewal.nextSteps.slice(0, 2).map(labelize).join(' / ')}
+                    </div>
+                  ) : null}
+                  {subscription.renewal?.customerReviewed ? (
+                    <div className="nyna-share-aftercare-copy">reviewed from this portal</div>
+                  ) : null}
+                  {subscription.renewal?.changeRequestCount ? (
+                    <div className="nyna-share-aftercare-copy">
+                      {subscription.renewal.changeRequestCount} change request{subscription.renewal.changeRequestCount === 1 ? '' : 's'} pending operator review
+                    </div>
+                  ) : null}
+                  {subscription.renewal?.confirmationCount ? (
+                    <div className="nyna-share-aftercare-copy">
+                      {subscription.renewal.confirmationCount} renewal confirmation{subscription.renewal.confirmationCount === 1 ? '' : 's'} visible
+                    </div>
+                  ) : null}
+                  {subscription.renewal?.confirmations?.length ? (
+                    <div className="nyna-share-confirmation-list">
+                      {subscription.renewal.confirmations.slice(0, 3).map((confirmation) => (
+                        <div key={confirmation.id} className="nyna-share-confirmation-row">
+                          <div>
+                            <strong>{confirmation.closeoutPacketVisible ? 'renewal closed' : confirmation.accepted ? 'accepted' : confirmation.acknowledged ? 'acknowledged' : 'confirmation ready'}</strong>
+                            <span>{confirmation.summary || 'Renewal update recorded in this portal.'}</span>
+                            {confirmation.latestCloseoutPacket ? (
+                              <span className="nyna-share-confirmation-closeout">
+                                {confirmation.latestCloseoutPacket.summary || 'Closeout packet recorded. No action is needed right now.'}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="nyna-share-confirmation-actions">
+                            {!confirmation.acknowledged ? (
+                              <button
+                                type="button"
+                                className="nyna-action nyna-action-secondary"
+                                onClick={() => handleRenewalConfirmationAcknowledge(confirmation.id)}
+                                disabled={actionState.renewalConfirmationBusy === confirmation.id}
+                              >
+                                {actionState.renewalConfirmationBusy === confirmation.id ? 'saving...' : 'mark received'}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="nyna-action nyna-action-secondary"
+                                onClick={() => handleRenewalConfirmationAccept(confirmation.id)}
+                                disabled={confirmation.accepted || actionState.renewalConfirmationAcceptBusy === confirmation.id}
+                              >
+                                {confirmation.accepted
+                                  ? 'accepted'
+                                  : actionState.renewalConfirmationAcceptBusy === confirmation.id
+                                    ? 'saving...'
+                                    : 'looks good'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="nyna-share-renewal-actions">
+                  <span className={`nyna-share-aftercare-status nyna-share-aftercare-status-${subscription.status}`}>
+                    {labelize(subscription.status)}
+                  </span>
+                  {subscription.renewal && !subscription.renewal.customerReviewed ? (
+                    <button
+                      type="button"
+                      className="nyna-action nyna-action-secondary"
+                      onClick={() => handleRenewalReview(subscription.id)}
+                      disabled={actionState.renewalBusy === subscription.id}
+                    >
+                      {actionState.renewalBusy === subscription.id ? 'saving…' : 'review'}
+                    </button>
+                  ) : null}
+                  {subscription.renewal ? (
+                    <div className="nyna-share-renewal-change-form">
+                      <textarea
+                        className="nyna-share-renewal-change-input"
+                        rows={2}
+                        placeholder="what would you like to change about renewal? (operator will review)"
+                        value={actionState.renewalChangeNotes?.[subscription.id] || ''}
+                        onChange={(event) => handleRenewalChangeNoteChange(subscription.id, event.target.value)}
+                        disabled={actionState.renewalChangeBusy === subscription.id}
+                      />
+                      <button
+                        type="button"
+                        className="nyna-action nyna-action-secondary"
+                        onClick={() => handleRenewalChangeRequest(subscription.id)}
+                        disabled={actionState.renewalChangeBusy === subscription.id}
+                      >
+                        {actionState.renewalChangeBusy === subscription.id ? 'sending…' : 'request change'}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+          {subscriptionManagement.changeRequestCount ? (
+            <div className="nyna-share-action-note">
+              {subscriptionManagement.changeRequestCount} renewal change request{subscriptionManagement.changeRequestCount === 1 ? '' : 's'} on file. We will follow up — no automatic billing changes are made from this portal.
+            </div>
+          ) : null}
+          {actionState.renewalMessage ? <div className="nyna-share-action-note">{actionState.renewalMessage}</div> : null}
+          {actionState.renewalError ? <div className="nyna-share-action-error">{actionState.renewalError}</div> : null}
+          {actionState.renewalChangeMessage ? <div className="nyna-share-action-note">{actionState.renewalChangeMessage}</div> : null}
+          {actionState.renewalChangeError ? <div className="nyna-share-action-error">{actionState.renewalChangeError}</div> : null}
+          {actionState.renewalConfirmationMessage ? <div className="nyna-share-action-note">{actionState.renewalConfirmationMessage}</div> : null}
+          {actionState.renewalConfirmationError ? <div className="nyna-share-action-error">{actionState.renewalConfirmationError}</div> : null}
+          {actionState.renewalConfirmationAcceptMessage ? <div className="nyna-share-action-note">{actionState.renewalConfirmationAcceptMessage}</div> : null}
+          {actionState.renewalConfirmationAcceptError ? <div className="nyna-share-action-error">{actionState.renewalConfirmationAcceptError}</div> : null}
         </section>
       ) : null}
 

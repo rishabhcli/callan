@@ -1,0 +1,49 @@
+name: Callan evals
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_ENV: test
+      RUN_MODE: mock
+      LIVE_CALLS: "false"
+      LIVE_EMAILS: "false"
+      LIVE_PAYMENTS: "false"
+      LIVE_BROWSER_SESSIONS: "false"
+      LIVE_PUBLIC_OUTREACH: "false"
+      LIVE_BUILDS: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Production eval suite
+        run: npm run check:evals
+
+      - name: Handoff suite
+        run: npm run check:handoff
+
+      - name: Operator handoff live-adapter contract
+        run: npm run check:eval-adapter-contract
+
+      - name: May goals acceptance ledger
+        run: npm run check:maygoals

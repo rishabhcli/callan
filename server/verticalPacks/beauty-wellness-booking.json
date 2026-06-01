@@ -1,0 +1,27 @@
+{
+  "key": "beauty_wellness_booking",
+  "name": "Beauty and wellness booking",
+  "matchNiches": ["salon booking", "spa booking", "beauty booking", "wellness booking", "massage booking"],
+  "priceCents": 65000,
+  "pitchTone": "Polished, appointment-focused, and careful around health or medical claims.",
+  "valuePropHook": "A beauty and wellness booking setup that makes services, availability boundaries, deposits, and intake questions clear before appointment confirmation.",
+  "reviewValueProps": ["easy booking", "service menu clarity", "deposit policy visibility"],
+  "marketSignals": ["DM-only booking", "unclear service menu", "missed appointment complaints"],
+  "leadSources": ["Instagram-heavy businesses", "salon directories", "review profiles with booking friction"],
+  "compliance": { "restrictedClaims": ["medical outcomes", "licensed treatment unless verified", "guaranteed results"], "requiredDisclosures": ["service scope", "deposit and cancellation policy"] },
+  "serviceOffer": {
+    "headline": "Beauty and wellness booking setup",
+    "customerOutcome": "Clients can understand services, policies, and booking steps before requesting an appointment.",
+    "packages": [{ "key": "wellness-booking", "name": "Booking setup", "description": "Service menu, intake questions, deposit/cancel policy, and booking CTA.", "priceCents": 65000 }],
+    "proofAssets": ["service menu", "booking policy", "license evidence if needed"]
+  },
+  "fulfillmentRequirements": ["service menu approved", "policy copy approved", "booking owner assigned"],
+  "vendorRequirements": ["calendar provider smoke before live booking", "license review for regulated services"],
+  "qaRules": ["policy visible", "no medical claims", "booking request path works"],
+  "trustRequirements": ["policy source", "license claim evidence"],
+  "growthPaths": ["repeat booking reminders", "review request loop"],
+  "retentionLoops": ["monthly service-menu refresh", "no-show policy review"],
+  "marginModel": { "basePriceCents": 65000, "estimatedFulfillmentCostCents": 19000, "targetGrossMarginPct": 48, "maxAcquisitionCostPct": 17 },
+  "launchChecklist": ["service menu captured", "policy reviewed", "booking CTA drafted", "mobile QA complete", "owner approval recorded"],
+  "evals": ["booking-policy clarity", "restricted-claim safety"]
+}

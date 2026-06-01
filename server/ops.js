@@ -1,13 +1,33 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
-import { calls, db, durableJobs, providerSmoke, safeToSellReports, scheduledCalls } from './db.js';
+import { accountTasks, calls, db, durableJobs, portfolioOperatingModel, providerSmoke, safeToRenewPlaybooks, safeToRenewReports, safeToSellReports, scheduledCalls, workflowInstances, workflowReplayReceipts } from './db.js';
 import { env } from './env.js';
 import { drainDurableJobsOnce, enqueueJob } from './jobs.js';
 import { log, redact } from './logger.js';
+import { containsRawSecret } from './secretRedaction.js';
 import { recordProviderPosture } from './providerPosture.js';
 import { isProviderRuntimeError, providerRuntimeIncident } from './providerIncidents.js';
 import { operationalErrorSummary } from './operationalErrors.js';
 import { ACCOUNT_MANAGER_RUN_JOB_TYPE, enqueueAccountManagerRun, handleAccountManagerRunJob } from './accountManager/scheduler.js';
+import { SAFE_TO_RENEW_JOB_TYPE, runSafeToRenewSelfCheck } from './safeToRenew.js';
+import {
+  RENEWAL_CUSTOMER_CONFIRMATION_ACCEPT_ACTION_TYPE,
+  RENEWAL_CUSTOMER_CONFIRMATION_ACK_ACTION_TYPE,
+  RENEWAL_CUSTOMER_CONFIRMATION_CLOSEOUT_PACKET_ACTION_TYPE,
+  RENEWAL_CUSTOMER_CONFIRMATION_FOLLOWUP_ACTION_TYPE,
+  RENEWAL_CUSTOMER_CONFIRMATION_FOLLOWUP_RECEIPT_ACTION_TYPE,
+  RENEWAL_CUSTOMER_CONFIRMATION_RECEIPT_ACTION_TYPE,
+  summarizeRenewalBillingExecutionReceiptQueue,
+  summarizeRenewalBillingChangePreflightQueue,
+  summarizeRenewalCustomerConfirmationAcceptanceQueue,
+  summarizeRenewalCustomerConfirmationAcknowledgementQueue,
+  summarizeRenewalCustomerConfirmationCloseoutPacketQueue,
+  summarizeRenewalCustomerConfirmationFollowupQueue,
+  summarizeRenewalCustomerConfirmationQueue,
+  summarizeRenewalCustomerMessageSendReceiptQueue,
+  summarizeRenewalCustomerMessagePreflightQueue,
+  summarizeRenewalChangeRequestQueue
+} from './customerPortal.js';
 
 const BACKUP_PREFIX = 'callan-backup-';
 const HOUR_MS = 60 * 60 * 1000;
@@ -26,13 +46,874 @@ const WORKER_PROVIDER_DEPENDENCIES = {
 export const OPS_BACKUP_JOB_TYPE = 'ops.backup';
 export const OPS_PROVIDER_POSTURE_JOB_TYPE = 'ops.provider_posture';
 export const OPS_RECOVER_STUCK_JOB_TYPE = 'ops.recover_stuck';
+export const OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE = 'ops.retention_command_lease_maintenance';
 const OPS_SAFE_TO_SELL_JOB_TYPE = 'ops.safe_to_sell';
 let backupTimer = null;
 let providerPostureTimer = null;
 let recoveryTimer = null;
+let retentionCommandLeaseMaintenanceTimer = null;
 
 export function redactPii(value) {
   return redact(value);
+}
+
+function parseOpsJson(value) {
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseOpsJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeOpsBlockerCode(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_:-]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function formatOpsLabel(value) {
+  const key = normalizeOpsBlockerCode(value);
+  if (!key) return 'Proof';
+  return key.split(/[_:-]+/g).filter(Boolean).map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`).join(' ');
+}
+
+function toOpsIsoDate(value) {
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric) && numeric > 0 ? new Date(numeric) : new Date(value || Date.now());
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function buildOpsMergeQueueConsolidatedBlockerRemediationActions({ warnings, escrow }) {
+  const actions = [];
+  if (warnings.includes('post_ledger_operator_release_attestation_missing')) {
+    actions.push({
+      code: 'restore_post_ledger_operator_release_attestation_receipt',
+      missingReceiptId: escrow.merge_queue_post_ledger_operator_release_attestation_receipt_id || null,
+      sourceTable: 'portfolio_eval_merge_queue_post_ledger_operator_release_attestation_receipts',
+      operatorAction: 'restore_or_replay_parent_attestation_before_release_review',
+      releaseBlockedUntilResolved: true
+    });
+  }
+  if (warnings.includes('final_blocker_ledger_missing')) {
+    actions.push({
+      code: 'restore_final_blocker_ledger_receipt',
+      missingReceiptId: escrow.merge_queue_final_blocker_ledger_receipt_id || null,
+      sourceTable: 'portfolio_eval_merge_queue_final_blocker_ledger_receipts',
+      operatorAction: 'restore_or_replay_final_blocker_ledger_before_release_review',
+      releaseBlockedUntilResolved: true
+    });
+  }
+  if (warnings.includes('live_merge_authorization_missing')) {
+    actions.push({
+      code: 'restore_live_merge_authorization_receipt',
+      missingReceiptId: escrow.live_merge_authorization_receipt_id || null,
+      sourceTable: 'portfolio_eval_live_merge_authorization_receipts',
+      operatorAction: 'restore_or_replay_live_merge_authorization_preflight_before_release_review',
+      releaseBlockedUntilResolved: true
+    });
+  }
+  return actions;
+}
+
+export function buildOpsMergeQueueConsolidatedBlockerAudits(tables, limit) {
+  const escrows = tables.portfolioEvalMergeQueuePostAttestationReleaseEscrowReceipts || [];
+  const attestations = tables.portfolioEvalMergeQueuePostLedgerOperatorReleaseAttestationReceipts || [];
+  const ledgers = tables.portfolioEvalMergeQueueFinalBlockerLedgerReceipts || [];
+  const authorizations = tables.portfolioEvalLiveMergeAuthorizationReceipts || [];
+  return escrows.slice(0, Math.max(1, Math.min(Number(limit) || 50, 200))).map((escrow) => {
+    const response = parseOpsJson(escrow.response_json);
+    const attestation = attestations.find((item) => item.id === escrow.merge_queue_post_ledger_operator_release_attestation_receipt_id) || null;
+    const ledger = ledgers.find((item) => item.id === escrow.merge_queue_final_blocker_ledger_receipt_id) || null;
+    const authorization = authorizations.find((item) => item.id === escrow.live_merge_authorization_receipt_id) || null;
+    const sourceReceipts = [
+      { kind: 'post_attestation_release_escrow', id: escrow.id, table: 'portfolio_eval_merge_queue_post_attestation_release_escrow_receipts' },
+      attestation ? { kind: 'post_ledger_operator_release_attestation', id: attestation.id, table: 'portfolio_eval_merge_queue_post_ledger_operator_release_attestation_receipts' } : null,
+      ledger ? { kind: 'final_blocker_ledger', id: ledger.id, table: 'portfolio_eval_merge_queue_final_blocker_ledger_receipts' } : null,
+      authorization ? { kind: 'live_merge_authorization', id: authorization.id, table: 'portfolio_eval_live_merge_authorization_receipts' } : null
+    ].filter(Boolean);
+    const warnings = [];
+    if (!attestation) warnings.push('post_ledger_operator_release_attestation_missing');
+    if (!ledger) warnings.push('final_blocker_ledger_missing');
+    if (!authorization) warnings.push('live_merge_authorization_missing');
+    const remediationActions = buildOpsMergeQueueConsolidatedBlockerRemediationActions({ warnings, escrow });
+    const blockerCodes = [...new Set([
+      ...(Array.isArray(response.remainingBlockers) ? response.remainingBlockers : []),
+      'post_attestation_release_escrow_held_by_final_blocker_ledger',
+      'operator_release_blocked_by_final_blocker_ledger',
+      'final_blocker_ledger_sealed',
+      'runtime_token_release_denied',
+      'live_github_http_request',
+      'live_merge_execution_attempt'
+    ].map(normalizeOpsBlockerCode).filter(Boolean))].sort();
+    return {
+      key: `merge_queue_consolidated_blocker_audit:${escrow.id}`,
+      kind: 'merge_queue_consolidated_blocker_audit',
+      status: warnings.length ? 'warning' : 'blocked_release_escrow_held',
+      generatedAt: new Date(escrow.updated_at || escrow.created_at || Date.now()).toISOString(),
+      releaseEscrowReceiptId: escrow.id,
+      postLedgerOperatorReleaseAttestationReceiptId: escrow.merge_queue_post_ledger_operator_release_attestation_receipt_id,
+      finalBlockerLedgerReceiptId: escrow.merge_queue_final_blocker_ledger_receipt_id,
+      liveMergeAuthorizationReceiptId: escrow.live_merge_authorization_receipt_id,
+      serviceBusinessId: escrow.service_business_id || null,
+      evalKey: escrow.eval_key,
+      sourceReceipts,
+      warnings,
+      remediationActions,
+      remediationActionCount: remediationActions.length,
+      blockerCount: blockerCodes.length,
+      blockers: blockerCodes.map((code) => ({ code, status: 'blocking', sourceReceiptIds: sourceReceipts.map((item) => item.id) })),
+      releaseEscrowHeld: response.releaseEscrowHeld === true,
+      escrowReleased: response.escrowReleased === true,
+      releaseApproved: response.releaseApproved === true,
+      tokenReleaseApproved: response.tokenReleaseApproved === true,
+      tokenReleased: response.tokenReleased === true,
+      tokenMaterialized: response.tokenMaterialized === true,
+      authorizationHeaderMaterialized: response.authorizationHeaderMaterialized === true,
+      httpRequestSent: response.httpRequestSent === true,
+      liveGithubApiCalled: response.liveGithubApiCalled === true,
+      liveVerificationPromoted: response.liveVerificationPromoted === true,
+      mergeAllowed: response.mergeAllowed === true,
+      mergeExecuted: response.mergeExecuted === true,
+      liveSideEffects: response.liveSideEffects === true,
+      readOnly: true,
+      externalProvidersCalled: false
+    };
+  });
+}
+
+function buildOpsRetentionCommandWorkItemProofPacket({
+  rollup,
+  commandReceipts = [],
+  commandWorkItems = [],
+  lifecycleReceipts = []
+} = {}) {
+  const provider = 'retention_command_work_item_proof_packet_collector';
+  const proofKeyFor = (value) => normalizeOpsBlockerCode(value || '');
+  const approvedLifecycleReceipts = lifecycleReceipts.filter((receipt) => receipt.status === 'approved');
+  const approvedProofKeys = [...new Set(approvedLifecycleReceipts.map((receipt) => proofKeyFor(receipt.proof_key)).filter(Boolean))];
+  const requiredProofKeys = [...new Set([
+    ...commandWorkItems.map((item) => {
+      const instructions = parseOpsJson(item.instructions_json);
+      return proofKeyFor(instructions.requiredProof || instructions.required_proof || item.proof_key);
+    }),
+    ...lifecycleReceipts.map((receipt) => proofKeyFor(receipt.proof_key))
+  ].filter(Boolean))];
+  const hasApprovedProof = (proofKey) => approvedProofKeys.includes(proofKey);
+  const localProofBlockers = requiredProofKeys.filter((proofKey) => !hasApprovedProof(proofKey));
+  return {
+    kind: 'retention_command_work_item_proof_packet',
+    provider,
+    status: commandWorkItems.length
+      ? (localProofBlockers.length ? 'operator_review_incomplete' : 'operator_review_complete')
+      : 'no_work_items',
+    retentionCohortRollupId: rollup?.id || commandReceipts[0]?.retention_cohort_rollup_id || null,
+    workspaceId: rollup?.workspace_id || commandReceipts[0]?.workspace_id || commandWorkItems[0]?.workspace_id || lifecycleReceipts[0]?.workspace_id || null,
+    serviceBusinessId: rollup?.service_business_id || commandReceipts[0]?.service_business_id || commandWorkItems[0]?.service_business_id || lifecycleReceipts[0]?.service_business_id || null,
+    commandReceiptIds: commandReceipts.map((receipt) => receipt.id),
+    commandWorkItemIds: commandWorkItems.map((item) => item.id),
+    lifecycleReceiptIds: lifecycleReceipts.map((receipt) => receipt.id),
+    approvedLifecycleReceiptIds: approvedLifecycleReceipts.map((receipt) => receipt.id),
+    requiredProofKeys,
+    operatorReviewedProofKeys: approvedProofKeys,
+    localProof: {
+      providerLiveSmokeOperatorReviewed: hasApprovedProof('provider_live_smoke'),
+      liveAdapterImplementationOperatorReviewed: hasApprovedProof('live_adapter_implemented'),
+      retentionRunModeApproved: hasApprovedProof('retention_run_mode_approval'),
+      externalSideEffects: false
+    },
+    localProofBlockers,
+    counts: {
+      commandReceiptCount: commandReceipts.length,
+      commandWorkItemCount: commandWorkItems.length,
+      lifecycleReceiptCount: lifecycleReceipts.length,
+      approvedLifecycleReceiptCount: approvedLifecycleReceipts.length,
+      operatorReviewedProofKeyCount: approvedProofKeys.length,
+      localProofBlockerCount: localProofBlockers.length
+    },
+    liveGateSemantics: {
+      canClearCustomerRetentionLivePreflight: false,
+      liveProviderSmokeSatisfied: false,
+      liveAdapterImplementationSatisfied: false,
+      reason: 'operator reviewed command work-item receipts are local evidence only',
+      localReviewCannotClearGateKeys: ['provider_live_smoke', 'live_adapter_implemented'],
+      requiredLiveEvidenceKeys: ['provider_live_smoke_receipt', 'live_adapter_implementation_receipt'],
+      gateClearanceSource: 'live_provider_and_adapter_evidence_required'
+    },
+    safety: {
+      kind: 'retention_command_work_item_proof_packet_safety',
+      provider,
+      evidenceOnly: true,
+      localOperatorReviewOnly: true,
+      externalSideEffects: false,
+      customerMessageSent: false,
+      offerSent: false,
+      priceChangedLive: false,
+      paymentLinkCreated: false,
+      bookingScheduled: false,
+      financeRollupMutated: false,
+      budgetMoved: false,
+      providerCalled: false,
+      adapterInvoked: false,
+      jobEnqueued: false,
+      retentionCohortMutated: false,
+      commandReceiptMutated: false,
+      workItemMutated: false,
+      livePreflightGateBypassed: false,
+      liveProviderSmokeSatisfied: false,
+      liveAdapterImplementationSatisfied: false
+    }
+  };
+}
+
+function buildOpsRetentionCohortCommandAction(blocker) {
+  const key = normalizeOpsBlockerCode(blocker);
+  if (key === 'retention_playbook_dry_run_required') return 'Record a dry-run retention playbook receipt before customer contact.';
+  if (key === 'retention_playbook_live_preflight_required') return 'Run retention live preflight and keep live sends blocked until proof clears.';
+  if (key === 'provider_live_smoke') return 'Attach fresh provider smoke proof before any retention send.';
+  if (key === 'live_adapter_implemented') return 'Ship and verify the retention playbook live adapter before execution.';
+  if (key === 'run_mode') return 'Keep retention follow-up in dry-run/local review until production mode is approved.';
+  if (key === 'retention_capital_feedback_required') return 'Record retention capital feedback from the cohort before budget planning.';
+  if (key === 'customer_retention_draft_review_required') return 'Complete the customer-retention draft review work item.';
+  return `Resolve ${formatOpsLabel(key)} and attach retention evidence.`;
+}
+
+function buildOpsRetentionCohortCommandLiveEvidenceRequirement(blocker) {
+  const key = normalizeOpsBlockerCode(blocker);
+  if (key === 'provider_live_smoke') {
+    return {
+      requiredLiveEvidenceKey: 'provider_live_smoke_receipt',
+      localReviewCannotClearLiveGate: true,
+      gateClearanceSource: 'live_provider_and_adapter_evidence_required'
+    };
+  }
+  if (key === 'live_adapter_implemented') {
+    return {
+      requiredLiveEvidenceKey: 'live_adapter_implementation_receipt',
+      localReviewCannotClearLiveGate: true,
+      gateClearanceSource: 'live_provider_and_adapter_evidence_required'
+    };
+  }
+  return null;
+}
+
+export function buildOpsRetentionCohortCommandCenter(tables, limit) {
+  const cap = Math.max(1, Math.min(Number(limit) || 50, 200));
+  const rollups = tables.portfolioRetentionCohortRollups || [];
+  const playbooks = tables.portfolioCustomerRetentionPlaybooks || [];
+  const playbookReceipts = tables.portfolioCustomerRetentionPlaybookReceipts || [];
+  const capitalFeedbackReceipts = tables.portfolioRetentionCapitalFeedbackReceipts || [];
+  const decisionWorkItems = tables.portfolioDecisionWorkItems || [];
+  const decisionWorkItemReceipts = tables.portfolioDecisionWorkItemReceipts || [];
+  const commandWorkItemReceipts = tables.portfolioRetentionCommandWorkItemReceipts || [];
+  const commandWorkItems = tables.portfolioRetentionCommandWorkItems || [];
+  const commandWorkItemLifecycleReceipts = tables.portfolioRetentionCommandWorkItemLifecycleReceipts || [];
+  const commandWorkItemLeaseSweepReceipts = tables.portfolioRetentionCommandWorkItemLeaseSweepReceipts || [];
+  const commandWorkItemLeaseMaintenanceReceipts = tables.portfolioRetentionCommandWorkItemLeaseMaintenanceReceipts || [];
+  const serviceNames = new Map((tables.serviceBusinesses || []).map((row) => [row.id, row.name]));
+  return rollups.slice(0, cap).map((rollup) => {
+    const cohortKey = normalizeOpsBlockerCode(rollup.cohort_key) || 'retention_cohort';
+    const serviceBusinessId = rollup.service_business_id || null;
+    const servicePlaybooks = playbooks.filter((playbook) => playbook.service_business_id === serviceBusinessId);
+    const cohortMatchedPlaybooks = servicePlaybooks.filter((playbook) => {
+      const retentionStatus = normalizeOpsBlockerCode(playbook.retention_status);
+      const playbookKind = normalizeOpsBlockerCode(playbook.playbook_kind);
+      return (retentionStatus && cohortKey.includes(retentionStatus)) ||
+        (playbookKind && cohortKey.includes(playbookKind));
+    });
+    const relatedPlaybooks = cohortMatchedPlaybooks.length ? cohortMatchedPlaybooks : servicePlaybooks;
+    const playbookIds = new Set(relatedPlaybooks.map((playbook) => playbook.id));
+    const relatedReceipts = playbookReceipts.filter((receipt) => playbookIds.has(receipt.retention_playbook_id));
+    const relatedCapitalFeedback = capitalFeedbackReceipts.filter((receipt) => (
+      receipt.retention_cohort_rollup_id === rollup.id ||
+      (serviceBusinessId && receipt.service_business_id === serviceBusinessId)
+    ));
+    const relatedWorkItems = decisionWorkItems.filter((item) => (
+      item.work_item_kind === 'customer_retention_draft_review' &&
+      (!serviceBusinessId || item.service_business_id === serviceBusinessId)
+    ));
+    const workItemIds = new Set(relatedWorkItems.map((item) => item.id));
+    const relatedWorkItemReceipts = decisionWorkItemReceipts.filter((receipt) => workItemIds.has(receipt.decision_work_item_id));
+    const relatedCommandReceipts = commandWorkItemReceipts.filter((receipt) => (
+      receipt.retention_cohort_rollup_id === rollup.id ||
+      (serviceBusinessId && receipt.service_business_id === serviceBusinessId)
+    ));
+    const commandReceiptIds = new Set(relatedCommandReceipts.map((receipt) => receipt.id));
+    const relatedCommandWorkItems = commandWorkItems.filter((item) => (
+      item.retention_cohort_rollup_id === rollup.id ||
+      commandReceiptIds.has(item.retention_command_work_item_receipt_id)
+    ));
+    const commandWorkItemIds = new Set(relatedCommandWorkItems.map((item) => item.id));
+    const relatedCommandLifecycleReceipts = commandWorkItemLifecycleReceipts.filter((receipt) => (
+      receipt.retention_cohort_rollup_id === rollup.id ||
+      commandWorkItemIds.has(receipt.retention_command_work_item_id) ||
+      commandReceiptIds.has(receipt.retention_command_work_item_receipt_id)
+    ));
+    const relatedCommandLeaseSweepReceipts = commandWorkItemLeaseSweepReceipts.filter((receipt) => (
+      receipt.retention_cohort_rollup_id === rollup.id ||
+      commandReceiptIds.has(receipt.retention_command_work_item_receipt_id) ||
+      (serviceBusinessId && receipt.service_business_id === serviceBusinessId)
+    ));
+    const relatedCommandLeaseMaintenanceReceipts = commandWorkItemLeaseMaintenanceReceipts.filter((receipt) => (
+      receipt.retention_cohort_rollup_id === rollup.id ||
+      commandReceiptIds.has(receipt.retention_command_work_item_receipt_id) ||
+      (serviceBusinessId && receipt.service_business_id === serviceBusinessId)
+    ));
+    const approvedCommandWorkItemCount = relatedCommandLifecycleReceipts.filter((receipt) => receipt.status === 'approved').length;
+    const claimedCommandWorkItemCount = relatedCommandLifecycleReceipts.filter((receipt) => receipt.action_kind === 'claim' && receipt.status === 'claimed').length;
+    const releasedCommandWorkItemCount = relatedCommandLifecycleReceipts.filter((receipt) => receipt.action_kind === 'release' && receipt.status === 'released').length;
+    const expiredCommandWorkItemLeaseCount = relatedCommandLifecycleReceipts.filter((receipt) => receipt.action_kind === 'expire_claim' && receipt.status === 'expired').length;
+    const leaseObservedAt = Date.now();
+    const commandWorkItemLeases = relatedCommandWorkItems
+      .map((item) => {
+        const instructions = parseOpsJson(item.instructions_json);
+        return instructions.lease && typeof instructions.lease === 'object' ? instructions.lease : null;
+      })
+      .filter(Boolean);
+    const activeCommandWorkItemLeases = commandWorkItemLeases.filter((lease) => lease.status === 'active');
+    const staleCommandWorkItemLeases = activeCommandWorkItemLeases.filter((lease) => {
+      const leaseExpiresAt = Number(lease.leaseExpiresAt || lease.lease_expires_at || 0);
+      return Number.isFinite(leaseExpiresAt) && leaseExpiresAt <= leaseObservedAt;
+    });
+    const nextCommandWorkItemLeaseExpiryAt = activeCommandWorkItemLeases
+      .map((lease) => Number(lease.leaseExpiresAt || lease.lease_expires_at || 0))
+      .filter((leaseExpiresAt) => Number.isFinite(leaseExpiresAt) && leaseExpiresAt > 0)
+      .sort((a, b) => a - b)[0] || null;
+    const leaseMaintenanceStatus = staleCommandWorkItemLeases.length
+      ? 'sweep_required'
+      : activeCommandWorkItemLeases.length
+        ? 'leases_active'
+        : 'no_active_leases';
+    const retentionCommandProofPacket = buildOpsRetentionCommandWorkItemProofPacket({
+      rollup,
+      commandReceipts: relatedCommandReceipts,
+      commandWorkItems: relatedCommandWorkItems,
+      lifecycleReceipts: relatedCommandLifecycleReceipts
+    });
+    const dryRunReceipts = relatedReceipts.filter((receipt) => receipt.mode === 'dry_run');
+    const livePreflightReceipts = relatedReceipts.filter((receipt) => receipt.mode === 'live_preflight');
+    const latestLivePreflight = livePreflightReceipts[0] || null;
+    const livePreflightResponse = parseOpsJson(latestLivePreflight?.response_json);
+    const livePreflightBlockers = Array.isArray(livePreflightResponse.blockers)
+      ? livePreflightResponse.blockers.map(normalizeOpsBlockerCode).filter(Boolean)
+      : [];
+    const reviewApproved = relatedWorkItemReceipts.some((receipt) => ['approved', 'completed', 'closed_with_evidence'].includes(receipt.status));
+    const blockers = [...new Set([
+      ...(dryRunReceipts.length ? [] : ['retention_playbook_dry_run_required']),
+      ...(livePreflightReceipts.length ? [] : ['retention_playbook_live_preflight_required']),
+      ...livePreflightBlockers,
+      ...(relatedCapitalFeedback.length ? [] : ['retention_capital_feedback_required']),
+      ...(relatedWorkItems.length && !reviewApproved ? ['customer_retention_draft_review_required'] : [])
+    ].map(normalizeOpsBlockerCode).filter(Boolean))];
+    const cleared = [
+      ...(dryRunReceipts.length ? ['retention_playbook_dry_run_recorded'] : []),
+      ...(livePreflightReceipts.length ? ['retention_playbook_live_preflight_recorded'] : []),
+      ...(relatedCapitalFeedback.length ? ['retention_capital_feedback_recorded'] : []),
+      ...(reviewApproved ? ['customer_retention_draft_review_approved'] : [])
+    ];
+    const sourceReceipts = [
+      { kind: 'retention_cohort_rollup', id: rollup.id, table: 'portfolio_retention_cohort_rollups' },
+      ...relatedPlaybooks.map((playbook) => ({ kind: 'customer_retention_playbook', id: playbook.id, table: 'portfolio_customer_retention_playbooks' })),
+      ...relatedReceipts.map((receipt) => ({ kind: 'customer_retention_playbook_receipt', id: receipt.id, table: 'portfolio_customer_retention_playbook_receipts' })),
+      ...relatedCapitalFeedback.map((receipt) => ({ kind: 'retention_capital_feedback_receipt', id: receipt.id, table: 'portfolio_retention_capital_feedback_receipts' })),
+      ...relatedWorkItems.map((item) => ({ kind: 'decision_work_item', id: item.id, table: 'portfolio_decision_work_items' })),
+      ...relatedWorkItemReceipts.map((receipt) => ({ kind: 'decision_work_item_receipt', id: receipt.id, table: 'portfolio_decision_work_item_receipts' })),
+      ...relatedCommandReceipts.map((receipt) => ({ kind: 'retention_command_work_item_receipt', id: receipt.id, table: 'portfolio_retention_command_work_item_receipts' })),
+      ...relatedCommandWorkItems.map((item) => ({ kind: 'retention_command_work_item', id: item.id, table: 'portfolio_retention_command_work_items' })),
+      ...relatedCommandLifecycleReceipts.map((receipt) => ({ kind: 'retention_command_work_item_lifecycle_receipt', id: receipt.id, table: 'portfolio_retention_command_work_item_lifecycle_receipts' })),
+      ...relatedCommandLeaseSweepReceipts.map((receipt) => ({ kind: 'retention_command_work_item_lease_sweep_receipt', id: receipt.id, table: 'portfolio_retention_command_work_item_lease_sweep_receipts' })),
+      ...relatedCommandLeaseMaintenanceReceipts.map((receipt) => ({ kind: 'retention_command_work_item_lease_maintenance_receipt', id: receipt.id, table: 'portfolio_retention_command_work_item_lease_maintenance_receipts' }))
+    ];
+    return {
+      id: `retention_command:${rollup.id}`,
+      key: `retention_cohort_command_center:${rollup.id}`,
+      kind: 'retention_cohort_command_center',
+      readOnly: true,
+      generatedAt: toOpsIsoDate(rollup.updated_at || rollup.created_at),
+      workspaceId: rollup.workspace_id,
+      retentionCohortRollupId: rollup.id,
+      serviceBusinessId,
+      serviceBusinessName: rollup.service_business_name || serviceNames.get(serviceBusinessId) || 'service business',
+      cohortKey,
+      segment: rollup.segment,
+      status: blockers.length ? 'blocked' : 'ready_for_review',
+      recommendation: rollup.recommendation,
+      customerCount: Number(rollup.customer_count || 0),
+      savedCustomerCount: Number(rollup.saved_customer_count || 0),
+      atRiskCustomerCount: Number(rollup.at_risk_customer_count || 0),
+      playbookCount: relatedPlaybooks.length || Number(rollup.playbook_count || 0),
+      playbookReceiptCount: relatedReceipts.length || Number(rollup.playbook_receipt_count || 0),
+      dryRunReceiptCount: dryRunReceipts.length,
+      livePreflightReceiptCount: livePreflightReceipts.length,
+      capitalFeedbackCount: relatedCapitalFeedback.length,
+      workItemCount: relatedWorkItems.length,
+      workItemReceiptCount: relatedWorkItemReceipts.length,
+      commandWorkItemCount: relatedCommandWorkItems.length,
+      commandWorkItemReceiptCount: relatedCommandReceipts.length,
+      commandWorkItemLifecycleReceiptCount: relatedCommandLifecycleReceipts.length,
+      commandWorkItemLeaseSweepReceiptCount: relatedCommandLeaseSweepReceipts.length,
+      commandWorkItemLeaseMaintenanceReceiptCount: relatedCommandLeaseMaintenanceReceipts.length,
+      commandWorkItemLeaseCount: commandWorkItemLeases.length,
+      activeCommandWorkItemLeaseCount: activeCommandWorkItemLeases.length,
+      staleCommandWorkItemLeaseCount: staleCommandWorkItemLeases.length,
+      releasedCommandWorkItemLeaseStateCount: commandWorkItemLeases.filter((lease) => lease.status === 'released').length,
+      expiredCommandWorkItemLeaseStateCount: commandWorkItemLeases.filter((lease) => lease.status === 'expired').length,
+      nextCommandWorkItemLeaseExpiryAt,
+      leaseMaintenanceStatus,
+      approvedCommandWorkItemCount,
+      claimedCommandWorkItemCount,
+      releasedCommandWorkItemCount,
+      expiredCommandWorkItemLeaseCount,
+      commandWorkItemProofPacketStatus: retentionCommandProofPacket.status,
+      operatorReviewedProofKeys: retentionCommandProofPacket.operatorReviewedProofKeys,
+      localProofBlockers: retentionCommandProofPacket.localProofBlockers,
+      retentionCommandProofPacket,
+      latestCommandWorkItemReceiptId: relatedCommandReceipts[0]?.id || null,
+      latestCommandWorkItemLifecycleReceiptId: relatedCommandLifecycleReceipts[0]?.id || null,
+      latestCommandWorkItemLeaseSweepReceiptId: relatedCommandLeaseSweepReceipts[0]?.id || null,
+      latestCommandWorkItemLeaseMaintenanceReceiptId: relatedCommandLeaseMaintenanceReceipts[0]?.id || null,
+      queuedCommandWorkItemCount: relatedCommandWorkItems.filter((item) => ['queued', 'queued_review', 'open'].includes(item.status)).length,
+      retainedRevenueCents: Number(rollup.retained_revenue_cents || 0),
+      netRetentionValueCents: Number(rollup.net_retention_value_cents || 0),
+      avgChurnRisk: Number(rollup.avg_churn_risk || 0),
+      blockers,
+      blockerCount: blockers.length,
+      cleared,
+      clearedCount: cleared.length,
+      nextActions: blockers.map((blocker) => ({
+        blocker,
+        label: formatOpsLabel(blocker),
+        action: buildOpsRetentionCohortCommandAction(blocker)
+      })),
+      actionCommands: [
+        ...(blockers.length ? [{
+          action: 'queue_retention_command_work_items',
+          label: 'Queue work items',
+          method: 'POST',
+          endpoint: `/api/portfolio/retention-command-center/${encodeURIComponent(rollup.id)}/work-items`,
+          blockerCount: blockers.length,
+          externalSideEffects: false,
+          enabled: true
+        }] : []),
+        ...(relatedCommandWorkItems.length ? [{
+          action: 'collect_retention_command_work_item_proof_packet',
+          label: 'Collect proof packet',
+          method: 'POST',
+          endpoint: `/api/portfolio/retention-command-center/${encodeURIComponent(rollup.id)}/proof-packet`,
+          operatorReviewedProofKeyCount: retentionCommandProofPacket.operatorReviewedProofKeys.length,
+          externalSideEffects: false,
+          enabled: true
+        }, {
+          action: 'record_retention_command_lease_maintenance',
+          label: 'Record lease maintenance',
+          method: 'POST',
+          endpoint: '/api/portfolio/retention-command-work-items/lease-maintenance',
+          retentionCohortRollupId: rollup.id,
+          activeLeaseCount: activeCommandWorkItemLeases.length,
+          staleLeaseCount: staleCommandWorkItemLeases.length,
+          leaseMaintenanceStatus,
+          maintenanceReceiptCount: relatedCommandLeaseMaintenanceReceipts.length,
+          latestMaintenanceReceiptId: relatedCommandLeaseMaintenanceReceipts[0]?.id || null,
+          safety: {
+            kind: 'retention_command_work_item_lease_maintenance_safety',
+            externalSideEffects: false,
+            readOnlyTelemetry: true,
+            customerMessageSent: false,
+            financeRollupMutated: false,
+            providerCalled: false,
+            adapterInvoked: false,
+            jobEnqueued: false
+          },
+          externalSideEffects: false,
+          enabled: true
+        }, {
+          action: 'expire_retention_command_work_item_leases',
+          label: 'Expire leases',
+          method: 'POST',
+          endpoint: '/api/portfolio/retention-command-work-items/expire-leases',
+          retentionCohortRollupId: rollup.id,
+          safety: {
+            kind: 'retention_command_work_item_lease_expiry_safety',
+            externalSideEffects: false,
+            localLeaseUpdated: true,
+            customerMessageSent: false,
+            financeRollupMutated: false,
+            providerCalled: false,
+            adapterInvoked: false,
+            jobEnqueued: false
+          },
+          externalSideEffects: false,
+          leaseSweepReceiptCount: relatedCommandLeaseSweepReceipts.length,
+          latestLeaseSweepReceiptId: relatedCommandLeaseSweepReceipts[0]?.id || null,
+          activeLeaseCount: activeCommandWorkItemLeases.length,
+          staleLeaseCount: staleCommandWorkItemLeases.length,
+          leaseMaintenanceStatus,
+          enabled: true
+        }] : []),
+        ...blockers.map((blocker) => ({
+          action: `resolve_${blocker}`,
+          label: formatOpsLabel(blocker),
+          blocker,
+          ...(buildOpsRetentionCohortCommandLiveEvidenceRequirement(blocker) || {}),
+          externalSideEffects: false,
+          enabled: true
+        }))
+      ],
+      sourceReceipts,
+      sourceReceiptCount: sourceReceipts.length,
+      safety: {
+        kind: 'retention_cohort_command_center_safety',
+        customerMessageSent: false,
+        offerSent: false,
+        priceChangedLive: false,
+        paymentLinkCreated: false,
+        bookingScheduled: false,
+        financeRollupMutated: false,
+        externalSideEffects: false
+      },
+      externalSideEffects: false,
+      externalProvidersCalled: false,
+      updatedAt: toOpsIsoDate(rollup.updated_at || rollup.created_at)
+    };
+  });
+}
+
+function buildOpsServiceDecisionReadinessCommandAction(blocker) {
+  const key = normalizeOpsBlockerCode(blocker);
+  if (key === 'provider_live_smoke') return 'Run isolated provider smoke and attach the smoke receipt.';
+  if (key === 'live_adapter_implemented') return 'Ship the live adapter behind the existing run-mode gates.';
+  if (key === 'run_mode') return 'Move runtime mode only after production review approval.';
+  if (key === 'side_effect_flag_runtime') return 'Enable runtime side-effect flags only after all live approvals and smoke receipts exist.';
+  if (key === 'live_board_execution_guardrail') return 'Record explicit board-execution guardrail approval before live preflight.';
+  return `Resolve ${formatOpsLabel(key)} and attach evidence.`;
+}
+
+const OPS_LIVE_PROVIDER_RUN_MODES = new Set(['demo_live', 'autonomous_live', 'production_live']);
+const OPS_PROVIDER_LIVE_FLAG_REQUIREMENTS = {
+  agentmail: ['LIVE_EMAILS'],
+  agentphone: ['LIVE_CALLS'],
+  stripe: ['LIVE_PAYMENTS'],
+  browser_use: ['LIVE_BROWSER_SESSIONS'],
+  browseruse: ['LIVE_BROWSER_SESSIONS'],
+  owned_surface_builder: ['LIVE_BUILDS'],
+  service_decision_execution_controller: ['LIVE_PUBLIC_OUTREACH', 'LIVE_PAYMENTS', 'LIVE_BUILDS']
+};
+
+function normalizeOpsLiveFlagName(value) {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase();
+  if (!normalized) return null;
+  return normalized.startsWith('LIVE_') ? normalized : `LIVE_${normalized}`;
+}
+
+function normalizeOpsLiveFlagList(values = []) {
+  const list = Array.isArray(values) ? values : [values];
+  return [...new Set(list.map(normalizeOpsLiveFlagName).filter(Boolean))].sort();
+}
+
+function opsProviderLiveFlagRequirements(provider, overrides = null) {
+  const overrideList = normalizeOpsLiveFlagList(overrides);
+  if (overrideList.length) return overrideList;
+  return OPS_PROVIDER_LIVE_FLAG_REQUIREMENTS[normalizeOpsBlockerCode(provider)] || ['LIVE_PROVIDER_SMOKE'];
+}
+
+function latestOpsReadinessProviderSmokeReceipt(reconciliation, { now = Date.now(), limit = 500 } = {}) {
+  if (!reconciliation?.id || !reconciliation.service_decision_execution_receipt_id) return null;
+  return providerSmoke.events({ since: 0, limit }).find((event) => {
+    const detail = event?.detail && typeof event.detail === 'object' ? event.detail : {};
+    if (detail.readinessReconciliationId !== reconciliation.id) return false;
+    if (detail.serviceDecisionExecutionReceiptId !== reconciliation.service_decision_execution_receipt_id) return false;
+    const requiredFlags = opsProviderLiveFlagRequirements(event.provider, detail.requiredLiveFlags || detail.required_live_flags);
+    const attestedFlags = normalizeOpsLiveFlagList(detail.liveFlagsAttested || detail.live_flags_attested);
+    const runMode = normalizeOpsBlockerCode(detail.runMode || detail.run_mode || 'mock');
+    return event.status === 'ok'
+      && event.live === true
+      && detail.source === 'readiness_command_center'
+      && OPS_LIVE_PROVIDER_RUN_MODES.has(runMode)
+      && requiredFlags.every((flag) => attestedFlags.includes(flag))
+      && (detail.liveSmokePassed === true || detail.live_smoke_passed === true)
+      && (detail.operatorVerified === true || detail.operator_verified === true)
+      && detail.providerCalledByCallan !== true
+      && detail.providerCalled !== true
+      && detail.externalSideEffects !== true
+      && now - Number(event.checkedAt || 0) <= 24 * 60 * 60 * 1000;
+  }) || null;
+}
+
+export function buildOpsServiceDecisionReadinessCommandCenter(tables, limit) {
+  const cap = Math.max(1, Math.min(Number(limit) || 50, 200));
+  const reconciliations = tables.portfolioServiceDecisionReadinessReconciliations || [];
+  const compensationPlans = tables.portfolioWorkflowCompensationPlans || [];
+  const compensationReceipts = tables.portfolioWorkflowCompensationReceipts || [];
+  const liveReadinessEvidenceArtifacts = tables.portfolioLiveReadinessEvidenceArtifacts || [];
+  const liveAdapterReceipts = tables.portfolioLiveAdapterReceipts || [];
+  const workflowInstanceRows = tables.workflowInstances || [];
+  const workflowLinks = tables.workflowEntityLinks || [];
+  const serviceNames = new Map((tables.serviceBusinesses || []).map((row) => [row.id, row.name]));
+  const buildEvidenceSummary = (artifacts) => {
+    const pendingReviewStatuses = new Set(['submitted_smoke_pending_review', 'submitted_adapter_pending_review']);
+    const verifiedStatuses = new Set(['verified', 'passed', 'ready', 'satisfied']);
+    const pendingReviewArtifacts = artifacts.filter((artifact) => pendingReviewStatuses.has(artifact.status));
+    const pendingReviewProofKeys = Array.from(new Set(pendingReviewArtifacts.map((artifact) => artifact.proof_key).filter(Boolean))).sort();
+    const verifiedProofKeys = Array.from(new Set(artifacts
+      .filter((artifact) => {
+        const safety = parseOpsJson(artifact.safety_json);
+        return verifiedStatuses.has(artifact.status) || safety.proofVerified === true;
+      })
+      .map((artifact) => artifact.proof_key)
+      .filter(Boolean))).sort();
+    const pendingReviewSafety = pendingReviewArtifacts.reduce((safety, artifact) => {
+      const artifactSafety = parseOpsJson(artifact.safety_json);
+      const attestation = parseOpsJson(artifact.attestation_json)?.attestation || {};
+      return {
+        ...safety,
+        providerCalled: safety.providerCalled || artifactSafety.providerCalled === true || attestation.providerCalledByCallan === true,
+        adapterInvoked: safety.adapterInvoked || artifactSafety.adapterInvoked === true || attestation.adapterInvokedByCallan === true,
+        jobEnqueued: safety.jobEnqueued || artifactSafety.jobEnqueued === true
+      };
+    }, {
+      kind: 'readiness_pending_review_evidence_safety',
+      externalSideEffects: false,
+      providerCalled: false,
+      adapterInvoked: false,
+      jobEnqueued: false,
+      canClearLiveGate: false
+    });
+    return {
+      artifactCount: artifacts.length,
+      verifiedArtifactCount: artifacts.filter((artifact) => verifiedStatuses.has(artifact.status)).length,
+      pendingReviewCount: pendingReviewArtifacts.length,
+      pendingReviewProofKeys,
+      pendingReviewStatuses: Array.from(new Set(pendingReviewArtifacts.map((artifact) => artifact.status).filter(Boolean))).sort(),
+      providerSmokePendingReview: pendingReviewProofKeys.includes('provider_live_smoke'),
+      adapterPendingReview: pendingReviewProofKeys.includes('live_adapter_implemented'),
+      verifiedProofKeys,
+      pendingReviewCanClearLiveGate: false,
+      pendingReviewRequiresVerifiedLiveEvidence: pendingReviewArtifacts.length > 0,
+      pendingReviewSafety
+    };
+  };
+  return reconciliations.slice(0, cap).map((reconciliation) => {
+    const report = parseOpsJson(reconciliation.report_json);
+    const executionId = reconciliation.service_decision_execution_receipt_id;
+    const workflowInstance = workflowInstanceRows.find((item) => item.id === reconciliation.workflow_instance_id) || null;
+    const plans = compensationPlans.filter((plan) => plan.service_decision_execution_receipt_id === executionId);
+    const receipts = compensationReceipts.filter((receipt) => receipt.service_decision_execution_receipt_id === executionId);
+    const artifacts = liveReadinessEvidenceArtifacts.filter((artifact) => artifact.service_decision_execution_receipt_id === executionId);
+    const adapterReceipts = liveAdapterReceipts.filter((receipt) => receipt.service_decision_execution_receipt_id === executionId);
+    const latestAdapterReceipt = adapterReceipts[0] || null;
+    const latestImplementationReceipt = adapterReceipts.find((receipt) => (
+      receipt.mode === 'implementation_verified' && receipt.status === 'verified_implemented'
+    )) || null;
+    const latestProviderSmokeReceipt = latestOpsReadinessProviderSmokeReceipt(reconciliation);
+    const latestProviderSmokeDetail = latestProviderSmokeReceipt?.detail && typeof latestProviderSmokeReceipt.detail === 'object'
+      ? latestProviderSmokeReceipt.detail
+      : {};
+    const links = workflowLinks.filter((link) => link.instance_id === reconciliation.workflow_instance_id);
+    const openPlans = plans.filter((plan) => !['closed_with_evidence', 'rolled_back'].includes(plan.status));
+    const retryablePlans = openPlans.filter((plan) => ['provider_live_smoke', 'live_adapter_implemented'].includes(plan.blocker_key));
+    const remainingProofBlockers = Array.isArray(report.remainingProofBlockers)
+      ? report.remainingProofBlockers.map(normalizeOpsBlockerCode).filter(Boolean)
+      : [];
+    const runtimeBlockers = Array.isArray(report.runtimeBlockers)
+      ? report.runtimeBlockers.map(normalizeOpsBlockerCode).filter(Boolean)
+      : [];
+    const blockerRows = parseOpsJsonArray(reconciliation.blockers_json).map(normalizeOpsBlockerCode).filter(Boolean);
+    const blockers = blockerRows.length ? blockerRows : [...remainingProofBlockers, ...runtimeBlockers];
+    const clearedRows = parseOpsJsonArray(reconciliation.cleared_json).map(normalizeOpsBlockerCode).filter(Boolean);
+    const cleared = clearedRows.length
+      ? clearedRows
+      : (Array.isArray(report.cleared) ? report.cleared.map(normalizeOpsBlockerCode).filter(Boolean) : []);
+    const sourceReceipts = [
+      { kind: 'service_decision_readiness_reconciliation', id: reconciliation.id, table: 'portfolio_service_decision_readiness_reconciliations' },
+      ...plans.map((plan) => ({ kind: 'workflow_compensation_plan', id: plan.id, table: 'portfolio_workflow_compensation_plans' })),
+      ...receipts.map((receipt) => ({ kind: 'workflow_compensation_receipt', id: receipt.id, table: 'portfolio_workflow_compensation_receipts' })),
+      ...artifacts.map((artifact) => ({ kind: 'live_readiness_evidence_artifact', id: artifact.id, table: 'portfolio_live_readiness_evidence_artifacts' })),
+      ...adapterReceipts.map((receipt) => ({ kind: 'live_adapter_receipt', id: receipt.id, table: 'portfolio_live_adapter_receipts' })),
+      ...links.map((link) => ({ kind: 'workflow_entity_link', id: link.id, table: 'workflow_entity_links' }))
+    ];
+    return {
+      id: reconciliation.id,
+      key: `service_decision_readiness_command_center:${reconciliation.id}`,
+      kind: 'service_decision_readiness_command_center',
+      readOnly: true,
+      generatedAt: toOpsIsoDate(reconciliation.updated_at || reconciliation.created_at),
+      workspaceId: reconciliation.workspace_id,
+      serviceBusinessId: reconciliation.service_business_id,
+      serviceBusinessName: reconciliation.service_business_name || serviceNames.get(reconciliation.service_business_id) || 'service business',
+      serviceDecisionExecutionReceiptId: executionId,
+      workflowInstanceId: reconciliation.workflow_instance_id,
+      workflowKey: workflowInstance?.workflow_key || null,
+      workflowState: workflowInstance?.state || null,
+      status: reconciliation.status,
+      cleared,
+      blockers,
+      remainingProofBlockers,
+      runtimeBlockers,
+      blockerCount: blockers.length,
+      clearedCount: cleared.length,
+      nextActions: blockers.map((blocker) => ({
+        blocker,
+        label: formatOpsLabel(blocker),
+        action: buildOpsServiceDecisionReadinessCommandAction(blocker)
+      })),
+      actionCommands: [
+        {
+          action: 'plan_compensation',
+          label: 'Plan compensation',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/plan-compensation`,
+          enabled: !!reconciliation.workflow_instance_id,
+          externalSideEffects: false
+        },
+        {
+          action: 'record_retry_receipts',
+          label: 'Record retry receipts',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/record-retry-receipts`,
+          enabled: !!reconciliation.workflow_instance_id && retryablePlans.length > 0,
+          openPlanCount: openPlans.length,
+          retryablePlanCount: retryablePlans.length,
+          externalSideEffects: false
+        },
+        ...(blockers.includes('provider_live_smoke') ? [{
+          action: 'record_provider_smoke_receipt',
+          label: 'Record smoke receipt',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/provider-smoke-receipt`,
+          enabled: !!executionId,
+          proofKey: 'provider_live_smoke',
+          provider: latestProviderSmokeReceipt?.provider || 'agentmail',
+          runMode: 'production_live',
+          requiredLiveFlags: normalizeOpsLiveFlagList(latestProviderSmokeDetail.requiredLiveFlags || latestProviderSmokeDetail.required_live_flags || ['LIVE_EMAILS']),
+          externalSideEffects: false
+        }, {
+          action: 'attach_provider_smoke_evidence',
+          label: 'Attach smoke packet',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/evidence`,
+          enabled: !!executionId,
+          proofKey: 'provider_live_smoke',
+          provider: latestProviderSmokeReceipt?.provider || null,
+          providerReceiptId: latestProviderSmokeReceipt?.id || null,
+          requiredLiveFlags: normalizeOpsLiveFlagList(latestProviderSmokeDetail.requiredLiveFlags || latestProviderSmokeDetail.required_live_flags),
+          verifiedSmokeReady: !!latestProviderSmokeReceipt,
+          externalSideEffects: false
+        }] : []),
+        ...(blockers.includes('live_adapter_implemented') ? [{
+          action: 'plan_adapter_ledger',
+          label: 'Plan adapter ledger',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/adapter-ledger`,
+          enabled: !!executionId,
+          adapterKey: 'service_decision_execution_controller',
+          mode: 'dry_run',
+          externalSideEffects: false
+        }, {
+          action: 'run_adapter_contract_tests',
+          label: 'Run contract tests',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/adapter-ledger`,
+          enabled: !!executionId,
+          adapterKey: 'service_decision_execution_controller',
+          mode: 'contract_test',
+          externalSideEffects: false
+        }, {
+          action: 'verify_adapter_implementation',
+          label: 'Verify adapter packet',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/adapter-ledger`,
+          enabled: !!executionId,
+          adapterKey: 'service_decision_execution_controller',
+          mode: 'implementation_verified',
+          externalSideEffects: false
+        }, {
+          action: 'preflight_adapter_ledger',
+          label: 'Preflight adapter',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/adapter-ledger`,
+          enabled: !!executionId,
+          adapterKey: 'service_decision_execution_controller',
+          mode: 'live_preflight',
+          externalSideEffects: false
+        }, {
+          action: 'attach_adapter_evidence',
+          label: 'Attach adapter packet',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/evidence`,
+          enabled: !!executionId,
+          proofKey: 'live_adapter_implemented',
+          adapterReceiptId: latestImplementationReceipt?.id || null,
+          verifiedImplementationReady: !!latestImplementationReceipt,
+          externalSideEffects: false
+        }] : []),
+        {
+          action: 'rerun_reconciliation',
+          label: 'Reconcile again',
+          method: 'POST',
+          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/reconcile`,
+          enabled: !!executionId,
+          externalSideEffects: false
+        }
+      ],
+      compensation: {
+        planCount: plans.length,
+        receiptCount: receipts.length,
+        openPlans: openPlans.length,
+        retryPlanned: receipts.filter((receipt) => receipt.status === 'retry_planned').length,
+        closedWithEvidence: receipts.filter((receipt) => receipt.status === 'closed_with_evidence').length,
+        rolledBack: receipts.filter((receipt) => receipt.status === 'rolled_back').length
+      },
+      evidence: {
+        ...buildEvidenceSummary(artifacts),
+        workflowLinkCount: links.length
+      },
+      providerSmoke: {
+        receiptId: latestProviderSmokeReceipt?.id || null,
+        provider: latestProviderSmokeReceipt?.provider || null,
+        verified: !!latestProviderSmokeReceipt
+      },
+      adapterLedger: {
+        receiptCount: adapterReceipts.length,
+        latestStatus: latestAdapterReceipt?.status || null,
+        latestMode: latestAdapterReceipt?.mode || null,
+        implementationReceiptId: latestImplementationReceipt?.id || null,
+        verifiedImplemented: adapterReceipts.some((receipt) => receipt.status === 'verified_implemented'),
+        contractTestsPassed: adapterReceipts.some((receipt) => receipt.status === 'contract_tests_passed'),
+        livePreflightBlocked: adapterReceipts.some((receipt) => receipt.status === 'blocked_live_preflight'),
+        implementationRequired: adapterReceipts.some((receipt) => receipt.status === 'implementation_required')
+      },
+      sourceReceipts,
+      sourceReceiptCount: sourceReceipts.length,
+      safety: {
+        kind: 'service_decision_readiness_command_center_safety',
+        providerCalled: false,
+        adapterInvoked: false,
+        workflowMutated: false,
+        customerMessageSent: false,
+        budgetMoved: false,
+        sideEffectFlagChanged: false,
+        externalSideEffects: false
+      },
+      externalSideEffects: false,
+      externalProvidersCalled: false,
+      updatedAt: toOpsIsoDate(reconciliation.updated_at || reconciliation.created_at)
+    };
+  });
 }
 
 export function exportOperationsData({ includePII = false, limit = 500 } = {}) {
@@ -44,8 +925,217 @@ export function exportOperationsData({ includePII = false, limit = 500 } = {}) {
     contactEvents: db.prepare(`SELECT * FROM contact_events ORDER BY created_at DESC LIMIT ?`).all(n),
     calls: db.prepare(`SELECT * FROM calls ORDER BY started_at DESC LIMIT ?`).all(n),
     jobs: durableJobs.list({ limit: n }),
-    safeToSellReports: safeToSellReports.list({ limit: n })
+    accountManagerPlans: db.prepare(`SELECT * FROM account_manager_plans ORDER BY updated_at DESC LIMIT ?`).all(n),
+    accountTasks: db.prepare(`SELECT * FROM account_tasks ORDER BY due_at ASC, updated_at DESC LIMIT ?`).all(n),
+    accountTaskOperatorBoardEscalations: db.prepare(`SELECT * FROM account_task_operator_board_escalations ORDER BY updated_at DESC LIMIT ?`).all(n),
+    accountOperatorBoardWorkItems: db.prepare(`SELECT * FROM account_operator_board_work_items ORDER BY due_at ASC, updated_at DESC LIMIT ?`).all(n),
+    accountOperatorBoardWorkItemReceipts: db.prepare(`SELECT * FROM account_operator_board_work_item_receipts ORDER BY updated_at DESC LIMIT ?`).all(n),
+    accountOperatorBoardRetentionFeedbackReceipts: db.prepare(`SELECT * FROM account_operator_board_retention_feedback_receipts ORDER BY updated_at DESC LIMIT ?`).all(n),
+    workflowInstances: workflowInstances.list({ limit: n }),
+    workflowInstanceEvents: db.prepare(`SELECT * FROM workflow_instance_events ORDER BY created_at DESC LIMIT ?`).all(n),
+    workflowEntityLinks: db.prepare(`SELECT * FROM workflow_entity_links ORDER BY updated_at DESC LIMIT ?`).all(n),
+    workflowReplayReceipts: workflowReplayReceipts.list({ limit: n }),
+    safeToSellReports: safeToSellReports.list({ limit: n }),
+    safeToRenewReports: safeToRenewReports.list({ limit: n }),
+    safeToRenewPlaybooks: safeToRenewPlaybooks.list({ limit: n }),
+    renewalChangeRequests: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = 'renewal_change_requested'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(n),
+    renewalBillingChangePreflights: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = 'renewal_billing_change_preflight'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(n),
+    renewalBillingExecutionReceipts: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = 'renewal_billing_change_execution_receipt'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(n),
+    renewalCustomerMessagePreflights: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = 'renewal_customer_message_preflight'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(n),
+    renewalCustomerMessageSendReceipts: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = 'renewal_customer_message_send_receipt'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(n),
+    renewalCustomerConfirmationReceipts: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_RECEIPT_ACTION_TYPE, n),
+    renewalCustomerConfirmationAcknowledgements: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_ACK_ACTION_TYPE, n),
+    renewalCustomerConfirmationAcceptances: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_ACCEPT_ACTION_TYPE, n),
+    renewalCustomerConfirmationFollowupWorkItems: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_FOLLOWUP_ACTION_TYPE, n),
+    renewalCustomerConfirmationFollowupReceipts: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_FOLLOWUP_RECEIPT_ACTION_TYPE, n),
+    renewalCustomerConfirmationCloseoutPackets: db.prepare(`
+      SELECT * FROM portal_actions
+      WHERE type = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(RENEWAL_CUSTOMER_CONFIRMATION_CLOSEOUT_PACKET_ACTION_TYPE, n),
+    organizations: db.prepare(`SELECT * FROM organizations ORDER BY created_at DESC LIMIT ?`).all(n),
+    workspaces: db.prepare(`SELECT * FROM workspaces ORDER BY created_at DESC LIMIT ?`).all(n),
+    operators: db.prepare(`SELECT * FROM operators ORDER BY updated_at DESC LIMIT ?`).all(n),
+    territories: db.prepare(`SELECT * FROM territories ORDER BY created_at DESC LIMIT ?`).all(n),
+    brands: db.prepare(`SELECT * FROM brands ORDER BY created_at DESC LIMIT ?`).all(n),
+    marketOpportunities: db.prepare(`SELECT * FROM market_opportunities ORDER BY updated_at DESC LIMIT ?`).all(n),
+    serviceBusinesses: db.prepare(`SELECT * FROM service_businesses ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioCustomers: db.prepare(`SELECT * FROM portfolio_customers ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioCustomerContacts: db.prepare(`SELECT * FROM portfolio_customer_contacts ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioJobs: db.prepare(`SELECT * FROM portfolio_jobs ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioFulfillmentTasks: db.prepare(`SELECT * FROM portfolio_fulfillment_tasks ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioPayments: db.prepare(`SELECT * FROM portfolio_payments ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioLaborCostEntries: db.prepare(`SELECT * FROM portfolio_labor_cost_entries ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioFinanceRollups: db.prepare(`SELECT * FROM portfolio_finance_rollups ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioOfferBundles: db.prepare(`SELECT * FROM portfolio_offer_bundles ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioProviderLinks: db.prepare(`SELECT * FROM portfolio_provider_links ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioProviderCredentialReceipts: db.prepare(`SELECT * FROM portfolio_provider_credential_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioTenantIsolationReceipts: db.prepare(`SELECT * FROM portfolio_tenant_isolation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioTenantControlReceipts: db.prepare(`SELECT * FROM portfolio_tenant_control_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioTenantLifecycleReceipts: db.prepare(`SELECT * FROM portfolio_tenant_lifecycle_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRoleAssignments: db.prepare(`SELECT * FROM portfolio_role_assignments ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioRoleAccessReceipts: db.prepare(`SELECT * FROM portfolio_role_access_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioApprovals: db.prepare(`SELECT * FROM portfolio_approvals ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioOperatorInboxItems: db.prepare(`SELECT * FROM portfolio_operator_inbox_items ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioOperatorActionReceipts: db.prepare(`SELECT * FROM portfolio_operator_action_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioOperatorAssignmentQueues: db.prepare(`SELECT * FROM portfolio_operator_assignment_queues ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioOperatorBulkReviewReceipts: db.prepare(`SELECT * FROM portfolio_operator_bulk_review_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioOperatorHandoffEvalCloseouts: db.prepare(`SELECT * FROM portfolio_operator_handoff_eval_closeouts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalPublicationReceipts: db.prepare(`SELECT * FROM portfolio_eval_publication_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalFixtureWorkItems: db.prepare(`SELECT * FROM portfolio_eval_fixture_work_items ORDER BY priority ASC, created_at DESC LIMIT ?`).all(n),
+    portfolioEvalFixtureRunnerReceipts: db.prepare(`SELECT * FROM portfolio_eval_fixture_runner_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalFixtureApprovalReceipts: db.prepare(`SELECT * FROM portfolio_eval_fixture_approval_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalGoldenFixtureReviewReceipts: db.prepare(`SELECT * FROM portfolio_eval_golden_fixture_review_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalNonLiveRunnerBindingReceipts: db.prepare(`SELECT * FROM portfolio_eval_non_live_runner_binding_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalFileDryRunManifests: db.prepare(`SELECT * FROM portfolio_eval_file_dry_run_manifests ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalCiWriteAccessReceipts: db.prepare(`SELECT * FROM portfolio_eval_ci_write_access_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalLiveAdapterReadinessReceipts: db.prepare(`SELECT * FROM portfolio_eval_live_adapter_readiness_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalLiveAdapterContractTestReceipts: db.prepare(`SELECT * FROM portfolio_eval_live_adapter_contract_test_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalCiWorkflowPublicationReceipts: db.prepare(`SELECT * FROM portfolio_eval_ci_workflow_publication_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalGeneratedArtifactPromotionReceipts: db.prepare(`SELECT * FROM portfolio_eval_generated_artifact_promotion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalPrMergeProposalReceipts: db.prepare(`SELECT * FROM portfolio_eval_pr_merge_proposal_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalPrOpenSimulationReceipts: db.prepare(`SELECT * FROM portfolio_eval_pr_open_simulation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalOperatorMergeApprovalReceipts: db.prepare(`SELECT * FROM portfolio_eval_operator_merge_approval_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalSubmittedPrEvidenceReceipts: db.prepare(`SELECT * FROM portfolio_eval_submitted_pr_evidence_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalPrExternalVerificationReceipts: db.prepare(`SELECT * FROM portfolio_eval_pr_external_verification_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalExternalCiResultReceipts: db.prepare(`SELECT * FROM portfolio_eval_external_ci_result_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalGithubPrVerificationReceipts: db.prepare(`SELECT * FROM portfolio_eval_github_pr_verification_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalGithubPrObservationReceipts: db.prepare(`SELECT * FROM portfolio_eval_github_pr_observation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalGithubCheckRunObservationReceipts: db.prepare(`SELECT * FROM portfolio_eval_github_check_run_observation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeExecutionAdapterContractReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_execution_adapter_contract_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalOperatorMergeCompletionGateReceipts: db.prepare(`SELECT * FROM portfolio_eval_operator_merge_completion_gate_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalLiveMergeAuthorizationReceipts: db.prepare(`SELECT * FROM portfolio_eval_live_merge_authorization_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalBranchProtectionReadbackAdapterContractReceipts: db.prepare(`SELECT * FROM portfolio_eval_branch_protection_readback_adapter_contract_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalTokenScopeObservationAdapterContractReceipts: db.prepare(`SELECT * FROM portfolio_eval_token_scope_observation_adapter_contract_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalSecretRedactionProofReceipts: db.prepare(`SELECT * FROM portfolio_eval_secret_redaction_proof_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueReadbackAdapterContractReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_readback_adapter_contract_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadReconciliationReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_reconciliation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadAdapterContractReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_adapter_contract_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadReadinessReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_readiness_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueCredentialHandoffReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_credential_handoff_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadPreflightReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_preflight_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueTokenQuarantineReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_token_quarantine_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadResponseIngestionReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_response_ingestion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueRuntimeTokenReleaseGateReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_runtime_token_release_gate_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveReadVerificationPromotionReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_read_verification_promotion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveHttpExecutionPreflightHandoffReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_http_execution_preflight_handoff_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueLiveHttpOperatorReleaseAckReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_live_http_operator_release_ack_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueRuntimeSecretProviderSmokeReadinessReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_runtime_secret_provider_smoke_readiness_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueRuntimeSecretProviderSmokeExecutionGateReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_runtime_secret_provider_smoke_execution_gate_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueRuntimeSecretProviderSmokeEvidenceReviewReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_runtime_secret_provider_smoke_evidence_review_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueMemoryOnlyRuntimeTokenReleasePreflightReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_memory_only_runtime_token_release_preflight_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueSuccessfulSmokeEvidenceIngestionReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_successful_smoke_evidence_ingestion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueRuntimeTokenReleaseDenialReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_runtime_token_release_denial_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueFakeLiveReadReplayQuarantineReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_fake_live_read_replay_quarantine_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueFinalBlockerLedgerReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_final_blocker_ledger_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueuePostLedgerOperatorReleaseAttestationReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_post_ledger_operator_release_attestation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueuePostAttestationReleaseEscrowReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_post_attestation_release_escrow_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioEvalMergeQueueReleaseDenialCloseoutReceipts: db.prepare(`SELECT * FROM portfolio_eval_merge_queue_release_denial_closeout_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioOperatorInboxAssignments: db.prepare(`SELECT * FROM portfolio_operator_inbox_assignments ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioOperatorStaffingAnalyticsReceipts: db.prepare(`SELECT * FROM portfolio_operator_staffing_analytics_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioIncidents: db.prepare(`SELECT * FROM portfolio_incidents ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioLearningRecords: db.prepare(`SELECT * FROM portfolio_learning_records ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioGateEvaluations: db.prepare(`SELECT * FROM portfolio_gate_evaluations ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioLaunchSurfaces: db.prepare(`SELECT * FROM portfolio_launch_surfaces ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioMonitoringChecks: db.prepare(`SELECT * FROM portfolio_monitoring_checks ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioAcquisitionAttempts: db.prepare(`SELECT * FROM portfolio_acquisition_attempts ORDER BY attempted_at DESC LIMIT ?`).all(n),
+    portfolioStrategyRecommendations: db.prepare(`SELECT * FROM portfolio_strategy_recommendations ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioAcquisitionActions: db.prepare(`SELECT * FROM portfolio_acquisition_actions ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioAcquisitionActionReceipts: db.prepare(`SELECT * FROM portfolio_acquisition_action_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCapitalAllocationReceipts: db.prepare(`SELECT * FROM portfolio_capital_allocation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioProviderFallbackReceipts: db.prepare(`SELECT * FROM portfolio_provider_fallback_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioDispatchReceipts: db.prepare(`SELECT * FROM portfolio_dispatch_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioJobTrackingReceipts: db.prepare(`SELECT * FROM portfolio_job_tracking_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCustomerPrivacyControlReceipts: db.prepare(`SELECT * FROM portfolio_customer_privacy_control_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCompletionReceipts: db.prepare(`SELECT * FROM portfolio_completion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioPayoutReceipts: db.prepare(`SELECT * FROM portfolio_payout_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRefundDisputeReceipts: db.prepare(`SELECT * FROM portfolio_refund_dispute_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioVendorQualityReceipts: db.prepare(`SELECT * FROM portfolio_vendor_quality_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCustomerUpdateReceipts: db.prepare(`SELECT * FROM portfolio_customer_update_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCustomerFeedbackRecords: db.prepare(`SELECT * FROM portfolio_customer_feedback_records ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioCustomerRemediationPlans: db.prepare(`SELECT * FROM portfolio_customer_remediation_plans ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioVendorCorrectiveActions: db.prepare(`SELECT * FROM portfolio_vendor_corrective_actions ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioRemediationBudgetReserves: db.prepare(`SELECT * FROM portfolio_remediation_budget_reserves ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioRemediationCloseoutReceipts: db.prepare(`SELECT * FROM portfolio_remediation_closeout_receipts ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioCustomerRetentionPlaybooks: db.prepare(`SELECT * FROM portfolio_customer_retention_playbooks ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioCustomerRetentionPlaybookReceipts: db.prepare(`SELECT * FROM portfolio_customer_retention_playbook_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCohortRollups: db.prepare(`SELECT * FROM portfolio_retention_cohort_rollups ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCapitalFeedbackReceipts: db.prepare(`SELECT * FROM portfolio_retention_capital_feedback_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCommandWorkItemReceipts: db.prepare(`SELECT * FROM portfolio_retention_command_work_item_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCommandWorkItems: db.prepare(`SELECT * FROM portfolio_retention_command_work_items ORDER BY due_at ASC, created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCommandWorkItemLifecycleReceipts: db.prepare(`SELECT * FROM portfolio_retention_command_work_item_lifecycle_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCommandWorkItemLeaseSweepReceipts: db.prepare(`SELECT * FROM portfolio_retention_command_work_item_lease_sweep_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRetentionCommandWorkItemLeaseMaintenanceReceipts: db.prepare(`SELECT * FROM portfolio_retention_command_work_item_lease_maintenance_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioServiceDecisionFusionReceipts: db.prepare(`SELECT * FROM portfolio_service_decision_fusion_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioServiceDecisionExecutionReceipts: db.prepare(`SELECT * FROM portfolio_service_decision_execution_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioDecisionDistributionReceipts: db.prepare(`SELECT * FROM portfolio_decision_distribution_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioDecisionWorkItems: db.prepare(`SELECT * FROM portfolio_decision_work_items ORDER BY due_at ASC, created_at DESC LIMIT ?`).all(n),
+    portfolioDecisionWorkItemReceipts: db.prepare(`SELECT * FROM portfolio_decision_work_item_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioLiveReadinessEvidenceArtifacts: db.prepare(`SELECT * FROM portfolio_live_readiness_evidence_artifacts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioLiveAdapterReceipts: db.prepare(`SELECT * FROM portfolio_live_adapter_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioWorkflowCompensationPlans: db.prepare(`SELECT * FROM portfolio_workflow_compensation_plans ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioWorkflowCompensationReceipts: db.prepare(`SELECT * FROM portfolio_workflow_compensation_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioServiceDecisionReadinessReconciliations: db.prepare(`SELECT * FROM portfolio_service_decision_readiness_reconciliations ORDER BY created_at DESC LIMIT ?`).all(n),
+    portfolioRepeatWorkReceipts: db.prepare(`SELECT * FROM portfolio_repeat_work_receipts ORDER BY created_at DESC LIMIT ?`).all(n),
+    serviceCapabilities: db.prepare(`SELECT * FROM service_capabilities ORDER BY updated_at DESC LIMIT ?`).all(n),
+    vendorPartners: db.prepare(`SELECT * FROM vendor_partners ORDER BY updated_at DESC LIMIT ?`).all(n),
+    workflowDefinitions: db.prepare(`SELECT * FROM workflow_definitions ORDER BY updated_at DESC LIMIT ?`).all(n),
+    portfolioEvents: db.prepare(`SELECT * FROM portfolio_events ORDER BY created_at DESC LIMIT ?`).all(n)
   };
+  tables.portfolioEvalMergeQueueConsolidatedBlockerAudits = buildOpsMergeQueueConsolidatedBlockerAudits(tables, n);
+  tables.portfolioRetentionCohortCommandCenter = buildOpsRetentionCohortCommandCenter(tables, n);
+  tables.portfolioServiceDecisionReadinessCommandCenter = buildOpsServiceDecisionReadinessCommandCenter(tables, n);
   const payload = {
     version: 1,
     generatedAt: new Date().toISOString(),
@@ -63,7 +1153,82 @@ export function exportOperationsData({ includePII = false, limit = 500 } = {}) {
     counts: Object.fromEntries(Object.entries(tables).map(([name, rows]) => [name, rows.length])),
     tables
   };
-  return includePII ? payload : redact(payload);
+  const safePayload = includePII ? payload : redact(payload);
+  return {
+    ...safePayload,
+    redaction: {
+      ...(safePayload.redaction || {}),
+      manifest: buildOperationsExportRedactionManifest(safePayload, { includePII })
+    }
+  };
+}
+
+export function buildOperationsExportRedactionManifest(payload, { includePII = false } = {}) {
+  const tables = payload?.tables && typeof payload.tables === 'object' ? payload.tables : {};
+  const counts = payload?.counts && typeof payload.counts === 'object' ? payload.counts : {};
+  const serialized = JSON.stringify(payload || {});
+  const redactedPlaceholderKinds = [...new Set([...serialized.matchAll(/\[redacted:([^\]]+)\]/g)].map((match) => match[1]))].sort();
+  const receiptTableNames = Object.keys(tables).filter((name) => (
+    /Receipt|Receipts|Proof|Contract|Manifest|Gate|Authorization|Observation|Audit/i.test(name)
+  ));
+  const rowCount = Object.values(counts).reduce((sum, value) => sum + (Number(value) || 0), 0);
+  const secretPatternScan = {
+    rawTokenPatternFound: containsRawSecret(payload),
+    checkedPatterns: ['github_classic_token', 'github_fine_grained_token', 'stripe_live_secret', 'stripe_restricted_key', 'webhook_secret'],
+    redactedPlaceholderKinds
+  };
+  const manifest = {
+    schemaVersion: 1,
+    kind: 'ops_export_redaction_manifest',
+    generatedAt: payload?.generatedAt || new Date().toISOString(),
+    includePII: !!includePII,
+    redacted: !includePII,
+    redactionStrategy: payload?.redaction?.strategy || (includePII ? 'none' : 'pii_secrets_and_local_paths'),
+    tableCount: Object.keys(tables).length,
+    rowCount,
+    receiptTableCount: receiptTableNames.length,
+    receiptTables: Object.fromEntries(receiptTableNames.map((name) => [name, Number(counts[name]) || 0])),
+    proofReceipts: {
+      secretRedactionProofReceipts: Number(counts.portfolioEvalSecretRedactionProofReceipts) || 0,
+      mergeQueueReadbackAdapterContractReceipts: Number(counts.portfolioEvalMergeQueueReadbackAdapterContractReceipts) || 0,
+      mergeQueueLiveReadReconciliationReceipts: Number(counts.portfolioEvalMergeQueueLiveReadReconciliationReceipts) || 0,
+      mergeQueueLiveReadAdapterContractReceipts: Number(counts.portfolioEvalMergeQueueLiveReadAdapterContractReceipts) || 0,
+      mergeQueueLiveReadReadinessReceipts: Number(counts.portfolioEvalMergeQueueLiveReadReadinessReceipts) || 0,
+      mergeQueueCredentialHandoffReceipts: Number(counts.portfolioEvalMergeQueueCredentialHandoffReceipts) || 0,
+      mergeQueueLiveReadPreflightReceipts: Number(counts.portfolioEvalMergeQueueLiveReadPreflightReceipts) || 0,
+      mergeQueueTokenQuarantineReceipts: Number(counts.portfolioEvalMergeQueueTokenQuarantineReceipts) || 0,
+      mergeQueueLiveReadResponseIngestionReceipts: Number(counts.portfolioEvalMergeQueueLiveReadResponseIngestionReceipts) || 0,
+      mergeQueueRuntimeTokenReleaseGateReceipts: Number(counts.portfolioEvalMergeQueueRuntimeTokenReleaseGateReceipts) || 0,
+      mergeQueueLiveReadVerificationPromotionReceipts: Number(counts.portfolioEvalMergeQueueLiveReadVerificationPromotionReceipts) || 0,
+      mergeQueueLiveHttpExecutionPreflightHandoffReceipts: Number(counts.portfolioEvalMergeQueueLiveHttpExecutionPreflightHandoffReceipts) || 0,
+      mergeQueueLiveHttpOperatorReleaseAckReceipts: Number(counts.portfolioEvalMergeQueueLiveHttpOperatorReleaseAckReceipts) || 0,
+      mergeQueueRuntimeSecretProviderSmokeReadinessReceipts: Number(counts.portfolioEvalMergeQueueRuntimeSecretProviderSmokeReadinessReceipts) || 0,
+      mergeQueueRuntimeSecretProviderSmokeExecutionGateReceipts: Number(counts.portfolioEvalMergeQueueRuntimeSecretProviderSmokeExecutionGateReceipts) || 0,
+      mergeQueueRuntimeSecretProviderSmokeEvidenceReviewReceipts: Number(counts.portfolioEvalMergeQueueRuntimeSecretProviderSmokeEvidenceReviewReceipts) || 0,
+      mergeQueueMemoryOnlyRuntimeTokenReleasePreflightReceipts: Number(counts.portfolioEvalMergeQueueMemoryOnlyRuntimeTokenReleasePreflightReceipts) || 0,
+      mergeQueueSuccessfulSmokeEvidenceIngestionReceipts: Number(counts.portfolioEvalMergeQueueSuccessfulSmokeEvidenceIngestionReceipts) || 0,
+      mergeQueueRuntimeTokenReleaseDenialReceipts: Number(counts.portfolioEvalMergeQueueRuntimeTokenReleaseDenialReceipts) || 0,
+      mergeQueueFakeLiveReadReplayQuarantineReceipts: Number(counts.portfolioEvalMergeQueueFakeLiveReadReplayQuarantineReceipts) || 0,
+      mergeQueueFinalBlockerLedgerReceipts: Number(counts.portfolioEvalMergeQueueFinalBlockerLedgerReceipts) || 0,
+      mergeQueuePostLedgerOperatorReleaseAttestationReceipts: Number(counts.portfolioEvalMergeQueuePostLedgerOperatorReleaseAttestationReceipts) || 0,
+      mergeQueuePostAttestationReleaseEscrowReceipts: Number(counts.portfolioEvalMergeQueuePostAttestationReleaseEscrowReceipts) || 0,
+      mergeQueueReleaseDenialCloseoutReceipts: Number(counts.portfolioEvalMergeQueueReleaseDenialCloseoutReceipts) || 0,
+      mergeQueueConsolidatedBlockerAudits: Number(counts.portfolioEvalMergeQueueConsolidatedBlockerAudits) || 0,
+      retentionCohortCommandCenter: Number(counts.portfolioRetentionCohortCommandCenter) || 0,
+      retentionCommandWorkItemReceipts: Number(counts.portfolioRetentionCommandWorkItemReceipts) || 0,
+      retentionCommandWorkItemLifecycleReceipts: Number(counts.portfolioRetentionCommandWorkItemLifecycleReceipts) || 0,
+      retentionCommandWorkItemLeaseSweepReceipts: Number(counts.portfolioRetentionCommandWorkItemLeaseSweepReceipts) || 0,
+      retentionCommandWorkItemLeaseMaintenanceReceipts: Number(counts.portfolioRetentionCommandWorkItemLeaseMaintenanceReceipts) || 0,
+      serviceDecisionReadinessCommandCenter: Number(counts.portfolioServiceDecisionReadinessCommandCenter) || 0,
+      tokenScopeObservationAdapterContractReceipts: Number(counts.portfolioEvalTokenScopeObservationAdapterContractReceipts) || 0,
+      branchProtectionReadbackAdapterContractReceipts: Number(counts.portfolioEvalBranchProtectionReadbackAdapterContractReceipts) || 0
+    },
+    secretPatternScan,
+    noRawSecretPatterns: secretPatternScan.rawTokenPatternFound === false,
+    exportRedactionProofManifestRecorded: true,
+    ok: includePII ? false : secretPatternScan.rawTokenPatternFound === false
+  };
+  return redact(manifest);
 }
 
 export function backupSqliteDataDir({
@@ -452,6 +1617,161 @@ export function stopOpsRecoveryScheduler() {
   return { running: false };
 }
 
+export function runRetentionCommandLeaseMaintenanceJob(payload = {}) {
+  const now = parseJobNow(payload?.now);
+  const workspaceId = payload?.workspaceId || 'ws_callan';
+  const limit = Math.max(1, Math.min(Number(payload?.limit) || 25, 100));
+  const snapshot = portfolioOperatingModel.snapshot({ workspaceId, limit: Math.max(limit, 50) });
+  const candidates = (snapshot.retentionCohortCommandCenter || [])
+    .filter((item) => Number(item.commandWorkItemCount || 0) > 0)
+    .filter((item) => !payload?.serviceBusinessId || item.serviceBusinessId === payload.serviceBusinessId)
+    .filter((item) => !payload?.retentionCohortRollupId || item.retentionCohortRollupId === payload.retentionCohortRollupId)
+    .filter((item) => !payload?.retentionCommandWorkItemReceiptId || item.latestCommandWorkItemReceiptId === payload.retentionCommandWorkItemReceiptId)
+    .slice(0, limit);
+  const evidence = Array.isArray(payload?.evidence) ? payload.evidence : [];
+  const actor = payload?.actor || payload?.source || 'retention_command_lease_maintenance_job';
+  const receipts = candidates.map((item) => {
+    const result = portfolioOperatingModel.recordRetentionCommandWorkItemLeaseMaintenance({
+      workspaceId: item.workspace_id || workspaceId,
+      serviceBusinessId: item.serviceBusinessId,
+      retentionCohortRollupId: item.retentionCohortRollupId,
+      retentionCommandWorkItemReceiptId: item.latestCommandWorkItemReceiptId,
+      actor,
+      evidence: [
+        {
+          id: `retention-command-lease-maintenance-job:${item.retentionCohortRollupId}:${now}`,
+          source: OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE,
+          reason: payload?.reason || 'durable_job',
+          jobType: OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE,
+          safetyKind: 'retention_command_work_item_lease_maintenance_job_safety',
+          externalSideEffects: false,
+          readOnlyTelemetry: true,
+          summary: 'Recorded scheduled retention command lease maintenance without live side effects.'
+        },
+        ...evidence
+      ],
+      limit: payload?.workItemLimit || 500,
+      now
+    });
+    return {
+      id: result.receipt.id,
+      status: result.receipt.status,
+      retentionCohortRollupId: result.receipt.retention_cohort_rollup_id,
+      retentionCommandWorkItemReceiptId: result.receipt.retention_command_work_item_receipt_id,
+      workItemCount: result.receipt.work_item_count,
+      activeLeaseCount: result.receipt.active_lease_count,
+      staleLeaseCount: result.receipt.stale_lease_count,
+      releasedLeaseCount: result.receipt.released_lease_count,
+      expiredLeaseCount: result.receipt.expired_lease_count,
+      nextLeaseExpiryAt: result.receipt.next_lease_expiry_at || null
+    };
+  });
+  return {
+    ok: true,
+    type: OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE,
+    reason: payload?.reason || 'durable_job',
+    workspaceId,
+    limit,
+    scope: {
+      serviceBusinessId: payload?.serviceBusinessId || null,
+      retentionCohortRollupId: payload?.retentionCohortRollupId || null,
+      retentionCommandWorkItemReceiptId: payload?.retentionCommandWorkItemReceiptId || null
+    },
+    scannedCommandCenterCount: candidates.length,
+    receiptCount: receipts.length,
+    receipts,
+    safety: {
+      kind: 'retention_command_work_item_lease_maintenance_job_safety',
+      externalSideEffects: false,
+      readOnlyTelemetry: true,
+      localMaintenanceReceiptRecorded: receipts.length > 0,
+      customerMessageSent: false,
+      providerCalled: false,
+      adapterInvoked: false,
+      jobEnqueued: false,
+      localLeaseUpdated: false
+    }
+  };
+}
+
+export function enqueueRetentionCommandLeaseMaintenance({
+  now = Date.now(),
+  intervalMs = env.ops.retentionCommandLeaseMaintenanceIntervalMs,
+  reason = 'scheduler',
+  runAt = now,
+  maxAttempts = 2,
+  idempotencyKey = null,
+  workspaceId = 'ws_callan',
+  serviceBusinessId = null,
+  retentionCohortRollupId = null,
+  retentionCommandWorkItemReceiptId = null,
+  limit = 25
+} = {}) {
+  const bucketMs = Math.max(60_000, Number(intervalMs) || 15 * 60 * 1000);
+  const bucket = Math.floor(now / bucketMs);
+  return enqueueJob({
+    type: OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE,
+    payload: {
+      reason,
+      workspaceId,
+      serviceBusinessId,
+      retentionCohortRollupId,
+      retentionCommandWorkItemReceiptId,
+      limit,
+      source: 'durable_job',
+      intervalMs: bucketMs,
+      enqueuedAt: new Date(now).toISOString()
+    },
+    idempotencyKey: idempotencyKey || `${OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE}:${workspaceId}:${bucket}`,
+    runAt,
+    maxAttempts
+  });
+}
+
+export function startRetentionCommandLeaseMaintenanceScheduler({
+  enabled = env.ops.retentionCommandLeaseMaintenanceEnabled,
+  intervalMs = env.ops.retentionCommandLeaseMaintenanceIntervalMs
+} = {}) {
+  if (!enabled) return { running: false, disabled: true };
+  const safeInterval = Math.max(60_000, Number(intervalMs) || 15 * 60 * 1000);
+  if (retentionCommandLeaseMaintenanceTimer) {
+    return { running: true, intervalMs: safeInterval, alreadyRunning: true };
+  }
+
+  const enqueue = (reason = 'scheduler') => {
+    const result = enqueueRetentionCommandLeaseMaintenance({ intervalMs: safeInterval, reason });
+    log.info('ops.retention_command_lease_maintenance_enqueued', {
+      jobId: result.row?.id,
+      status: result.row?.status,
+      inserted: result.inserted,
+      reason
+    });
+    return result;
+  };
+
+  const first = enqueue('boot');
+  retentionCommandLeaseMaintenanceTimer = setInterval(() => {
+    try {
+      enqueue('scheduler');
+    } catch (err) {
+      log.warn('ops.retention_command_lease_maintenance_scheduler_failed', { error: err?.message || String(err) });
+    }
+  }, safeInterval);
+  retentionCommandLeaseMaintenanceTimer.unref?.();
+  return {
+    running: true,
+    intervalMs: safeInterval,
+    firstJobId: first.row?.id || null,
+    firstInserted: first.inserted
+  };
+}
+
+export function stopRetentionCommandLeaseMaintenanceScheduler() {
+  if (retentionCommandLeaseMaintenanceTimer) clearInterval(retentionCommandLeaseMaintenanceTimer);
+  retentionCommandLeaseMaintenanceTimer = null;
+  return { running: false };
+}
+
 function parseJobNow(value) {
   if (value === undefined || value === null || value === '') return Date.now();
   if (typeof value === 'number') return Number.isFinite(value) ? value : Date.now();
@@ -500,6 +1820,59 @@ export function opsObservability({ now = Date.now(), windowMs = 24 * HOUR_MS } =
   const providerHealthSloResult = providerHealthSlo(providerHistory);
   const recentProviderFailures = providerSmoke.issues({ since, limit: 25 });
   const safeToSellHistory = safeToSellReports.summary({ since, limit: 10 });
+  const safeToRenewHistory = safeToRenewReports.summary({ since, limit: 10 });
+  const safeToRenewPlaybookHistory = safeToRenewPlaybooks.summary({ since, limit: 10 });
+  const accountOperatorBoard = accountTasks.operatorBoardSummary();
+  const renewalChangeRequestQueue = summarizeRenewalChangeRequestQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalBillingChangePreflightQueue = summarizeRenewalBillingChangePreflightQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalBillingExecutionReceiptQueue = summarizeRenewalBillingExecutionReceiptQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerMessagePreflightQueue = summarizeRenewalCustomerMessagePreflightQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerMessageSendReceiptQueue = summarizeRenewalCustomerMessageSendReceiptQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerConfirmationQueue = summarizeRenewalCustomerConfirmationQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerConfirmationAcknowledgementQueue = summarizeRenewalCustomerConfirmationAcknowledgementQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerConfirmationAcceptanceQueue = summarizeRenewalCustomerConfirmationAcceptanceQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerConfirmationFollowupQueue = summarizeRenewalCustomerConfirmationFollowupQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
+  const renewalCustomerConfirmationCloseoutPacketQueue = summarizeRenewalCustomerConfirmationCloseoutPacketQueue({
+    windowMs: 30 * 24 * HOUR_MS,
+    now,
+    limit: 200
+  });
   const workerHistory = workerRunHistory({ since, now });
   const durableJobIssueHistory = durableJobIssues({ since });
   const workerHealthSloResult = workerHealthSlo(workerHistory, durableJobIssueHistory);
@@ -573,6 +1946,19 @@ export function opsObservability({ now = Date.now(), windowMs = 24 * HOUR_MS } =
     workerHistory,
     durableJobIssueHistory,
     safeToSellHistory,
+    safeToRenewHistory,
+    safeToRenewPlaybookHistory,
+    accountOperatorBoard,
+    renewalChangeRequestQueue,
+    renewalBillingChangePreflightQueue,
+    renewalBillingExecutionReceiptQueue,
+    renewalCustomerMessagePreflightQueue,
+    renewalCustomerMessageSendReceiptQueue,
+    renewalCustomerConfirmationQueue,
+    renewalCustomerConfirmationAcknowledgementQueue,
+    renewalCustomerConfirmationAcceptanceQueue,
+    renewalCustomerConfirmationFollowupQueue,
+    renewalCustomerConfirmationCloseoutPacketQueue,
     providerCosts,
     recentFailures,
     stuck,
@@ -940,7 +2326,9 @@ export async function refreshStaleOpsMaintenance({
     [OPS_BACKUP_JOB_TYPE]: runOpsBackupJob,
     [OPS_PROVIDER_POSTURE_JOB_TYPE]: runProviderPostureJob,
     [OPS_RECOVER_STUCK_JOB_TYPE]: runOpsRecoveryJob,
-    [ACCOUNT_MANAGER_RUN_JOB_TYPE]: handleAccountManagerRunJob
+    [OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE]: runRetentionCommandLeaseMaintenanceJob,
+    [ACCOUNT_MANAGER_RUN_JOB_TYPE]: handleAccountManagerRunJob,
+    [SAFE_TO_RENEW_JOB_TYPE]: runSafeToRenewSelfCheck
   };
   const stale = before.jobs.filter((job) => job.enabled && !job.ok && handlers[job.type]);
   if (!stale.length) {
@@ -965,6 +2353,18 @@ export async function refreshStaleOpsMaintenance({
     if (job.type === OPS_BACKUP_JOB_TYPE) queued.push(enqueueOpsBackup(common));
     if (job.type === OPS_PROVIDER_POSTURE_JOB_TYPE) queued.push(enqueueProviderPostureRefresh(common));
     if (job.type === OPS_RECOVER_STUCK_JOB_TYPE) queued.push(enqueueOpsRecovery(common));
+    if (job.type === OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE) queued.push(enqueueRetentionCommandLeaseMaintenance(common));
+    if (job.type === SAFE_TO_RENEW_JOB_TYPE) queued.push(enqueueJob({
+      type: SAFE_TO_RENEW_JOB_TYPE,
+      payload: {
+        reason,
+        source: 'safe_to_sell_preflight',
+        enqueuedAt: new Date(now).toISOString()
+      },
+      idempotencyKey: key,
+      runAt: now,
+      maxAttempts: 2
+    }));
     if (job.type === ACCOUNT_MANAGER_RUN_JOB_TYPE) {
       queued.push(enqueueAccountManagerRun({
         ...common,
@@ -1022,10 +2422,22 @@ function recurringOpsJobSpecs() {
       intervalMs: env.ops.recoveryIntervalMs
     },
     {
+      type: OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE,
+      label: 'Retention command lease maintenance',
+      enabled: env.ops.retentionCommandLeaseMaintenanceEnabled,
+      intervalMs: env.ops.retentionCommandLeaseMaintenanceIntervalMs
+    },
+    {
       type: OPS_SAFE_TO_SELL_JOB_TYPE,
       label: 'Safe-to-sell self-check',
       enabled: env.ops.safeToSellCheckEnabled,
       intervalMs: env.ops.safeToSellCheckIntervalMs
+    },
+    {
+      type: SAFE_TO_RENEW_JOB_TYPE,
+      label: 'Safe-to-renew self-check',
+      enabled: env.ops.safeToRenewCheckEnabled,
+      intervalMs: env.ops.safeToRenewCheckIntervalMs
     },
     {
       type: ACCOUNT_MANAGER_RUN_JOB_TYPE,

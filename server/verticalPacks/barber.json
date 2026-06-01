@@ -54,5 +54,94 @@
     "Use existing Instagram or review photos as the first visual proof instead of a generic salon page."
   ],
   "siteTemplateHint": "Use a warm, photo-led barber template: dark, masculine palette with one bold accent, big hero image of the chair or a finished cut, services with simple price tier copy, hours, and a sticky tap-to-call button.",
-  "customerPersonaHint": "Local clients searching for a new barber or stylist, scrolling fast on a phone, looking for photos of work, a price feel, hours, and a quick way to call or DM."
+  "customerPersonaHint": "Local clients searching for a new barber or stylist, scrolling fast on a phone, looking for photos of work, a price feel, hours, and a quick way to call or DM.",
+  "marketSignals": [
+    { "key": "booking_gap", "label": "Booking link, hours, or chair location is hard to find.", "evidenceHint": "Listing, Instagram, or reviews mention appointments but no owned page connects them." },
+    { "key": "photo_proof_gap", "label": "Public profiles show work but do not convert searchers into bookings.", "evidenceHint": "Instagram or review photos exist without clear hours, prices, or booking path." },
+    { "key": "walk_in_confusion", "label": "New clients cannot tell whether walk-ins, appointments, or DMs are preferred.", "evidenceHint": "Listing lacks booking instructions or review questions mention scheduling." }
+  ],
+  "leadSources": [
+    "Google Maps barber and salon categories",
+    "Instagram profile links from public listings",
+    "Yelp barber and salon pages",
+    "booking-app profiles missing owned pages"
+  ],
+  "compliance": {
+    "restrictedClaims": ["licensed cosmetology claims unless verified", "medical hair-loss claims", "before-after transformations without owner approval"],
+    "requiredDisclosures": ["automated call disclosure", "public-source phone explanation", "photo usage approval"],
+    "mediaApprovalRequired": true
+  },
+  "serviceOffer": {
+    "headline": "Photo-led booking page for a barber or salon",
+    "customerOutcome": "New clients can see the work, hours, location, and booking or DM path without digging.",
+    "packages": [
+      { "key": "chair-page", "name": "Chair page", "description": "Photo-led page with service tiers, hours, location, booking link, and hosting.", "priceCents": 45000 },
+      { "key": "photo-refresh", "name": "Photo refresh", "description": "Swap in new cuts, styles, or seasonal service copy.", "priceCents": 12000 }
+    ],
+    "refundPolicy": "Refund before build work starts if the owner cannot approve usable photos or booking details.",
+    "proofAssets": ["approved photos", "booking link", "review themes", "hours and location"]
+  },
+  "fulfillmentRequirements": [
+    "booking or DM path confirmed",
+    "photo permissions recorded",
+    "hours and location verified",
+    "service tiers approved",
+    "mobile CTA QA"
+  ],
+  "vendorRequirements": [
+    "designer review for weak photo sets",
+    "operator review before using client images from public profiles"
+  ],
+  "qaRules": [
+    "no unapproved photos",
+    "booking link works",
+    "hours and address are visible on mobile",
+    "service tier copy avoids unverified price promises"
+  ],
+  "portalCopy": {
+    "intakePrompt": "Confirm booking link, hours, services, photo permissions, and preferred client contact path.",
+    "approvalLabel": "Approve booking page",
+    "revisionLabel": "Update photos or service tiers"
+  },
+  "trustRequirements": [
+    "photo approval source",
+    "booking-link source",
+    "review proof source"
+  ],
+  "reviewStrategy": [
+    "request reviews about service, style, and repeat-client trust",
+    "collect best style mentions for future proof copy"
+  ],
+  "growthPaths": [
+    "new-client booking page",
+    "style gallery refresh",
+    "review capture loop",
+    "holiday gift-card or appointment push"
+  ],
+  "retentionLoops": [
+    "monthly photo refresh",
+    "hours and booking link check",
+    "seasonal service tier update"
+  ],
+  "marginModel": {
+    "basePriceCents": 45000,
+    "estimatedFulfillmentCostCents": 12000,
+    "targetGrossMarginPct": 50,
+    "maxAcquisitionCostPct": 16,
+    "notes": "Lower base price is offset by repeat photo-refresh opportunities."
+  },
+  "launchChecklist": [
+    "booking path confirmed",
+    "photo rights approved",
+    "service tiers approved",
+    "mobile booking QA",
+    "owner approval recorded",
+    "photo refresh reminder scheduled"
+  ],
+  "evals": [
+    "photo permission safety",
+    "booking path clarity",
+    "mobile gallery load",
+    "hours and location clarity"
+  ]
 }

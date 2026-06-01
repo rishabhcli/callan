@@ -1,0 +1,27 @@
+{
+  "key": "home_services_lead_capture",
+  "name": "Home services lead capture",
+  "matchNiches": ["home services", "home repair", "handyman", "roofing leads", "landscaping leads"],
+  "priceCents": 70000,
+  "pitchTone": "Direct and field-service oriented. Focus on quote intake, service area, and proof without overpromising response times.",
+  "valuePropHook": "A home-services lead capture setup that filters service area, job type, urgency, and photos before an operator or vendor follows up.",
+  "reviewValueProps": ["service-area fit", "photo-aware intake", "quote clarity"],
+  "marketSignals": ["unclear quote path", "service-area ambiguity", "review complaints about estimates"],
+  "leadSources": ["home-service directories", "review complaints", "weak quote-form websites"],
+  "compliance": { "restrictedClaims": ["licensed unless verified", "guaranteed estimates", "24/7 emergency unless confirmed"], "requiredDisclosures": ["estimate boundary", "consent to contact"] },
+  "serviceOffer": {
+    "headline": "Home-service quote intake",
+    "customerOutcome": "Homeowners can submit the right job details, photos, and location before a quote or dispatch review.",
+    "packages": [{ "key": "home-lead-capture", "name": "Lead capture setup", "description": "Service-area gate, job-type intake, photo prompt, and quote handoff.", "priceCents": 70000 }],
+    "proofAssets": ["service area", "job categories", "estimate policy"]
+  },
+  "fulfillmentRequirements": ["service categories approved", "photo prompt ready", "estimate boundary reviewed"],
+  "vendorRequirements": ["licensed vendor proof for regulated trades", "backup route before dispatch promises"],
+  "qaRules": ["service area required", "photo upload path documented", "no instant quote claim"],
+  "trustRequirements": ["license claim evidence or omission", "estimate disclaimer"],
+  "growthPaths": ["quote follow-up", "missed-call rescue"],
+  "retentionLoops": ["seasonal service reminder", "repeat-work scheduling"],
+  "marginModel": { "basePriceCents": 70000, "estimatedFulfillmentCostCents": 21000, "targetGrossMarginPct": 48, "maxAcquisitionCostPct": 18 },
+  "launchChecklist": ["service area captured", "intake drafted", "quote boundary reviewed", "QA complete", "owner approval recorded"],
+  "evals": ["quote-intake completeness", "regulated-claim safety"]
+}

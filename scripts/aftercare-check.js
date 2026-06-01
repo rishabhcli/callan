@@ -31,7 +31,7 @@ Object.assign(process.env, {
   MOSS_PROJECT_KEY: ''
 });
 
-const { accountManagerPlans, accountTasks, buildQaResults, contactEvents, db, leads, payments } = await import('../server/db.js');
+const { accountManagerPlans, accountTasks, buildQaResults, contactEvents, db, leads, payments, portalActions } = await import('../server/db.js');
 const { containerTagFor } = await import('../server/memory.js');
 const {
   evaluateSendPolicy,
@@ -102,6 +102,33 @@ try {
     body: 'Please add our curly hair consultation service and update the hero photo.',
     metadata: { synthetic: true }
   });
+  const renewalCloseoutNextReviewAt = now + 14 * 24 * 60 * 60 * 1000;
+  const renewalCloseout = portalActions.add({
+    id: 'pa_aftercare_renewal_closeout',
+    lead_id: leadId,
+    type: 'renewal_customer_confirmation_closeout_packet',
+    status: 'visible_to_customer',
+    related_type: 'portal_action',
+    related_id: 'pa_aftercare_followup_receipt',
+    body: {
+      leadId,
+      subscriptionId: 'sub_aftercare_renewal',
+      summary: 'Customer-visible renewal closeout is verified and ready for the next health review.',
+      closeoutPacketVisible: true,
+      customerVisible: true,
+      portalVisible: true,
+      customerMessageSent: false,
+      liveSideEffects: false,
+      closeoutLiveSideEffects: false,
+      nextReviewAt: renewalCloseoutNextReviewAt
+    },
+    metadata: { synthetic: true },
+    actor: 'ops_check_operator',
+    channel: 'ops_console',
+    direction: 'internal',
+    decision_code: 'ops.renewal_customer_confirmation.closeout_packet_recorded',
+    summary: 'Synthetic renewal closeout packet for account-manager aftercare verification.'
+  });
 
   const generated = await generateAccountManagerPlanForLead({ leadId, force: true, source: 'aftercare-check', now });
   assert.equal(generated.plan.schemaVersion, 'account_manager_plan.v1');
@@ -119,7 +146,8 @@ try {
     'seasonal_hours',
     'service_menu_changes',
     'analytics_contact_flow_check',
-    'hosting_subscription_status'
+    'hosting_subscription_status',
+    'renewal_closeout_health_check'
   ]) {
     assert.ok(kinds.has(kind), `${kind} task should be persisted`);
   }
@@ -140,6 +168,109 @@ try {
   assert.ok(review.due_at > launch.due_at, 'review request should happen after delivery check');
   const stale = tasks.find((task) => task.kind === 'stale_business_fact');
   assert.ok(stale.due_at <= now, 'stale phone/hours correction should be due immediately');
+  const renewalCloseoutTask = tasks.find((task) => task.kind === 'renewal_closeout_health_check');
+  assert.equal(renewalCloseoutTask.due_at, renewalCloseoutNextReviewAt, 'renewal closeout health check should use packet nextReviewAt');
+  assert.equal(renewalCloseoutTask.channel, 'operator', 'renewal closeout health check should stay operator-owned');
+  assert.ok(
+    renewalCloseoutTask.evidenceIds.includes(`renewal-closeout-${renewalCloseout.id.replace(/_/g, '-')}`),
+    'renewal closeout health check should cite the closeout packet evidence'
+  );
+  const boardEscalation = accountTasks.escalateToOperatorBoard(renewalCloseoutTask.id, {
+    actor: 'aftercare-check',
+    workItemKind: 'renewal_closeout_operator_review',
+    requiredProof: 'renewal_closeout_operator_review',
+    evidence: [{ id: 'aftercare-renewal-closeout-board-escalation', source: 'aftercare-check', summary: 'Renewal closeout health check escalates into operator-board review without customer contact.' }]
+  });
+  assert.equal(boardEscalation.inserted, true);
+  assert.equal(boardEscalation.receipt.provider, 'account_manager_operator_board');
+  assert.equal(boardEscalation.receipt.escalation_kind, 'account_manager_task_operator_board_review');
+  assert.equal(boardEscalation.receipt.safety.customerMessageSent, false);
+  assert.equal(boardEscalation.receipt.safety.subscriptionChanged, false);
+  assert.equal(boardEscalation.receipt.safety.billingChanged, false);
+  assert.equal(boardEscalation.workItem.work_item_kind, 'renewal_closeout_operator_review');
+  assert.equal(boardEscalation.workItem.status, 'queued_review');
+  assert.equal(boardEscalation.workItem.instructions.requiredProof, 'renewal_closeout_operator_review');
+  assert.equal(boardEscalation.workItem.instructions.accountTaskId, renewalCloseoutTask.id);
+  assert.equal(boardEscalation.workItem.safety.customerMessageSent, false);
+  assert.equal(boardEscalation.task.owner, 'operator_board');
+  const boardEscalationReused = accountTasks.escalateToOperatorBoard(renewalCloseoutTask.id, {
+    actor: 'aftercare-check',
+    workItemKind: 'renewal_closeout_operator_review',
+    requiredProof: 'renewal_closeout_operator_review'
+  });
+  assert.equal(boardEscalationReused.inserted, false);
+  assert.equal(boardEscalationReused.receipt.id, boardEscalation.receipt.id);
+  assert(accountTasks.history(renewalCloseoutTask.id).some((row) => row.action === 'operator_board_escalated'));
+  const boardClaim = accountTasks.claimOperatorBoardWorkItem(boardEscalation.workItem.id, {
+    actor: 'aftercare-check',
+    evidence: [{ id: 'aftercare-renewal-closeout-board-claim', source: 'aftercare-check', summary: 'Local operator claimed renewal closeout board review.' }]
+  });
+  assert.equal(boardClaim.inserted, true);
+  assert.equal(boardClaim.receipt.provider, 'account_manager_operator_board_lifecycle');
+  assert.equal(boardClaim.receipt.action_kind, 'claim');
+  assert.equal(boardClaim.receipt.status, 'in_review');
+  assert.equal(boardClaim.receipt.safety.customerMessageSent, false);
+  assert.equal(boardClaim.receipt.safety.accountTaskCompleted, false);
+  assert.equal(boardClaim.workItem.status, 'in_review');
+  assert.equal(boardClaim.escalation.status, 'in_review');
+  assert.notEqual(boardClaim.task.status, 'completed');
+  const boardClaimReused = accountTasks.claimOperatorBoardWorkItem(boardEscalation.workItem.id, { actor: 'aftercare-check' });
+  assert.equal(boardClaimReused.inserted, false);
+  assert.equal(boardClaimReused.receipt.id, boardClaim.receipt.id);
+  const boardResolve = accountTasks.resolveOperatorBoardWorkItem(boardEscalation.workItem.id, {
+    actor: 'aftercare-check',
+    proofKey: 'renewal_closeout_operator_review',
+    proof: { reviewed: true, closeoutPacketId: renewalCloseout.id },
+    note: 'Renewal closeout operator review resolved locally.',
+    evidence: [{ id: 'aftercare-renewal-closeout-board-resolve', source: 'aftercare-check', summary: 'Local operator resolved renewal closeout board review without live side effects.' }]
+  });
+  assert.equal(boardResolve.inserted, true);
+  assert.equal(boardResolve.receipt.action_kind, 'resolve');
+  assert.equal(boardResolve.receipt.status, 'resolved');
+  assert.equal(boardResolve.receipt.proof_key, 'renewal_closeout_operator_review');
+  assert.equal(boardResolve.receipt.response.downstreamProof.renewal_closeout_operator_review, true);
+  assert.equal(boardResolve.receipt.safety.customerMessageSent, false);
+  assert.equal(boardResolve.receipt.safety.billingChanged, false);
+  assert.equal(boardResolve.receipt.safety.accountTaskCompleted, false);
+  assert.equal(boardResolve.workItem.status, 'resolved');
+  assert.equal(boardResolve.workItem.instructions.lifecycle.receiptId, boardResolve.receipt.id);
+  assert.equal(boardResolve.escalation.status, 'resolved');
+  assert.notEqual(boardResolve.task.status, 'completed');
+  assert(accountTasks.history(renewalCloseoutTask.id).some((row) => row.action === 'operator_board_resolve'));
+  const boardResolveReused = accountTasks.resolveOperatorBoardWorkItem(boardEscalation.workItem.id, {
+    actor: 'aftercare-check',
+    proofKey: 'renewal_closeout_operator_review'
+  });
+  assert.equal(boardResolveReused.inserted, false);
+  assert.equal(boardResolveReused.receipt.id, boardResolve.receipt.id);
+  const boardRetentionFeedback = accountTasks.recordOperatorBoardRetentionFeedback(boardResolve.receipt.id, {
+    actor: 'aftercare-check',
+    recommendation: 'attach_to_retention_health_watch',
+    evidence: [{ id: 'aftercare-renewal-closeout-board-retention-feedback', source: 'aftercare-check', summary: 'Resolved renewal board review can become a retention feedback signal without contacting the customer.' }]
+  });
+  assert.equal(boardRetentionFeedback.inserted, true);
+  assert.equal(boardRetentionFeedback.receipt.provider, 'account_manager_operator_board_retention_feedback');
+  assert.equal(boardRetentionFeedback.receipt.feedback_kind, 'account_board_retention_signal');
+  assert.equal(boardRetentionFeedback.receipt.recommendation, 'attach_to_retention_health_watch');
+  assert.equal(boardRetentionFeedback.receipt.safety.kind, 'account_manager_operator_board_retention_feedback_safety');
+  assert.equal(boardRetentionFeedback.receipt.safety.customerMessageSent, false);
+  assert.equal(boardRetentionFeedback.receipt.safety.retentionPlaybookMutated, false);
+  assert.equal(boardRetentionFeedback.receipt.safety.accountTaskCompleted, false);
+  assert.equal(boardRetentionFeedback.receipt.response.operatorBoardLifecycleReceiptId, boardResolve.receipt.id);
+  assert.equal(boardRetentionFeedback.receipt.response.externalSideEffects, false);
+  const boardRetentionFeedbackReused = accountTasks.recordOperatorBoardRetentionFeedback(boardResolve.receipt.id, { actor: 'aftercare-check' });
+  assert.equal(boardRetentionFeedbackReused.inserted, false);
+  assert.equal(boardRetentionFeedbackReused.receipt.id, boardRetentionFeedback.receipt.id);
+  assert(accountTasks.history(renewalCloseoutTask.id).some((row) => row.action === 'operator_board_retention_feedback_recorded'));
+  const operatorBoardSummary = accountTasks.operatorBoardSummary();
+  assert.equal(operatorBoardSummary.escalations.total, 1);
+  assert.equal(operatorBoardSummary.workItems.total, 1);
+  assert.equal(operatorBoardSummary.workItems.byStatus.resolved, 1);
+  assert.equal(operatorBoardSummary.lifecycleReceipts.total, 2);
+  assert.equal(operatorBoardSummary.lifecycleReceipts.byAction.claim, 1);
+  assert.equal(operatorBoardSummary.lifecycleReceipts.byAction.resolve, 1);
+  assert.equal(operatorBoardSummary.retentionFeedback.total, 1);
+  assert.equal(operatorBoardSummary.retentionFeedback.byRecommendation.attach_to_retention_health_watch, 1);
 
   const dryRun = await runAccountManagerScheduler({ leadId, dryRun: true, now, source: 'aftercare-check' });
   assert.ok(dryRun.processed >= 1, 'dry-run should process due tasks');
@@ -263,6 +394,7 @@ try {
   console.log(`[PASS] account_manager_plan persisted for ${leadId}`);
   console.log(`[PASS] ${tasks.length} account_tasks persisted with due_at, priority, channel, owner, evidence, and idempotency keys`);
   console.log('[PASS] 24h launch, review capture, seasonal hours, stale facts, GBP, analytics, promised edit, and hosting checks exist');
+  console.log('[PASS] customer-visible renewal closeout packets become operator-owned renewal health checks');
   console.log('[PASS] dry-run previews cite remembered evidence and persist to the task');
   console.log('[PASS] post-launch aftercare waits for customer approval, then seeds automatically from portal launch approval');
   console.log('[PASS] LIVE_EMAILS gate, opt-out block, frequency cap, and quiet-window block verified');

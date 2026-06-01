@@ -16,6 +16,11 @@ npm run start        # NODE_ENV=production server/index.js
 npm run check        # `node --check` over server/ and scripts/ — fastest syntax gate
 npm run demo:e2e     # one-command mocked lifecycle (seed → call → invoice → paid → build → verify)
 npm run safe-to-sell # fail-closed launch gate (exits nonzero when not ready)
+npm run safe-to-renew # fail-closed renewal/aftercare gate; records non-live save playbooks for at-risk subscriptions
+npm run check:aftercare # account-manager plans/tasks, dry-run previews, renewal closeout health checks, operator-board escalation, lifecycle receipts, and retention-feedback receipts
+npm run check:portal # token-scoped customer portal actions, including renewal review/change requests, confirmations, acknowledgements, and acceptances
+npm run check:ops    # ops observability/export/queue regressions, including renewal billing/message preflight, execution, confirmation, acknowledgement, acceptance, follow-up, closeout, and closeout-to-aftercare gates
+npm run check:maygoals # portfolio operating-model proof, including renewal closeout-driven retention playbooks
 npm run drill:reliability  # starts a throwaway mock server, hits public routes
 npm run smoke:providers    # provider readiness; live checks need SMOKE_* + `-- --provider <name>`
 ```

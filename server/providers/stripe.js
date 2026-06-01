@@ -247,6 +247,77 @@ export async function createHostedInvoice({
   }
 }
 
+export async function applyStripeSubscriptionChange({
+  stripeSubscriptionId,
+  changeType = 'other',
+  targetStripePriceId = null,
+  idempotencyKey,
+  metadata = {}
+} = {}) {
+  if (!stripeSubscriptionId) throw new Error('Stripe subscription id required');
+  if (!idempotencyKey) throw new Error('Stripe subscription change idempotencyKey missing');
+  const cleanChangeType = String(changeType || 'other').toLowerCase();
+  const cleanMetadataPayload = cleanMetadata({
+    source: 'callmemaybe_renewal_billing_change',
+    changeType: cleanChangeType,
+    ...metadata
+  });
+
+  try {
+    const stripe = stripeClient();
+    let updatePayload;
+    if (cleanChangeType === 'cancel') {
+      updatePayload = {
+        cancel_at_period_end: true,
+        metadata: cleanMetadataPayload
+      };
+    } else if (cleanChangeType === 'pause') {
+      updatePayload = {
+        pause_collection: { behavior: 'mark_uncollectible' },
+        metadata: cleanMetadataPayload
+      };
+    } else if (cleanChangeType === 'resume') {
+      updatePayload = {
+        pause_collection: null,
+        cancel_at_period_end: false,
+        metadata: cleanMetadataPayload
+      };
+    } else if (targetStripePriceId) {
+      const subscription = await stripe.subscriptions.retrieve(stripeSubscriptionId, {
+        expand: ['items.data.price']
+      });
+      const item = subscription?.items?.data?.[0] || null;
+      if (!item?.id) throw new Error(`Stripe subscription ${stripeSubscriptionId} has no editable subscription item`);
+      updatePayload = {
+        items: [{ id: item.id, price: targetStripePriceId }],
+        proration_behavior: 'none',
+        metadata: cleanMetadataPayload
+      };
+    } else {
+      throw new Error(`Stripe subscription change ${cleanChangeType} requires targetStripePriceId`);
+    }
+
+    const updated = await stripe.subscriptions.update(
+      stripeSubscriptionId,
+      updatePayload,
+      { idempotencyKey }
+    );
+    const updatedItem = updated?.items?.data?.[0] || null;
+    return {
+      id: updated.id,
+      status: updated.status || null,
+      cancelAtPeriodEnd: updated.cancel_at_period_end === true,
+      currentPeriodEnd: updated.current_period_end ? updated.current_period_end * 1000 : null,
+      pauseCollection: updated.pause_collection || null,
+      subscriptionItemId: updatedItem?.id || null,
+      stripePriceId: updatedItem?.price?.id || updatedItem?.price || null,
+      metadata: updated.metadata || {}
+    };
+  } catch (err) {
+    throw stripeAdapterError(err, 'applyStripeSubscriptionChange');
+  }
+}
+
 export async function createStripeSmokeInvoice() {
   if (!bool(process.env.SMOKE_STRIPE_INVOICE)) {
     throw new Error('SMOKE_STRIPE_INVOICE=true is required to create a Stripe smoke invoice');

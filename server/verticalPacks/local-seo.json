@@ -1,0 +1,27 @@
+{
+  "key": "local_seo",
+  "name": "Local SEO",
+  "matchNiches": ["local seo", "seo", "seo agency", "google maps seo", "near me seo", "local search"],
+  "priceCents": 65000,
+  "pitchTone": "Practical and evidence-led. Avoid ranking promises and focus on discoverability hygiene.",
+  "valuePropHook": "A local SEO setup that cleans up service-area pages, listing consistency, and proof copy without making ranking guarantees.",
+  "reviewValueProps": ["service-area clarity", "directory consistency", "review themes as proof"],
+  "marketSignals": ["inconsistent NAP", "thin local pages", "missing service-area proof"],
+  "leadSources": ["Maps category searches", "directory NAP mismatches", "weak local landing pages"],
+  "compliance": { "restrictedClaims": ["guaranteed rankings", "guaranteed leads", "fake reviews"], "requiredDisclosures": ["no ranking guarantee", "public-source evidence"] },
+  "serviceOffer": {
+    "headline": "Local SEO foundation package",
+    "customerOutcome": "Customers can find consistent local service information and proof across owned and directory surfaces.",
+    "packages": [{ "key": "local-seo-foundation", "name": "Local SEO foundation", "description": "Service-area page plan, NAP consistency checklist, proof copy, and review prompts.", "priceCents": 65000 }],
+    "proofAssets": ["listing inventory", "service-area evidence", "review themes"]
+  },
+  "fulfillmentRequirements": ["NAP inventory captured", "service areas approved", "no ranking promises in copy"],
+  "vendorRequirements": ["directory access only after ownership proof", "operator review for regulated categories"],
+  "qaRules": ["NAP fields match", "service areas are explicit", "no guaranteed ranking claim"],
+  "trustRequirements": ["source every local claim", "document ownership boundaries"],
+  "growthPaths": ["neighborhood pages", "review request loop"],
+  "retentionLoops": ["monthly listing check", "quarterly service-area refresh"],
+  "marginModel": { "basePriceCents": 65000, "estimatedFulfillmentCostCents": 18000, "targetGrossMarginPct": 48, "maxAcquisitionCostPct": 16 },
+  "launchChecklist": ["listing inventory captured", "local page drafted", "NAP QA complete", "owner approval recorded", "monitoring scheduled"],
+  "evals": ["NAP consistency", "ranking-claim safety"]
+}

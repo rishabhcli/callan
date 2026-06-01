@@ -62,5 +62,95 @@
     "Turn repeated review mentions of signature items into concrete menu highlights."
   ],
   "siteTemplateHint": "Use a warm hospitality template: appetite-friendly photo hero, palette inspired by the cuisine with one accent, menu section rendered as readable text (not just an image), hours, address with a map link, and a sticky phone CTA.",
-  "customerPersonaHint": "Hungry locals or visitors searching by name or cuisine on a phone, deciding in seconds whether to come in, looking for hours, the menu, and a clear address with a phone number."
+  "customerPersonaHint": "Hungry locals or visitors searching by name or cuisine on a phone, deciding in seconds whether to come in, looking for hours, the menu, and a clear address with a phone number.",
+  "marketSignals": [
+    { "key": "menu_visibility_gap", "label": "Menu is missing, image-only, stale, or trapped on a third-party profile.", "evidenceHint": "Public search result lacks readable menu text or hours are inconsistent." },
+    { "key": "meal_time_intent", "label": "Customers decide during lunch or dinner windows and need fast certainty.", "evidenceHint": "Cuisine/category and review volume indicate local search demand." },
+    { "key": "delivery_dependency", "label": "Third-party delivery profiles own too much of the search journey.", "evidenceHint": "DoorDash, Yelp, or Facebook are clearer than the owned page." }
+  ],
+  "leadSources": [
+    "Google Maps restaurant and cuisine categories",
+    "Yelp and delivery marketplace profiles",
+    "public menu aggregators",
+    "food truck and pop-up calendars"
+  ],
+  "compliance": {
+    "restrictedClaims": ["health claims", "allergen guarantees unless owner supplies policy", "delivery promises unless confirmed", "alcohol promotion without review"],
+    "requiredDisclosures": ["automated call disclosure", "public-source phone explanation", "menu accuracy disclaimer when owner has not approved"],
+    "menuApprovalRequired": true
+  },
+  "serviceOffer": {
+    "headline": "Menu, hours, and map page for a restaurant",
+    "customerOutcome": "Hungry customers can see the menu, hours, address, and phone fast enough to choose the restaurant.",
+    "packages": [
+      { "key": "menu-page", "name": "Menu page", "description": "Readable menu, hours, address, map link, phone CTA, review proof, and hosting.", "priceCents": 50000 },
+      { "key": "menu-refresh", "name": "Menu refresh", "description": "Update seasonal items, hours, photos, or specials.", "priceCents": 15000 }
+    ],
+    "refundPolicy": "Refund before build work starts if the owner cannot approve menu or hours.",
+    "proofAssets": ["approved menu", "hours", "address", "review themes", "food photos if approved"]
+  },
+  "fulfillmentRequirements": [
+    "menu source captured and owner-approved",
+    "hours and address verified",
+    "phone and map link QA",
+    "photo use approved",
+    "allergen or alcohol copy reviewed if present"
+  ],
+  "vendorRequirements": [
+    "designer review for photo-heavy pages",
+    "operator approval for alcohol, allergen, or health-sensitive copy"
+  ],
+  "qaRules": [
+    "menu is readable text or clearly approved image",
+    "hours, phone, address, and map link work",
+    "no unapproved allergen, health, or delivery guarantees",
+    "mobile first viewport shows menu path and address"
+  ],
+  "portalCopy": {
+    "intakePrompt": "Confirm menu source, hours, address, phone, photos, and ordering or dine-in preference.",
+    "approvalLabel": "Approve restaurant page",
+    "revisionLabel": "Update menu, hours, or photos"
+  },
+  "trustRequirements": [
+    "owner-approved menu",
+    "hours and address source",
+    "photo approval source"
+  ],
+  "reviewStrategy": [
+    "request reviews mentioning signature items and service",
+    "use real favorite-dish mentions as proof near the menu"
+  ],
+  "growthPaths": [
+    "seasonal menu refresh",
+    "catering or private event page",
+    "review capture loop",
+    "local SEO cuisine page"
+  ],
+  "retentionLoops": [
+    "monthly hours and menu check",
+    "holiday-hours update",
+    "specials or photo refresh"
+  ],
+  "marginModel": {
+    "basePriceCents": 50000,
+    "estimatedFulfillmentCostCents": 15000,
+    "targetGrossMarginPct": 46,
+    "maxAcquisitionCostPct": 17,
+    "notes": "Menu updates create strong retention if owner can provide clean menu sources."
+  },
+  "launchChecklist": [
+    "menu source captured",
+    "hours and address verified",
+    "photo rights approved or omitted",
+    "menu mobile QA",
+    "map and phone QA",
+    "owner approval recorded",
+    "menu refresh reminder scheduled"
+  ],
+  "evals": [
+    "menu readability",
+    "hours/address accuracy",
+    "photo permission safety",
+    "meal-time conversion clarity"
+  ]
 }

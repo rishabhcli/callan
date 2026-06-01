@@ -8,6 +8,7 @@ import {
   growthPlans,
   leads,
   payments,
+  portalActions,
   subscriptions
 } from '../db.js';
 import { env } from '../env.js';
@@ -18,6 +19,7 @@ import { ACCOUNT_MANAGER_SECTION_KEYS, collectAccountTasks, emptyAccountManagerP
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
+const RENEWAL_CLOSEOUT_PACKET_TYPE = 'renewal_customer_confirmation_closeout_packet';
 
 const SECTION_FOR_KIND = Object.freeze({
   promised_edit: 'promisedEdits',
@@ -28,7 +30,8 @@ const SECTION_FOR_KIND = Object.freeze({
   seasonal_hours: 'seasonalHours',
   service_menu_changes: 'serviceMenuChanges',
   analytics_contact_flow_check: 'analyticsContactFlowCheck',
-  hosting_subscription_status: 'hostingSubscriptionStatus'
+  hosting_subscription_status: 'hostingSubscriptionStatus',
+  renewal_closeout_health_check: 'renewalCloseoutHealthChecks'
 });
 
 export async function generateAccountManagerPlanForLead({ leadId, force = false, source = 'account_manager', now = Date.now() } = {}) {
@@ -79,6 +82,12 @@ export async function readAccountManagerState(leadId) {
     row,
     plan: row?.plan || null,
     tasks: accountTasks.listByLead(leadId, { includeHistory: true }),
+    operatorBoard: {
+      escalations: accountTasks.listOperatorBoardEscalations({ leadId, limit: 100 }),
+      workItems: accountTasks.listOperatorBoardWorkItems({ leadId, limit: 100 }),
+      lifecycleReceipts: accountTasks.listOperatorBoardWorkItemReceipts({ leadId, limit: 100 }),
+      retentionFeedbackReceipts: accountTasks.listOperatorBoardRetentionFeedbackReceipts({ leadId, limit: 100 })
+    },
     summary: accountTaskSummary(leadId)
   };
 }
@@ -89,6 +98,10 @@ export async function collectAccountManagerContext(lead, { now = Date.now() } = 
   const buildRows = builds.listByLead(leadId);
   const paymentRows = payments.listByLead(leadId);
   const subscriptionRows = subscriptions.forLead(leadId);
+  const renewalCloseoutPackets = portalActions.listByLead?.(leadId, {
+    limit: 50,
+    type: RENEWAL_CLOSEOUT_PACKET_TYPE
+  }) || [];
   const revisionRows = buildRows.flatMap((build) => buildRevisions.listByBuild(build.id, { limit: 20 }));
   const growthRow = growthPlans.getLatest(leadId);
   const growthPlan = safeJson(growthRow?.plan_json) || null;
@@ -109,6 +122,7 @@ export async function collectAccountManagerContext(lead, { now = Date.now() } = 
     builds: buildRows,
     payments: paymentRows,
     subscriptions: subscriptionRows,
+    renewalCloseoutPackets,
     revisions: revisionRows,
     growthPlan,
     memoryKinds,
@@ -123,6 +137,7 @@ export async function collectAccountManagerContext(lead, { now = Date.now() } = 
     builds: buildRows,
     payments: paymentRows,
     subscriptions: subscriptionRows,
+    renewalCloseoutPackets,
     revisions: revisionRows,
     latestBuild,
     deliveredAt,
@@ -146,6 +161,13 @@ export async function collectAccountManagerContext(lead, { now = Date.now() } = 
       latestContact: contactRows[0] ? [contactRows[0].id, contactRows[0].created_at, contactRows[0].type] : null,
       latestPayment: paymentRows[0] ? [paymentRows[0].id, paymentRows[0].status, paymentRows[0].paid_at] : null,
       latestSubscription: subscriptionRows[0] ? [subscriptionRows[0].id, subscriptionRows[0].status, subscriptionRows[0].updated_at] : null,
+      latestRenewalCloseout: renewalCloseoutPackets[0] ? [
+        renewalCloseoutPackets[0].id,
+        renewalCloseoutPackets[0].status,
+        renewalCloseoutPackets[0].body?.nextReviewAt || null,
+        renewalCloseoutPackets[0].body?.subscriptionId || null,
+        renewalCloseoutPackets[0].created_at
+      ] : null,
       nowBucket: Math.floor(now / DAY_MS)
     }
   };
@@ -176,6 +198,9 @@ export function buildAccountManagerPlan({ lead, context, now = Date.now() } = {}
     add('google_business_profile_hygiene', gbpHygieneItem({ lead, context, now }));
     add('analytics_contact_flow_check', analyticsItem({ lead, context, now }));
     add('hosting_subscription_status', hostingItem({ lead, context, now }));
+  }
+  for (const renewalCloseout of renewalCloseoutHealthCheckItems({ lead, context, now })) {
+    add('renewal_closeout_health_check', renewalCloseout);
   }
   add('seasonal_hours', seasonalHoursItem({ lead, context, now }));
   add('service_menu_changes', serviceMenuItem({ lead, context, now }));
@@ -398,6 +423,39 @@ function hostingItem({ lead, context }) {
   };
 }
 
+function renewalCloseoutHealthCheckItems({ context, now }) {
+  return (context.renewalCloseoutPackets || [])
+    .filter((row) => row.status === 'visible_to_customer' && row.body?.closeoutPacketVisible !== false)
+    .slice(0, 5)
+    .map((packet) => {
+      const body = packet.body || {};
+      const nextReviewAt = Number.isFinite(Number(body.nextReviewAt))
+        ? Number(body.nextReviewAt)
+        : (packet.created_at || now) + 30 * DAY_MS;
+      const subscriptionText = body.subscriptionId ? ` for subscription ${body.subscriptionId}` : '';
+      const reviewDate = new Date(nextReviewAt).toISOString();
+      return {
+        id: `renewal-closeout-health-check-${safeCode(packet.id)}`,
+        title: 'Renewal closeout health check',
+        why: `Customer-visible renewal closeout packet ${packet.id}${subscriptionText} scheduled a next health review for ${reviewDate}.`,
+        action: 'Review the closeout evidence, subscription status, portal confirmation, and support notes before any future renewal billing or customer-message step.',
+        dueAtMs: nextReviewAt,
+        priority: nextReviewAt <= now + 2 * DAY_MS ? 'high' : 'medium',
+        channel: 'operator',
+        owner: 'account_manager',
+        evidenceIds: [`renewal-closeout-${safeCode(packet.id)}`],
+        messageIntent: 'renewal_closeout_health_check',
+        risk: {
+          customerVisibleCloseout: true,
+          noAutomaticCustomerContact: true,
+          closeoutPacketId: packet.id,
+          subscriptionId: body.subscriptionId || null,
+          nextReviewAt
+        }
+      };
+    });
+}
+
 function normalizePlanItem({ lead, kind, item, now, evidence }) {
   const dueAtMs = Number.isFinite(item.dueAtMs) ? Math.max(item.dueAtMs, now - 30 * DAY_MS) : now;
   const evidenceIds = unique((item.evidenceIds || []).filter(Boolean));
@@ -420,7 +478,7 @@ function normalizePlanItem({ lead, kind, item, now, evidence }) {
   };
 }
 
-function collectEvidence({ lead, profile, contacts, builds: buildRows, payments: paymentRows, subscriptions: subscriptionRows, revisions, growthPlan, memoryKinds, deliveredAt }) {
+function collectEvidence({ lead, profile, contacts, builds: buildRows, payments: paymentRows, subscriptions: subscriptionRows, renewalCloseoutPackets, revisions, growthPlan, memoryKinds, deliveredAt }) {
   const out = [];
   addEvidence(out, {
     id: 'lead-profile',
@@ -483,6 +541,20 @@ function collectEvidence({ lead, profile, contacts, builds: buildRows, payments:
     confidence: activeSub ? 0.86 : 0.7,
     createdAt: activeSub?.updated_at || null
   });
+  for (const packet of (renewalCloseoutPackets || []).slice(0, 5)) {
+    const body = packet.body || {};
+    const nextReviewAt = Number.isFinite(Number(body.nextReviewAt))
+      ? new Date(Number(body.nextReviewAt)).toISOString()
+      : 'not scheduled';
+    addEvidence(out, {
+      id: `renewal-closeout-${safeCode(packet.id)}`,
+      source: 'customer portal renewal closeout',
+      summary: `Renewal closeout packet ${packet.id} is ${packet.status}; next health review is ${nextReviewAt}. ${body.summary || ''}`,
+      url: null,
+      confidence: packet.status === 'visible_to_customer' ? 0.88 : 0.68,
+      createdAt: packet.created_at
+    });
+  }
   for (const event of contacts.slice(0, 8)) {
     const prefix = event.type === 'customer_edit_request' ? 'edit' : 'contact';
     addEvidence(out, {

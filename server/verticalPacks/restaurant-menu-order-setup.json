@@ -1,0 +1,27 @@
+{
+  "key": "restaurant_menu_order_setup",
+  "name": "Restaurant menu and order setup",
+  "matchNiches": ["restaurant menu", "online ordering", "restaurant website", "menu setup", "takeout ordering"],
+  "priceCents": 80000,
+  "pitchTone": "Practical and hospitality-aware. Keep menu accuracy, hours, allergens, and order handoff safer than flashy design.",
+  "valuePropHook": "A menu and order setup that makes hours, current items, takeout steps, and customer handoff clear without inventing prices or availability.",
+  "reviewValueProps": ["current menu clarity", "hours visibility", "takeout handoff"],
+  "marketSignals": ["outdated menu photos", "unclear ordering path", "hours mismatch complaints"],
+  "leadSources": ["restaurant listings", "review complaints about menu accuracy", "social pages with PDF menus"],
+  "compliance": { "restrictedClaims": ["unverified allergen claims", "guaranteed delivery times", "unverified pricing"], "requiredDisclosures": ["menu owner approval", "availability can change"] },
+  "serviceOffer": {
+    "headline": "Restaurant menu and order setup",
+    "customerOutcome": "Guests can see current menu information and take the correct ordering step without digging through old photos.",
+    "packages": [{ "key": "menu-order-setup", "name": "Menu/order setup", "description": "Menu page, hours, takeout CTA, order handoff copy, and QA.", "priceCents": 80000 }],
+    "proofAssets": ["owner-approved menu", "hours source", "ordering policy"]
+  },
+  "fulfillmentRequirements": ["menu approved", "hours verified", "order handoff confirmed"],
+  "vendorRequirements": ["POS or order provider verified before integration", "operator review for allergen copy"],
+  "qaRules": ["prices match source", "hours are visible", "no unverified allergen claims"],
+  "trustRequirements": ["menu approval receipt", "change-request path"],
+  "growthPaths": ["catering inquiry capture", "review capture after pickup"],
+  "retentionLoops": ["monthly menu refresh", "holiday hours check"],
+  "marginModel": { "basePriceCents": 80000, "estimatedFulfillmentCostCents": 26000, "targetGrossMarginPct": 45, "maxAcquisitionCostPct": 17 },
+  "launchChecklist": ["menu source captured", "hours verified", "order CTA drafted", "mobile menu QA", "owner approval recorded"],
+  "evals": ["menu accuracy", "order handoff clarity"]
+}

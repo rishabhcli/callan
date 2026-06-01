@@ -1,0 +1,27 @@
+{
+  "key": "med_spa_digital_operations",
+  "name": "Med-spa digital operations",
+  "matchNiches": ["med spa", "medical spa", "aesthetics clinic", "botox clinic", "laser clinic"],
+  "priceCents": 95000,
+  "pitchTone": "Polished, compliance-heavy, and strict about medical, results, credential, and consent boundaries.",
+  "valuePropHook": "A med-spa digital operations setup that clarifies service inquiry, consent, credential review, and booking boundaries without unsafe medical claims.",
+  "reviewValueProps": ["consultation boundary", "credential proof", "service inquiry clarity"],
+  "marketSignals": ["unsafe results claims", "unclear consultation booking", "credential proof gaps"],
+  "leadSources": ["med-spa listings", "review profiles", "aesthetic service search pages"],
+  "compliance": { "restrictedClaims": ["medical advice", "guaranteed results", "licensed provider unless verified"], "requiredDisclosures": ["consultation required", "credential verification", "privacy boundary"] },
+  "serviceOffer": {
+    "headline": "Med-spa inquiry and compliance setup",
+    "customerOutcome": "Prospects can request a consultation with clear service boundaries, privacy expectations, and verified proof.",
+    "packages": [{ "key": "med-spa-ops", "name": "Med-spa operations setup", "description": "Service inquiry, consultation CTA, credential-proof plan, privacy copy, and QA.", "priceCents": 95000 }],
+    "proofAssets": ["license evidence", "approved service menu", "privacy policy"]
+  },
+  "fulfillmentRequirements": ["service menu approved", "credential claims verified", "privacy copy reviewed"],
+  "vendorRequirements": ["licensed provider review", "secure intake provider before sensitive data"],
+  "qaRules": ["no guaranteed results", "consultation boundary visible", "license claims sourced"],
+  "trustRequirements": ["credential evidence", "privacy and consent policy"],
+  "growthPaths": ["consultation follow-up", "review request after completed visit"],
+  "retentionLoops": ["monthly compliance copy review", "service-menu update check"],
+  "marginModel": { "basePriceCents": 95000, "estimatedFulfillmentCostCents": 33000, "targetGrossMarginPct": 44, "maxAcquisitionCostPct": 14 },
+  "launchChecklist": ["service claims reviewed", "privacy copy approved", "consultation intake drafted", "QA complete", "operator approval recorded"],
+  "evals": ["medical-claim safety", "privacy-boundary clarity"]
+}

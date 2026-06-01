@@ -1,0 +1,27 @@
+{
+  "key": "booking_contact_automation",
+  "name": "Booking and contact automation",
+  "matchNiches": ["booking automation", "contact automation", "appointment automation", "lead intake", "contact form automation"],
+  "priceCents": 70000,
+  "pitchTone": "Operational and calm. Emphasize fewer missed requests, cleaner intake, and human approval where promises matter.",
+  "valuePropHook": "A booking and contact automation setup that captures requests, asks missing questions, and routes approved next steps without making unsafe promises.",
+  "reviewValueProps": ["fewer missed requests", "clear intake questions", "tracked callbacks"],
+  "marketSignals": ["missed calls", "slow callback reviews", "unclear contact forms"],
+  "leadSources": ["reviews mentioning no callback", "sites with weak contact forms", "service listings with phone-only intake"],
+  "compliance": { "restrictedClaims": ["guaranteed response time", "unverified emergency availability", "unsupported advice"], "requiredDisclosures": ["automation disclosure", "consent to contact"] },
+  "serviceOffer": {
+    "headline": "Booking and contact intake automation",
+    "customerOutcome": "Customer requests are captured with the right questions, routed for review, and followed up without losing context.",
+    "packages": [{ "key": "booking-contact-setup", "name": "Booking/contact setup", "description": "Intake form, callback routing, approval gates, and status copy.", "priceCents": 70000 }],
+    "proofAssets": ["intake fields", "callback policy", "operator approval path"]
+  },
+  "fulfillmentRequirements": ["intake questions approved", "consent copy ready", "handoff owner assigned"],
+  "vendorRequirements": ["calendar provider verified", "phone or inbox provider linked before live use"],
+  "qaRules": ["required fields save", "consent captured", "no unsupported ETA promise"],
+  "trustRequirements": ["automation disclosure", "customer data minimization"],
+  "growthPaths": ["missed-call rescue", "quote follow-up"],
+  "retentionLoops": ["monthly intake QA", "callback outcome review"],
+  "marginModel": { "basePriceCents": 70000, "estimatedFulfillmentCostCents": 21000, "targetGrossMarginPct": 47, "maxAcquisitionCostPct": 17 },
+  "launchChecklist": ["intake flow drafted", "consent copy reviewed", "provider smoke planned", "handoff tested", "operator approval recorded"],
+  "evals": ["intake completeness", "promise-boundary safety"]
+}

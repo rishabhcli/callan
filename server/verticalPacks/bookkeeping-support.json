@@ -1,0 +1,27 @@
+{
+  "key": "bookkeeping_support",
+  "name": "Bookkeeping support",
+  "matchNiches": ["bookkeeping", "bookkeeper", "accounting support", "small business books", "quickbooks help"],
+  "priceCents": 75000,
+  "pitchTone": "Precise, conservative, and clear that this is intake and operations support, not tax or legal advice.",
+  "valuePropHook": "A bookkeeping support intake setup that captures business needs, document readiness, and handoff boundaries without giving tax or legal advice.",
+  "reviewValueProps": ["document checklist", "handoff clarity", "monthly close cadence"],
+  "marketSignals": ["unclear intake", "tax advice risk", "missing document checklist"],
+  "leadSources": ["bookkeeper directories", "small business groups", "reviews mentioning slow bookkeeping handoff"],
+  "compliance": { "restrictedClaims": ["tax advice", "legal advice", "guaranteed deductions"], "requiredDisclosures": ["not tax advice", "credential boundary", "privacy handling"] },
+  "serviceOffer": {
+    "headline": "Bookkeeping intake and support setup",
+    "customerOutcome": "Business owners can submit the right bookkeeping support request and documents before a qualified review.",
+    "packages": [{ "key": "bookkeeping-intake", "name": "Bookkeeping intake setup", "description": "Need-type intake, document checklist, privacy copy, and qualified handoff.", "priceCents": 75000 }],
+    "proofAssets": ["service scope", "privacy policy", "credential boundary"]
+  },
+  "fulfillmentRequirements": ["document checklist approved", "privacy copy reviewed", "advice boundary explicit"],
+  "vendorRequirements": ["qualified bookkeeper review before advice", "secure storage proof before uploads"],
+  "qaRules": ["no tax advice", "privacy copy visible", "document checklist clear"],
+  "trustRequirements": ["credential boundary", "data minimization policy"],
+  "growthPaths": ["monthly close reminder", "invoice cleanup intake"],
+  "retentionLoops": ["monthly document reminder", "quarter-end readiness check"],
+  "marginModel": { "basePriceCents": 75000, "estimatedFulfillmentCostCents": 24000, "targetGrossMarginPct": 45, "maxAcquisitionCostPct": 15 },
+  "launchChecklist": ["scope approved", "privacy reviewed", "document checklist drafted", "QA complete", "owner approval recorded"],
+  "evals": ["advice-boundary safety", "privacy-intake completeness"]
+}

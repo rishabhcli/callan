@@ -1,0 +1,27 @@
+{
+  "key": "cleaning",
+  "name": "Cleaning",
+  "matchNiches": ["cleaning", "house cleaning", "maid service", "commercial cleaning", "move out cleaning"],
+  "priceCents": 65000,
+  "pitchTone": "Reliable, checklist-driven, and clear about scope, access, supplies, and quote boundaries.",
+  "valuePropHook": "A cleaning quote intake setup that clarifies property type, scope, access, supplies, and recurring options before a cleaner is scheduled.",
+  "reviewValueProps": ["scope clarity", "recurring schedule options", "arrival-window expectations"],
+  "marketSignals": ["scope confusion", "pricing complaints", "unclear recurring booking"],
+  "leadSources": ["cleaning directories", "reviews mentioning missed details", "weak quote-form sites"],
+  "compliance": { "restrictedClaims": ["bonded or insured unless verified", "guaranteed stain removal", "unverified background checks"], "requiredDisclosures": ["scope boundary", "access policy"] },
+  "serviceOffer": {
+    "headline": "Cleaning quote and recurring booking setup",
+    "customerOutcome": "Customers can request the right cleaning scope, property details, and recurring cadence without unclear promises.",
+    "packages": [{ "key": "cleaning-intake", "name": "Cleaning intake setup", "description": "Scope checklist, property intake, recurring option, quote boundary, and QA.", "priceCents": 65000 }],
+    "proofAssets": ["scope checklist", "service area", "insurance evidence if claimed"]
+  },
+  "fulfillmentRequirements": ["scope checklist approved", "access policy reviewed", "quote boundary ready"],
+  "vendorRequirements": ["insurance or bonding proof before claims", "backup cleaner route before dispatch"],
+  "qaRules": ["scope fields required", "no unverified insured claim", "recurring option clear"],
+  "trustRequirements": ["access policy", "insurance claim evidence"],
+  "growthPaths": ["recurring plan follow-up", "review request loop"],
+  "retentionLoops": ["monthly recurring check", "move-out season refresh"],
+  "marginModel": { "basePriceCents": 65000, "estimatedFulfillmentCostCents": 18000, "targetGrossMarginPct": 49, "maxAcquisitionCostPct": 17 },
+  "launchChecklist": ["scope captured", "access policy reviewed", "quote intake drafted", "QA complete", "owner approval recorded"],
+  "evals": ["scope-intake completeness", "insured-claim safety"]
+}

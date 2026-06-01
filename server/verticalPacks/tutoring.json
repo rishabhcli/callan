@@ -1,0 +1,27 @@
+{
+  "key": "tutoring",
+  "name": "Tutoring",
+  "matchNiches": ["tutoring", "math tutor", "reading tutor", "test prep", "private tutor"],
+  "priceCents": 60000,
+  "pitchTone": "Trustworthy, parent-friendly, and careful about academic guarantees or child privacy.",
+  "valuePropHook": "A tutoring inquiry setup that explains subjects, availability, parent intake, and proof without promising scores or outcomes.",
+  "reviewValueProps": ["subject clarity", "parent intake", "safe scheduling"],
+  "marketSignals": ["unclear subject coverage", "DM-only scheduling", "missing parent proof"],
+  "leadSources": ["tutoring directories", "school-area searches", "review profiles"],
+  "compliance": { "restrictedClaims": ["guaranteed grades", "guaranteed test scores", "unverified credentials"], "requiredDisclosures": ["parent/guardian contact", "privacy boundary"] },
+  "serviceOffer": {
+    "headline": "Tutoring inquiry and trust setup",
+    "customerOutcome": "Parents can understand subjects, availability, credentials, and next steps before sharing student details.",
+    "packages": [{ "key": "tutoring-intake", "name": "Tutoring intake page", "description": "Subject menu, parent intake, scheduling boundary, proof copy, and QA.", "priceCents": 60000 }],
+    "proofAssets": ["subject list", "credential evidence", "parent-approved intake"]
+  },
+  "fulfillmentRequirements": ["subjects approved", "parent intake reviewed", "privacy copy ready"],
+  "vendorRequirements": ["background/credential claims verified before publication", "operator review for minors data"],
+  "qaRules": ["no score guarantee", "parent contact required", "student details minimized"],
+  "trustRequirements": ["credential evidence or omission", "minor data policy"],
+  "growthPaths": ["trial session inquiry", "review request after completed sessions"],
+  "retentionLoops": ["semester check-in", "test-prep season refresh"],
+  "marginModel": { "basePriceCents": 60000, "estimatedFulfillmentCostCents": 17000, "targetGrossMarginPct": 48, "maxAcquisitionCostPct": 16 },
+  "launchChecklist": ["subject list captured", "privacy copy reviewed", "intake drafted", "QA complete", "owner approval recorded"],
+  "evals": ["minor-privacy safety", "academic-claim safety"]
+}

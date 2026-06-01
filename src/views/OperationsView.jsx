@@ -170,6 +170,34 @@ function ProductionCommandCenter() {
   const liveStage = promotionGates.productionLive || null;
   const decisionReceipt = safe?.decisionReceipt || null;
   const receiptHistory = data?.safeToSellReceipts || safe?.receiptHistory || data?.observability?.safeToSellReceiptHistory || null;
+  const renewal = safe?.renewal || data?.safeToRenewToday || decisionReceipt?.renewal || null;
+	  const renewalChangeQueue = data?.renewalChangeRequestQueue
+	    || data?.observability?.renewalChangeRequestQueue
+	    || null;
+	  const renewalMessagePreflightQueue = data?.renewalCustomerMessagePreflightQueue
+	    || data?.observability?.renewalCustomerMessagePreflightQueue
+	    || null;
+	  const renewalBillingExecutionQueue = data?.renewalBillingExecutionReceiptQueue
+	    || data?.observability?.renewalBillingExecutionReceiptQueue
+	    || null;
+	  const renewalMessageSendQueue = data?.renewalCustomerMessageSendReceiptQueue
+	    || data?.observability?.renewalCustomerMessageSendReceiptQueue
+	    || null;
+	  const renewalConfirmationQueue = data?.renewalCustomerConfirmationQueue
+	    || data?.observability?.renewalCustomerConfirmationQueue
+	    || null;
+	  const renewalConfirmationAcknowledgementQueue = data?.renewalCustomerConfirmationAcknowledgementQueue
+	    || data?.observability?.renewalCustomerConfirmationAcknowledgementQueue
+	    || null;
+	  const renewalConfirmationAcceptanceQueue = data?.renewalCustomerConfirmationAcceptanceQueue
+	    || data?.observability?.renewalCustomerConfirmationAcceptanceQueue
+	    || null;
+	  const renewalConfirmationFollowupQueue = data?.renewalCustomerConfirmationFollowupQueue
+	    || data?.observability?.renewalCustomerConfirmationFollowupQueue
+	    || null;
+	  const renewalConfirmationCloseoutPacketQueue = data?.renewalCustomerConfirmationCloseoutPacketQueue
+	    || data?.observability?.renewalCustomerConfirmationCloseoutPacketQueue
+	    || null;
 
   const runAction = async (label, fn) => {
     setAction(label);
@@ -219,7 +247,18 @@ function ProductionCommandCenter() {
         <Metric label="provider SLO" value={formatProviderSlo(providerHealthSlo)} tone={providerHealthSlo?.ok === false ? 'bad' : 'good'} />
         <Metric label="worker SLO" value={formatWorkerSlo(workerHealthSlo)} tone={workerHealthSlo?.ok === false ? 'bad' : 'good'} />
         <Metric label="receipt" value={formatSnapshotStatus(durableSnapshot)} tone={durableSnapshot?.ok ? 'good' : 'bad'} />
-      </div>
+	        <Metric label="renew" value={formatSafeToRenew(renewal)} tone={renewal?.safeToRenew === false ? 'bad' : 'good'} />
+	        <Metric label="save plans" value={formatRenewalSavePlans(renewal)} tone={(renewal?.atRiskSubscriptionCount || 0) ? 'warm' : 'good'} />
+	        <Metric label="change reqs" value={formatRenewalChangeQueue(renewalChangeQueue)} tone={formatRenewalChangeQueueTone(renewalChangeQueue)} />
+	        <Metric label="msg proof" value={formatRenewalPreflightQueue(renewalMessagePreflightQueue)} tone={formatRenewalPreflightQueueTone(renewalMessagePreflightQueue)} />
+	        <Metric label="bill gate" value={formatRenewalBillingExecutionQueue(renewalBillingExecutionQueue)} tone={formatRenewalBillingExecutionQueueTone(renewalBillingExecutionQueue)} />
+	        <Metric label="send gate" value={formatRenewalSendQueue(renewalMessageSendQueue)} tone={formatRenewalSendQueueTone(renewalMessageSendQueue)} />
+	        <Metric label="confirm" value={formatRenewalConfirmationQueue(renewalConfirmationQueue)} tone={formatRenewalConfirmationQueueTone(renewalConfirmationQueue)} />
+	        <Metric label="ack" value={formatRenewalConfirmationAcknowledgementQueue(renewalConfirmationAcknowledgementQueue)} tone={formatRenewalConfirmationAcknowledgementQueueTone(renewalConfirmationAcknowledgementQueue)} />
+	        <Metric label="accept" value={formatRenewalConfirmationAcceptanceQueue(renewalConfirmationAcceptanceQueue)} tone={formatRenewalConfirmationAcceptanceQueueTone(renewalConfirmationAcceptanceQueue)} />
+	        <Metric label="followup" value={formatRenewalConfirmationFollowupQueue(renewalConfirmationFollowupQueue)} tone={formatRenewalConfirmationFollowupQueueTone(renewalConfirmationFollowupQueue)} />
+	        <Metric label="closeout" value={formatRenewalConfirmationCloseoutPacketQueue(renewalConfirmationCloseoutPacketQueue)} tone={formatRenewalConfirmationCloseoutPacketQueueTone(renewalConfirmationCloseoutPacketQueue)} />
+	      </div>
 
       <div className={`prod-snapshot-strip ${durableSnapshot?.ok ? 'is-good' : 'is-blocked'}`}>
         <span>{safe?.source || 'inline'}</span>
@@ -264,6 +303,14 @@ function ProductionCommandCenter() {
         <div className="prod-command-mini">
           <span>ops jobs</span>
           <strong>{formatSchedulerHealth(schedulerHealth)}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>renewal</span>
+          <strong>{formatRenewalProof(renewal)}</strong>
+        </div>
+        <div className="prod-command-mini">
+          <span>save plans</span>
+          <strong>{formatRenewalSavePlans(renewal)}</strong>
         </div>
         <div className="prod-command-mini">
           <span>stuck</span>
@@ -346,8 +393,14 @@ function ProductionCommandCenter() {
         <button type="button" onClick={() => runAction('self-check', () => api.enqueueOpsSelfCheck({ reason: 'operator' }))} disabled={loading || !!action}>
           {action === 'self-check' ? 'checking' : 'self-check'}
         </button>
+        <button type="button" onClick={() => runAction('renew-check', () => api.enqueueOpsSelfCheck({ reason: 'operator', scope: 'renew' }))} disabled={loading || !!action}>
+          {action === 'renew-check' ? 'checking' : 'renew'}
+        </button>
         <button type="button" onClick={() => runAction('recover', () => api.recoverStuckOps({ dryRun: false }))} disabled={loading || !!action}>
           {action === 'recover' ? 'recovering' : 'recover'}
+        </button>
+        <button type="button" onClick={() => runAction('lease-maint', () => api.runRetentionCommandLeaseMaintenance({ reason: 'operator', actor: 'operations_ui' }))} disabled={loading || !!action}>
+          {action === 'lease-maint' ? 'queueing' : 'lease maint'}
         </button>
         <button type="button" onClick={() => runAction('export', async () => {
           const payload = await api.exportOps({ includePII: false, limit: 500 });
@@ -519,6 +572,122 @@ function formatReceiptProviders(receipt) {
   return `${proof.requiredLiveReady || 0}/${proof.requiredProviders || 0}`;
 }
 
+function formatSafeToRenew(renewal) {
+  if (!renewal) return 'n/a';
+  if (renewal.safeToRenew === false) return 'blocked';
+  return renewal.activeSubscriptionCount ? 'ready' : 'none';
+}
+
+function formatRenewalProof(renewal) {
+  if (!renewal) return 'n/a';
+  const active = renewal.activeSubscriptionCount || 0;
+  const proof = renewal.dryRunProofCount || 0;
+  return `${proof}/${active}`;
+}
+
+function formatRenewalSavePlans(renewal) {
+  if (!renewal) return 'n/a';
+  return `${renewal.renewalSavePlaybookCount || renewal.renewalSavePlaybooks?.length || 0}/${renewal.atRiskSubscriptionCount || 0}`;
+}
+
+function formatRenewalChangeQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.pendingCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalChangeQueueTone(queue) {
+  if (!queue) return 'good';
+  if (queue.pendingCount > 0) return 'warm';
+  return 'good';
+}
+
+function formatRenewalPreflightQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.blockedCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalPreflightQueueTone(queue) {
+  if (!queue) return 'good';
+  if (queue.blockedCount > 0) return 'warm';
+  return 'good';
+}
+
+function formatRenewalBillingExecutionQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.appliedCount || 0}/${queue.blockedCount || 0}`;
+}
+
+function formatRenewalBillingExecutionQueueTone(queue) {
+  if (!queue) return 'good';
+  if (queue.failedCount > 0) return 'bad';
+  if (queue.blockedCount > 0) return 'warm';
+  return 'good';
+}
+
+function formatRenewalSendQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.sentCount || 0}/${queue.blockedCount || 0}`;
+}
+
+function formatRenewalSendQueueTone(queue) {
+  if (!queue) return 'good';
+  if (queue.failedCount > 0) return 'bad';
+  if (queue.blockedCount > 0) return 'warm';
+  return 'good';
+}
+
+function formatRenewalConfirmationQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.visibleCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalConfirmationQueueTone(queue) {
+  if (!queue) return 'good';
+  return (queue.visibleCount || 0) > 0 ? 'good' : 'warm';
+}
+
+function formatRenewalConfirmationAcknowledgementQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.acknowledgedCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalConfirmationAcknowledgementQueueTone(queue) {
+  if (!queue) return 'good';
+  return (queue.acknowledgedCount || 0) > 0 ? 'good' : 'warm';
+}
+
+function formatRenewalConfirmationAcceptanceQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.acceptedCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalConfirmationAcceptanceQueueTone(queue) {
+  if (!queue) return 'good';
+  return (queue.acceptedCount || 0) > 0 ? 'good' : 'warm';
+}
+
+function formatRenewalConfirmationFollowupQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.pendingCount || 0}/${queue.completedCount || 0}`;
+}
+
+function formatRenewalConfirmationFollowupQueueTone(queue) {
+  if (!queue) return 'good';
+  if (queue.escalatedCount > 0) return 'bad';
+  if (queue.pendingCount > 0) return 'warm';
+  return 'good';
+}
+
+function formatRenewalConfirmationCloseoutPacketQueue(queue) {
+  if (!queue) return 'n/a';
+  return `${queue.visibleCount || 0}/${queue.total || 0}`;
+}
+
+function formatRenewalConfirmationCloseoutPacketQueueTone(queue) {
+  if (!queue) return 'good';
+  return (queue.visibleCount || 0) > 0 ? 'good' : 'warm';
+}
+
 function formatReceiptProof(row) {
   if (!row) return 'n/a';
   const required = row.requiredProviders || 0;
@@ -540,7 +709,9 @@ function formatAdminActionResult(label, result) {
   if (!result) return '';
   if (label === 'backup') return `backup ${result.ok ? 'ready' : 'blocked'} (${result.files?.length || 0} files)`;
   if (label === 'self-check') return result.report?.snapshot?.id || result.jobId || 'self-check queued';
+  if (label === 'renew-check') return result.report?.snapshot?.id || result.jobId || 'safe-to-renew queued';
   if (label === 'recover') return `recovered ${result.jobs?.recovered || 0} jobs, ${result.calls?.recovered || 0} calls`;
+  if (label === 'lease-maint') return result.report?.receiptCount !== undefined ? `recorded ${result.report.receiptCount} lease receipts` : result.jobId || 'lease maintenance queued';
   if (label === 'export') return `exported ${Object.keys(result.tables || {}).length} tables`;
   if (label === 'reset-scan') return `reset scan found ${result.totalMatched || 0} rows`;
   if (label === 'reset-apply') return `reset changed ${result.totalChanged || 0} rows after backup`;

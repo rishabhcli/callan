@@ -455,6 +455,7 @@ function subjectForTask(lead, task) {
   if (task.kind === 'seasonal_hours') return `Do your hours change soon?`;
   if (task.kind === 'stale_business_fact') return `Quick fact check for ${name}`;
   if (task.kind === 'hosting_subscription_status') return `Keeping ${name} online`;
+  if (task.kind === 'renewal_closeout_health_check') return `Renewal health check for ${name}`;
   return `Following up on ${name}`;
 }
 
@@ -526,6 +527,17 @@ function bodyForTask({ lead, task, citeLine }) {
       optOut,
       '',
       closing
+    ].join('\n');
+  }
+  if (task.kind === 'renewal_closeout_health_check') {
+    return [
+      `Internal account-manager note for ${lead.business_name || 'this account'}:`,
+      '',
+      citeLine,
+      '',
+      'Review the renewal closeout packet, subscription status, portal confirmation, and support history before any future billing or customer-message step.',
+      '',
+      'Keep this task operator-only unless a new explicit renewal message preflight is opened.'
     ].join('\n');
   }
   return [

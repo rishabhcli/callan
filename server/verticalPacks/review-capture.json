@@ -1,0 +1,27 @@
+{
+  "key": "review_capture",
+  "name": "Review capture",
+  "matchNiches": ["review capture", "review management", "reputation management", "google reviews", "review request"],
+  "priceCents": 55000,
+  "pitchTone": "Careful, trust-first, and strict about no incentives, no gating, and no fake review behavior.",
+  "valuePropHook": "A review capture loop that asks real completed customers for honest reviews while preserving consent, no-incentive rules, and proof.",
+  "reviewValueProps": ["honest completed-service reviews", "no gating", "clear opt-out"],
+  "marketSignals": ["few recent reviews", "review complaints unresolved", "missing post-service ask"],
+  "leadSources": ["review profiles", "customer completion logs", "service businesses with stale review dates"],
+  "compliance": { "restrictedClaims": ["fake reviews", "review gating", "incentivized reviews"], "requiredDisclosures": ["honest review request", "opt-out path"] },
+  "serviceOffer": {
+    "headline": "Compliant review capture loop",
+    "customerOutcome": "Completed customers receive a clear, honest review request without incentives or gating.",
+    "packages": [{ "key": "review-loop", "name": "Review loop setup", "description": "Review request copy, completion trigger, opt-out handling, and monitoring.", "priceCents": 55000 }],
+    "proofAssets": ["completed service proof", "review policy", "customer consent"]
+  },
+  "fulfillmentRequirements": ["completed-service trigger defined", "opt-out path ready", "no incentive copy"],
+  "vendorRequirements": ["review platform ownership verified", "operator review for response templates"],
+  "qaRules": ["no gating language", "opt-out works", "request only after completed service"],
+  "trustRequirements": ["review policy evidence", "customer consent ledger"],
+  "growthPaths": ["review response workflow", "sentiment trend reports"],
+  "retentionLoops": ["monthly stale-review check", "post-completion review cadence"],
+  "marginModel": { "basePriceCents": 55000, "estimatedFulfillmentCostCents": 15000, "targetGrossMarginPct": 50, "maxAcquisitionCostPct": 16 },
+  "launchChecklist": ["policy reviewed", "request copy drafted", "completion trigger tested", "opt-out QA complete", "owner approval recorded"],
+  "evals": ["review-policy compliance", "completion-trigger correctness"]
+}

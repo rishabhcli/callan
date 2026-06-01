@@ -1,0 +1,27 @@
+{
+  "key": "contractor_quote_intake",
+  "name": "Contractor quote intake",
+  "matchNiches": ["contractor quote", "general contractor", "remodeling quote", "construction estimate", "contractor intake"],
+  "priceCents": 80000,
+  "pitchTone": "Scope-driven and serious. Make budget, location, timeline, photos, and license boundaries clear before quote review.",
+  "valuePropHook": "A contractor quote intake setup that captures scope, photos, budget range, timeline, and service area before anyone promises an estimate.",
+  "reviewValueProps": ["scope clarity", "photo intake", "timeline and budget fit"],
+  "marketSignals": ["quote confusion", "unqualified leads", "license proof gaps"],
+  "leadSources": ["contractor directories", "review complaints about estimates", "thin remodeler sites"],
+  "compliance": { "restrictedClaims": ["licensed unless verified", "guaranteed estimate", "fixed timeline guarantee"], "requiredDisclosures": ["estimate boundary", "license verification"] },
+  "serviceOffer": {
+    "headline": "Contractor quote intake setup",
+    "customerOutcome": "Project leads arrive with scope, photos, budget, timeline, and location context before quote review.",
+    "packages": [{ "key": "contractor-quote-intake", "name": "Quote intake setup", "description": "Project intake, photo prompt, budget/timeline questions, service-area gate, and QA.", "priceCents": 80000 }],
+    "proofAssets": ["license evidence if claimed", "project categories", "estimate policy"]
+  },
+  "fulfillmentRequirements": ["project types approved", "photo prompt ready", "estimate boundary reviewed"],
+  "vendorRequirements": ["license proof before claims", "operator review before estimate promises"],
+  "qaRules": ["budget/timeline captured", "no guaranteed estimate", "license claim sourced"],
+  "trustRequirements": ["license claim evidence", "estimate disclaimer"],
+  "growthPaths": ["quote follow-up", "project status room"],
+  "retentionLoops": ["seasonal project refresh", "post-project review loop"],
+  "marginModel": { "basePriceCents": 80000, "estimatedFulfillmentCostCents": 25000, "targetGrossMarginPct": 46, "maxAcquisitionCostPct": 17 },
+  "launchChecklist": ["project types captured", "intake drafted", "license copy reviewed", "QA complete", "owner approval recorded"],
+  "evals": ["estimate-boundary safety", "project-intake completeness"]
+}

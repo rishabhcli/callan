@@ -7,7 +7,8 @@ export const ACCOUNT_MANAGER_SECTION_KEYS = Object.freeze([
   'seasonalHours',
   'serviceMenuChanges',
   'analyticsContactFlowCheck',
-  'hostingSubscriptionStatus'
+  'hostingSubscriptionStatus',
+  'renewalCloseoutHealthChecks'
 ]);
 
 export const ACCOUNT_TASK_KINDS = Object.freeze([
@@ -19,7 +20,8 @@ export const ACCOUNT_TASK_KINDS = Object.freeze([
   'seasonal_hours',
   'service_menu_changes',
   'analytics_contact_flow_check',
-  'hosting_subscription_status'
+  'hosting_subscription_status',
+  'renewal_closeout_health_check'
 ]);
 
 const planItemSchema = {
@@ -57,6 +59,7 @@ export const AccountManagerPlanJsonSchema = {
     serviceMenuChanges: { type: 'array', items: planItemSchema },
     analyticsContactFlowCheck: { type: 'array', items: planItemSchema },
     hostingSubscriptionStatus: { type: 'array', items: planItemSchema },
+    renewalCloseoutHealthChecks: { type: 'array', items: planItemSchema },
     tasks: { type: 'array', items: planItemSchema },
     evidence: {
       type: 'array',

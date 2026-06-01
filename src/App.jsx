@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import RightRail from './components/RightRail.jsx';
 import LiveInboundPanel from './components/LiveInboundPanel.jsx';
 import OperationsView from './views/OperationsView.jsx';
+import PortfolioView from './views/PortfolioView.jsx';
 import ScraperView from './views/ScraperView.jsx';
 import MemoryView from './views/MemoryView.jsx';
 import AgentsView from './views/AgentsView.jsx';
@@ -165,6 +166,7 @@ function appendInboundPreview(transcript = [], evt = {}) {
 
 const TABS = [
   { id: 'operations', label: 'Operations', sub: 'agent floor' },
+  { id: 'portfolio',  label: 'Portfolio',  sub: 'holding co' },
   { id: 'agents',     label: 'Agents',     sub: 'workers' },
   { id: 'scraper',    label: 'Scraper',    sub: 'browser fleet' },
   { id: 'memory',     label: 'Memory',     sub: 'supermemory' },
@@ -694,6 +696,8 @@ function Console() {
               inbound={inbound}
               onDismissInbound={() => setInbound(EMPTY_INBOUND)}
             />
+          ) : activeTab === 'portfolio' ? (
+            <PortfolioView />
           ) : activeTab === 'agents' ? (
             <AgentsView
               nodeStates={nodeStates}
@@ -868,6 +872,14 @@ function sectionItemsForTab(tab, counters = {}, queue = {}) {
       { label: 'fleet rollup',  active: true },
       { label: 'live workloads' },
       { label: 'instances' }
+    ];
+  }
+  if (tab === 'portfolio') {
+    return [
+      { label: 'market map', active: true },
+      { label: 'launch queue' },
+      { label: 'capabilities' },
+      { label: 'ledger' }
     ];
   }
   if (tab === 'scraper') {

@@ -57,5 +57,95 @@
     "Reflect repeated review mentions of same-day service, seasonal maintenance, and no-heat/no-AC emergencies."
   ],
   "siteTemplateHint": "Use the dependable HVAC/contractor template: white background with deep navy and a safety yellow accent, hero with service area and a huge tap-to-call CTA, short repair vs install service grid, license note if confirmed, and trust proof from existing reviews.",
-  "customerPersonaHint": "Homeowners in an urgent moment (no AC, no heat, leak) Googling on a phone, looking for a real local number to call and confirmation that the company covers their town."
+  "customerPersonaHint": "Homeowners in an urgent moment (no AC, no heat, leak) Googling on a phone, looking for a real local number to call and confirmation that the company covers their town.",
+  "marketSignals": [
+    { "key": "emergency_search", "label": "Urgent no-AC or no-heat search intent is visible in season.", "evidenceHint": "Reviews, category terms, or listing copy mention emergency repair, same-day repair, AC not cooling, or no heat." },
+    { "key": "thin_service_area", "label": "Service area is hard to confirm from public web presence.", "evidenceHint": "Listing names towns but owned site is absent, generic, or buried." },
+    { "key": "seasonal_capacity_gap", "label": "Seasonal demand can overwhelm weak callback and booking paths.", "evidenceHint": "Review complaints mention missed calls, slow response, or long waits during hot/cold months." }
+  ],
+  "leadSources": [
+    "Google Maps HVAC contractor category",
+    "AC repair directory pages",
+    "seasonal review clusters",
+    "manufacturer dealer locators"
+  ],
+  "compliance": {
+    "restrictedClaims": ["licensed unless verified", "24/7 emergency unless confirmed", "rebates or financing unless confirmed"],
+    "requiredDisclosures": ["automated call disclosure", "public-source phone explanation", "recording disclosure"],
+    "licenseVerification": "Verify state contractor license before publishing license copy."
+  },
+  "serviceOffer": {
+    "headline": "Emergency-ready HVAC service-area page",
+    "customerOutcome": "Homeowners can see the towns covered, repair/install categories, and a tap-to-call path in one screen.",
+    "packages": [
+      { "key": "hvac-page", "name": "HVAC service page", "description": "Service area, urgent repair CTA, repair/install grid, review proof, and hosting.", "priceCents": 60000 },
+      { "key": "seasonal-refresh", "name": "Seasonal refresh", "description": "Summer or winter offer copy and review update.", "priceCents": 18000 }
+    ],
+    "refundPolicy": "Refund before build work starts if verified service coverage cannot be confirmed.",
+    "proofAssets": ["service-area listing", "review themes", "license lookup if available"]
+  },
+  "fulfillmentRequirements": [
+    "service area confirmed",
+    "repair versus install services separated",
+    "license and insurance claims verified or omitted",
+    "tap-to-call CTA visible on mobile",
+    "seasonal emergency copy reviewed"
+  ],
+  "vendorRequirements": [
+    "licensed HVAC contractor if fulfillment expands beyond digital work",
+    "after-hours coverage confirmed before emergency claims"
+  ],
+  "qaRules": [
+    "no unverified license, rebate, financing, or 24/7 claims",
+    "phone CTA works on mobile",
+    "service area is above the fold",
+    "review proof uses real wording only"
+  ],
+  "portalCopy": {
+    "intakePrompt": "Confirm the towns covered, emergency availability, repair/install services, and license text.",
+    "approvalLabel": "Approve HVAC page",
+    "revisionLabel": "Update service area or emergency copy"
+  },
+  "trustRequirements": [
+    "license claim evidence or omission",
+    "emergency availability evidence",
+    "source-linked review proof"
+  ],
+  "reviewStrategy": [
+    "request reviews mentioning response speed and diagnosis clarity",
+    "summarize seasonal repair themes after launch"
+  ],
+  "growthPaths": [
+    "seasonal AC/no-heat landing pages",
+    "maintenance plan lead capture",
+    "review capture automation",
+    "missed-call rescue"
+  ],
+  "retentionLoops": [
+    "pre-summer copy refresh",
+    "pre-winter copy refresh",
+    "monthly review proof update"
+  ],
+  "marginModel": {
+    "basePriceCents": 60000,
+    "estimatedFulfillmentCostCents": 17000,
+    "targetGrossMarginPct": 48,
+    "maxAcquisitionCostPct": 18,
+    "notes": "Higher ticket supports seasonal add-ons, but emergency claims require review."
+  },
+  "launchChecklist": [
+    "season and service area evidence captured",
+    "license-sensitive copy reviewed",
+    "offer price confirmed",
+    "mobile tap-to-call QA",
+    "review proof QA",
+    "owner approval recorded",
+    "seasonal aftercare scheduled"
+  ],
+  "evals": [
+    "service-area clarity",
+    "emergency-claim safety",
+    "mobile CTA prominence",
+    "seasonal offer relevance"
+  ]
 }

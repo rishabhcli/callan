@@ -1,0 +1,27 @@
+{
+  "key": "website_agency",
+  "name": "Website agency",
+  "matchNiches": ["website agency", "web design", "website design", "small business website", "landing page"],
+  "priceCents": 75000,
+  "pitchTone": "Clear, outcome-focused, and scoped around getting a credible owned web presence live without a long agency process.",
+  "valuePropHook": "A fixed-scope website launch package that turns public business facts, offers, and proof into a fast owned site with one clear customer action.",
+  "reviewValueProps": ["owned site clarity", "mobile CTA visibility", "trust proof above the fold"],
+  "marketSignals": ["no owned website", "outdated site copy", "unclear customer action"],
+  "leadSources": ["Google Maps weak-site listings", "local chamber directories", "review profiles without owned links"],
+  "compliance": { "restrictedClaims": ["guaranteed revenue", "fake reviews", "unverified credentials"], "requiredDisclosures": ["public-source evidence", "owner approval before launch"] },
+  "serviceOffer": {
+    "headline": "Fast owned website launch",
+    "customerOutcome": "Prospects can understand the business, trust it, and take one clear next step from an owned site.",
+    "packages": [{ "key": "website-launch", "name": "Website launch", "description": "Owned site copy, proof, contact CTA, QA, and launch handoff.", "priceCents": 75000 }],
+    "proofAssets": ["public listing facts", "owner-approved services", "review themes"]
+  },
+  "fulfillmentRequirements": ["business facts verified", "offer and CTA approved", "mobile QA completed"],
+  "vendorRequirements": ["designer review for custom brands", "operator approval for regulated claims"],
+  "qaRules": ["CTA works", "claims are sourced", "mobile first viewport is readable"],
+  "trustRequirements": ["claim source links", "privacy and correction path"],
+  "growthPaths": ["local SEO expansion", "review capture loop"],
+  "retentionLoops": ["quarterly content refresh", "offer update review"],
+  "marginModel": { "basePriceCents": 75000, "estimatedFulfillmentCostCents": 22000, "targetGrossMarginPct": 50, "maxAcquisitionCostPct": 18 },
+  "launchChecklist": ["evidence captured", "offer approved", "copy drafted", "QA complete", "launch approval recorded"],
+  "evals": ["owned-site clarity", "CTA path integrity"]
+}
