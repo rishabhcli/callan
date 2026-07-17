@@ -1,0 +1,14 @@
+.git
+.data
+dist
+node_modules
+triple-t-v2-run
+output
+playwright-report
+test-results
+coverage
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example

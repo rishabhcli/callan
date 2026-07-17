@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  evals:
+  deploy-readiness:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       NODE_ENV: test
       RUN_MODE: mock
@@ -33,17 +33,16 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Syntax check
-        run: npm run check
+      - name: Install browser runtime
+        run: npx playwright install --with-deps chromium
 
-      - name: Production eval suite
-        run: npm run check:evals
+      - name: Deployment readiness
+        run: npm run check:deploy
 
-      - name: Handoff suite
-        run: npm run check:handoff
-
-      - name: Operator handoff live-adapter contract
-        run: npm run check:eval-adapter-contract
-
-      - name: May goals acceptance ledger
-        run: npm run check:maygoals
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: callan-browser-readiness
+          path: output/playwright
+          if-no-files-found: ignore

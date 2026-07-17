@@ -5,7 +5,6 @@ export const ADMIN_TOKEN_MIN_LENGTH = 24;
 const PROTECTED_MODES = new Set(['production_review', 'production_live']);
 const OPERATOR_MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const OPERATOR_READ_METHODS = new Set(['GET', 'HEAD']);
-const ADMIN_COOKIE_NAME = 'callan_admin_token';
 const PUBLIC_API_PREFIXES = [
   '/api/webhooks/',
   '/api/share/build/',
@@ -14,6 +13,7 @@ const PUBLIC_API_PREFIXES = [
 ];
 const PUBLIC_API_EXACT_PATHS = new Set([
   '/api/ping',
+  '/api/referrals/leads',
   '/api/referrals/landing-html'
 ]);
 
@@ -90,8 +90,7 @@ export function extractAdminToken(req) {
   const bearer = auth.match(/^Bearer\s+(.+)$/i);
   if (bearer?.[1]) return bearer[1].trim();
   const header = String(req.get?.('x-admin-token') || '').trim();
-  if (header) return header;
-  return cookieValue(req, ADMIN_COOKIE_NAME);
+  return header;
 }
 
 export function requireAdmin(req, res, next) {
@@ -145,19 +144,4 @@ function apiPath(req = {}) {
 function isPublicApiPath(path) {
   if (PUBLIC_API_EXACT_PATHS.has(path)) return true;
   return PUBLIC_API_PREFIXES.some((prefix) => path.startsWith(prefix));
-}
-
-function cookieValue(req, name) {
-  const header = String(req.get?.('cookie') || req.headers?.cookie || '');
-  if (!header || !name) return '';
-  for (const part of header.split(';')) {
-    const [rawKey, ...rawValue] = part.trim().split('=');
-    if (rawKey !== name) continue;
-    try {
-      return decodeURIComponent(rawValue.join('=') || '').trim();
-    } catch {
-      return (rawValue.join('=') || '').trim();
-    }
-  }
-  return '';
 }

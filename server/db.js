@@ -41048,23 +41048,23 @@ function buildServiceDecisionReadinessCommandCenter({
           retryablePlanCount: retryablePlans.length,
           externalSideEffects: false
         },
-	        ...(blockers.includes('provider_live_smoke') ? [{
-	          action: 'record_provider_smoke_receipt',
+		        ...(blockers.includes('provider_live_smoke') ? [{
+		          action: 'record_provider_smoke_receipt',
 	          label: 'Record smoke receipt',
 	          method: 'POST',
 	          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/provider-smoke-receipt`,
-	          enabled: !!executionId,
+		          enabled: !!executionId,
 	          proofKey: 'provider_live_smoke',
 	          provider: latestProviderSmokeReceipt?.provider || 'agentmail',
 	          runMode: 'production_live',
 	          requiredLiveFlags: normalizeLiveFlagList(latestProviderSmokeDetail.requiredLiveFlags || latestProviderSmokeDetail.required_live_flags || ['LIVE_EMAILS']),
 	          externalSideEffects: false
 	        }, {
-	          action: 'attach_provider_smoke_evidence',
+		          action: 'attach_provider_smoke_evidence',
 	          label: 'Attach smoke packet',
 	          method: 'POST',
 	          endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/evidence`,
-	          enabled: !!executionId,
+		          enabled: !!executionId && !!latestProviderSmokeReceipt,
 	          proofKey: 'provider_live_smoke',
 	          provider: latestProviderSmokeReceipt?.provider || null,
 	          providerReceiptId: latestProviderSmokeReceipt?.id || null,
@@ -41109,11 +41109,11 @@ function buildServiceDecisionReadinessCommandCenter({
           mode: 'live_preflight',
           externalSideEffects: false
         }, {
-          action: 'attach_adapter_evidence',
+	          action: 'attach_adapter_evidence',
           label: 'Attach adapter packet',
           method: 'POST',
           endpoint: `/api/portfolio/readiness-command-center/${reconciliation.id}/evidence`,
-          enabled: !!executionId,
+	          enabled: !!executionId && !!latestImplementationReceipt,
           proofKey: 'live_adapter_implemented',
           adapterReceiptId: latestImplementationReceipt?.id || null,
           verifiedImplementationReady: !!latestImplementationReceipt,
@@ -48983,11 +48983,8 @@ function normalizeEvalCiWorkflowPublicationReceipt({
     'pull_request:',
     'workflow_dispatch:',
     'npm ci',
-    'npm run check',
-    'npm run check:evals',
-    'npm run check:handoff',
-    'npm run check:eval-adapter-contract',
-    'npm run check:maygoals',
+    'npx playwright install --with-deps chromium',
+    'npm run check:deploy',
     'LIVE_CALLS: "false"',
     'LIVE_EMAILS: "false"',
     'LIVE_PAYMENTS: "false"',
@@ -49002,7 +48999,12 @@ function normalizeEvalCiWorkflowPublicationReceipt({
     generatedEvalSource.includes('databaseWritesRequired') &&
     generatedEvalSource.includes('liveSideEffects');
   const packageScriptPresent = packageScripts['check:eval-adapter-contract'] === 'node scripts/generated-evals/operator_handoff_customer_success.check.js';
-  const localCiMirrorPresent = packageScripts['check:ci'] === 'npm run check && npm run check:evals && npm run check:handoff && npm run check:eval-adapter-contract && npm run check:maygoals';
+  const localCiMirrorPresent = packageScripts['check:ci'] === 'npm run check:core' &&
+    typeof packageScripts['check:core'] === 'string' &&
+    packageScripts['check:core'].includes('npm run check:evals') &&
+    packageScripts['check:core'].includes('npm run check:handoff') &&
+    packageScripts['check:core'].includes('npm run check:eval-adapter-contract') &&
+    packageScripts['check:core'].includes('npm run check:maygoals');
   const ciWorkflowPublishedLocal = workflowFilePresent && evalArtifactPresent && packageScriptPresent && localCiMirrorPresent;
   const remainingBlockers = ciWorkflowPublishedLocal ? ['external_ci_run'] : [
     ...(workflowFilePresent ? [] : ['ci_workflow_file']),
@@ -49202,7 +49204,12 @@ function normalizeEvalGeneratedArtifactPromotionReceipt({
   const generatedEvalHashMatches = Boolean(workflowResponse.generatedEvalSha256) && generatedEvalSha256 === workflowResponse.generatedEvalSha256;
   const packageHashMatches = Boolean(workflowResponse.packageSha256) && packageSha256 === workflowResponse.packageSha256;
   const packageScriptPresent = packageScripts['check:eval-adapter-contract'] === 'node scripts/generated-evals/operator_handoff_customer_success.check.js';
-  const localCiMirrorPresent = packageScripts['check:ci'] === 'npm run check && npm run check:evals && npm run check:handoff && npm run check:eval-adapter-contract && npm run check:maygoals';
+  const localCiMirrorPresent = packageScripts['check:ci'] === 'npm run check:core' &&
+    typeof packageScripts['check:core'] === 'string' &&
+    packageScripts['check:core'].includes('npm run check:evals') &&
+    packageScripts['check:core'].includes('npm run check:handoff') &&
+    packageScripts['check:core'].includes('npm run check:eval-adapter-contract') &&
+    packageScripts['check:core'].includes('npm run check:maygoals');
   const generatedEvalPromotionReady = workflowResponse.ciWorkflowPublishedLocal === true &&
     workflowResponse.externalCiRunObserved === false &&
     workflowHashMatches &&

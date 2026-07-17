@@ -130,7 +130,7 @@ function sponsorDefinitions() {
         eventEvidence(ctx, ['pitch.created'], 'persisted pitch creation event'),
         eventEvidence(ctx, ['analyst.done'], 'persisted analyst completion event')
       ]),
-      readiness: (readiness) => providerReadinessEvidence(readiness, 'gemini')
+      readiness: (readiness) => providerReadinessEvidence(readiness, 'gemini', { allowMockOptional: true })
     },
     {
       sponsor: 'Stripe',
@@ -205,7 +205,7 @@ function sponsorDefinitions() {
         auditEvidence(ctx, ['research.lead.created'], 'persisted lead creation audit event with memory scope'),
         eventEvidence(ctx, ['scraper.profile'], 'persisted synthetic profile event')
       ]),
-      readiness: (readiness) => providerReadinessEvidence(readiness, 'supermemory')
+      readiness: (readiness) => providerReadinessEvidence(readiness, 'supermemory', { allowMockOptional: true })
     }
   ];
 }

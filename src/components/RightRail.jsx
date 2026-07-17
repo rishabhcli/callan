@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 
 function statusLabel(lead) {
   const status = lead.status || lead.outreach_status || 'discovered';
@@ -8,9 +8,9 @@ function statusLabel(lead) {
 function statusTone(lead) {
   const status = lead.status || lead.outreach_status || 'discovered';
   if (status === 'calling' || status === 'building') return 'calling';
-  if (status === 'paid' || status === 'shipped' || status === 'closing') return 'paid';
-  if (status === 'blocked' || status === 'rejected' || status === 'blocked_auth') return 'blocked';
   if (status === 'shipped') return 'built';
+  if (status === 'paid' || status === 'closing') return 'paid';
+  if (status === 'blocked' || status === 'rejected' || status === 'blocked_auth') return 'blocked';
   return '';
 }
 
@@ -70,6 +70,8 @@ export default function RightRail({
   onCancelScheduled,
   onFireScheduled
 }) {
+  const [query, setQuery] = useState('');
+  const [showAll, setShowAll] = useState(false);
   const activeLeads = useMemo(() => {
     const sorted = [...leads].sort((a, b) => {
       const aRank = rankFor(a);
@@ -77,13 +79,27 @@ export default function RightRail({
       if (aRank !== bRank) return aRank - bRank;
       return new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0);
     });
-    return sorted.slice(0, 24);
+    return sorted;
   }, [leads]);
 
   const liveCount = useMemo(
     () => activeLeads.filter((lead) => ['calling', 'building', 'closing'].includes(lead.status)).length,
     [activeLeads]
   );
+  const filteredLeads = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return activeLeads;
+    return activeLeads.filter((lead) => [
+      lead.business_name,
+      lead.businessName,
+      lead.city,
+      lead.region,
+      lead.niche,
+      lead.status,
+      lead.outreach_status
+    ].some((value) => String(value || '').toLowerCase().includes(needle)));
+  }, [activeLeads, query]);
+  const visibleLeads = showAll ? filteredLeads.slice(0, 24) : filteredLeads.slice(0, 8);
 
   return (
     <aside className="nyna-rail">
@@ -135,7 +151,20 @@ export default function RightRail({
         ) : null}
 
         <div className="nyna-rail-section-title">leads in motion</div>
-        {activeLeads.length ? activeLeads.map((lead) => (
+        <label className="nyna-rail-search">
+          <span className="sr-only">Search leads</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setShowAll(false);
+            }}
+            placeholder="Search business, city, status"
+          />
+          <span>{filteredLeads.length}</span>
+        </label>
+        {visibleLeads.length ? visibleLeads.map((lead) => (
           <RailCard
             key={lead.id}
             lead={lead}
@@ -143,8 +172,15 @@ export default function RightRail({
             onClick={() => onFocus?.(lead.id)}
           />
         )) : (
-          <div className="nyna-rail-empty">// no leads yet — start research from the discover panel</div>
+          <div className="nyna-rail-empty">
+            {leads.length ? 'No leads match this search.' : 'No leads yet — start research from the Scraper tab.'}
+          </div>
         )}
+        {filteredLeads.length > 8 ? (
+          <button type="button" className="nyna-rail-more" onClick={() => setShowAll((value) => !value)}>
+            {showAll ? 'Show priority leads' : `Show ${Math.min(filteredLeads.length, 24) - 8} more`}
+          </button>
+        ) : null}
       </div>
     </aside>
   );
@@ -158,7 +194,7 @@ function HandoffRailCard({ item, onFocus }) {
       onClick={onFocus}
     >
       <div className="nyna-rail-card-top">
-        <div style={{ minWidth: 0 }}>
+        <div className="nyna-rail-card-copy">
           <div className="nyna-rail-card-name">{item.businessName || item.business_name || item.lead_id || 'unassigned case'}</div>
           <div className="nyna-rail-card-loc">{labelize(item.category)}</div>
         </div>
@@ -193,7 +229,7 @@ function ScheduledCard({ sc, warming = false, onCancel, onFire, onFocus }) {
         <button
           type="button"
           onClick={onFocus}
-          style={{ background: 'none', border: 0, padding: 0, color: 'inherit', textAlign: 'left', minWidth: 0, cursor: 'pointer' }}
+          className="nyna-rail-card-focus-button"
         >
           <div className="nyna-rail-card-name">{business}</div>
           <div className="nyna-rail-card-loc">{sc.ask || sc.brief?.ask || 'scheduled callback'}</div>
@@ -204,12 +240,12 @@ function ScheduledCard({ sc, warming = false, onCancel, onFire, onFocus }) {
       </div>
       <div className="nyna-rail-card-meta">
         <span>{localTime}</span>
-        <div style={{ display: 'inline-flex', gap: 10 }}>
+        <div className="nyna-rail-card-actions">
           {onFire ? (
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onFire(); }}
-              style={{ background: 'transparent', border: 0, color: 'var(--apricot)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase' }}
+              className="nyna-rail-inline-action is-warm"
             >
               fire now
             </button>
@@ -218,7 +254,7 @@ function ScheduledCard({ sc, warming = false, onCancel, onFire, onFocus }) {
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onCancel(); }}
-              style={{ background: 'transparent', border: 0, color: 'var(--rose)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase' }}
+              className="nyna-rail-inline-action is-danger"
             >
               cancel
             </button>
@@ -289,7 +325,7 @@ function RailCard({ lead, focused, onClick }) {
       onClick={onClick}
     >
       <div className="nyna-rail-card-top">
-        <div style={{ minWidth: 0 }}>
+        <div className="nyna-rail-card-copy">
           <div className="nyna-rail-card-name">{lead.business_name || lead.businessName || lead.id}</div>
           <div className="nyna-rail-card-loc">{leadCity(lead)}</div>
         </div>
