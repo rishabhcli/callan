@@ -35,6 +35,8 @@ TRUST_PROXY_HOPS=1
 DATA_RETENTION_ENABLED=true
 DATA_AT_REST_ENCRYPTED=true
 BACKUPS_ENCRYPTED=true
+MEMORY_RETRY_ENABLED=true
+MEMORY_RETRY_INTERVAL_MS=60000
 APP_REPLICA_COUNT=1
 SINGLE_NODE_PILOT_ACK=I_ACCEPT_SINGLE_NODE_PILOT_LIMITS
 PROVIDER_CERTIFICATION_FILE=/app/config/provider-certification.json
@@ -90,15 +92,16 @@ Use the matching webhook secrets in the runtime environment. Callan verifies pro
 
 4. Run one intentionally scoped live smoke at a time against owned test targets. The exact commands are in `README.md`.
 5. Confirm webhook delivery, fresh smoke receipts, the signed safe-to-sell snapshot, and a completed provider/capacity certification manifest.
-6. Run `npm run check:production -- --strict` and `npm run safe-to-sell`; both must pass without report-only overrides.
-7. Only then set:
+6. Confirm `/api/health` reports `memory.ok=true` with zero pending/dead writes and zero unresolved memory failures.
+7. Run `npm run check:production -- --strict` and `npm run safe-to-sell`; both must pass without report-only overrides.
+8. Only then set:
 
    ```sh
    RUN_MODE=production_live
    PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH
    ```
 
-8. Enable only the `LIVE_*` capabilities you are ready to operate. Every provider call rechecks the pause, live flag, lead budget, job lease, production acknowledgement, and signed readiness snapshot immediately before the side effect.
+9. Enable only the `LIVE_*` capabilities you are ready to operate. Every provider call rechecks the pause, live flag, lead budget, job lease, production acknowledgement, and signed readiness snapshot immediately before the side effect.
 
 ## Operational constraints
 

@@ -6,7 +6,7 @@ import {
   RUN_MODES,
   sideEffectMatrix
 } from './env.js';
-import { callAttempts, contactEvents, doNotCall, leads, providerSmoke, durableJobs, webhookEvents } from './db.js';
+import { callAttempts, contactEvents, doNotCall, leads, providerSmoke, durableJobs, webhookEvents, memoryFailures, memoryWriteQueue } from './db.js';
 import { complianceGateReport } from './compliance.js';
 import { fulfillmentReadiness } from './fulfillment/targets.js';
 import { v0ReadinessDetails } from './providers/v0.js';
@@ -51,11 +51,12 @@ export function liveReadiness() {
   const compliance = complianceGateReport({ mode });
   const reputation = reputationReadinessReport();
   const jobs = durableJobs.summary();
+  const memory = memoryDurabilityReadiness();
   const admin = adminAuthPosture({ mode });
   const providerCertification = providerCertificationStatus();
-  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin, providerCertification });
-  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification });
-  const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs });
+  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, memory, admin, providerCertification });
+  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification });
+  const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs, memory });
   const nextActions = nextActionsFor([...blockers, ...productionBlockers]);
 
   return {
@@ -78,6 +79,7 @@ export function liveReadiness() {
     reputation,
     admin,
     jobs,
+    memory,
     smoke,
     smokeToggles: {
       gemini: env.smoke.gemini,
@@ -401,7 +403,33 @@ function quotaCostStatus(name, smokeRow) {
   return detail.quota || detail.usage || 'not reported';
 }
 
-function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin, providerCertification }) {
+export function memoryDurabilityReadiness() {
+  const queue = Object.fromEntries(memoryWriteQueue.counts().map((row) => [row.status, Number(row.n) || 0]));
+  const failures = memoryFailures.counts();
+  const unresolvedFailures = Number(failures.unresolved) || 0;
+  const pendingWrites = (queue.queued || 0) + (queue.retrying || 0) + (queue.failed || 0);
+  const deadWrites = queue.dead || 0;
+  const blockers = [
+    !env.memory?.retryEnabled ? 'MEMORY_RETRY_ENABLED must be true for production memory durability' : null,
+    pendingWrites ? `${pendingWrites} Supermemory write(s) are pending or failed` : null,
+    deadWrites ? `${deadWrites} Supermemory write(s) are dead and require operator repair` : null,
+    unresolvedFailures ? `${unresolvedFailures} unresolved memory failure(s) remain` : null
+  ].filter(Boolean);
+  return {
+    ok: blockers.length === 0,
+    retryEnabled: env.memory?.retryEnabled === true,
+    retryIntervalMs: env.memory?.retryIntervalMs || null,
+    retryBatchSize: env.memory?.retryBatchSize || null,
+    pendingWrites,
+    deadWrites,
+    unresolvedFailures,
+    retryableFailures: Number(failures.retryable) || 0,
+    queue,
+    blockers
+  };
+}
+
+function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, memory, admin, providerCertification }) {
   const blockers = [];
   if (!isValidRunMode(mode)) blockers.push(`invalid RUN_MODE: ${mode}; expected one of ${RUN_MODES.join(', ')}`);
 
@@ -416,7 +444,7 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (mode === 'production_live') {
-    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification }));
+    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification }));
   }
   if (admin?.required && !admin.ok) blockers.push(...admin.blockers);
 
@@ -435,11 +463,12 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
+  if (['production_review', 'production_live'].includes(mode) && memory?.ok === false) blockers.push(...memory.blockers);
 
   return unique(blockers);
 }
 
-function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification = providerCertificationStatus() }) {
+function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification = providerCertificationStatus() }) {
   const blockers = [];
   const admin = adminAuthPosture({ mode: PRODUCTION_LIVE_MODE });
   if (env.runMode !== 'production_live') blockers.push('RUN_MODE is not production_live');
@@ -484,11 +513,12 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, 
     if (!gate.ok) blockers.push(`reputation gate ${gate.name} failed: ${gate.detail}`);
   }
   if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
+  if (memory?.ok === false) blockers.push(...memory.blockers);
   if (stripeKeyMode(env.stripe.secretKey) === 'secret_live') blockers.push('STRIPE_SECRET_KEY is sk_live_; use a restricted rk_live_ key for production');
   return unique(blockers);
 }
 
-function promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs }) {
+function promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs, memory }) {
   const productionReview = stageReport(PRODUCTION_REVIEW_MODE, [
     gate({
       name: 'target_mode',
@@ -513,6 +543,7 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
     dryRunSmokeGate(providers),
     complianceGate(compliance),
     reputationGate(reputation),
+    memoryDurabilityGate(memory),
     durableJobsGate(jobs)
   ]);
 
@@ -619,6 +650,7 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
     webhookFreshnessGate(webhooks),
     complianceGate(compliance),
     reputationGate(reputation),
+    memoryDurabilityGate(memory),
     durableJobsGate(jobs),
     gate({
       name: 'stripe_key_scope',
@@ -673,6 +705,17 @@ function providerCredentialGate(providers) {
     blockers,
     nextAction: 'set missing provider credentials',
     detail
+  });
+}
+
+function memoryDurabilityGate(memory) {
+  return gate({
+    name: 'persistent_memory',
+    label: 'Persistent memory durability',
+    ok: memory?.ok === true,
+    blockers: memory?.blockers || ['persistent memory status is unavailable'],
+    nextAction: 'enable durable memory retries and clear unresolved Supermemory writes before promotion',
+    detail: memory || null
   });
 }
 

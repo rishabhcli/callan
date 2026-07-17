@@ -42246,15 +42246,25 @@ export const experimentAssignments = {
 
 export const experimentOutcomes = {
   insert({ id, assignment_id, experiment_key, arm, outcome, value_cents, metadata }) {
-    db.prepare(`
+    const result = db.prepare(`
       INSERT INTO experiment_outcomes (id, assignment_id, experiment_key, arm, outcome, value_cents, metadata_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
     `).run(id, assignment_id, experiment_key, arm, outcome, value_cents ?? null, jsonText(metadata), Date.now());
+    return {
+      inserted: result.changes > 0,
+      row: db.prepare(`SELECT * FROM experiment_outcomes WHERE id = ?`).get(id) || null
+    };
   },
   rollup(experiment_key) {
     return db.prepare(`
       SELECT a.arm,
              COUNT(DISTINCT a.id)                                AS assignments,
+             COUNT(DISTINCT CASE WHEN o.outcome='connected' THEN o.assignment_id END) AS connections,
+             COUNT(DISTINCT CASE WHEN o.outcome='won' THEN o.assignment_id END) AS wins,
+             COUNT(DISTINCT CASE WHEN o.outcome='lost' THEN o.assignment_id END) AS losses,
+             COUNT(DISTINCT CASE WHEN o.outcome='callback' THEN o.assignment_id END) AS callbacks,
+             COUNT(DISTINCT CASE WHEN o.outcome='unreachable' THEN o.assignment_id END) AS unreachable,
              COUNT(DISTINCT CASE WHEN o.outcome='converted' THEN o.assignment_id END) AS conversions,
              COALESCE(SUM(CASE WHEN o.outcome='converted' THEN o.value_cents END), 0) AS revenue_cents
       FROM experiment_assignments a

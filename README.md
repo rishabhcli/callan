@@ -547,6 +547,7 @@ Current policy:
 - `customId = <kind>:<leadId>:<sourceId>` for provider-side update/dedup and local idempotency.
 - Memory kinds are `research_evidence`, `business_profile`, `presence_score`, `pitch`, `call_transcript`, `call_analysis`, `mail_thread`, `invoice`, `build_brief`, `build_result`, `growth_plan`, and `compliance_decision`.
 - Every write mirrors into `memory_documents`, queues/retries through `memory_write_queue`, logs searches in `memory_searches`, and records provider failures in `memory_failures`.
+- A boot-and-interval durable job (`memory.retry_failed`) automatically drains failed writes. `MEMORY_RETRY_ENABLED=false`, a pending/dead write, or an unresolved memory failure blocks production promotion.
 - The operator UI Memory tab shows businesses found, per-lead ledgers, scoped retrieval hits, failed writes, and a retry action.
 
 Routes:
@@ -565,11 +566,23 @@ Verification:
 npm run check:supermemory
 ```
 
+The check proves per-lead isolation, failure recovery, and SQLite mirror/queue survival across a fresh Node process.
+
 Source docs used for this implementation:
 
 - Supermemory add/update parameters: `content`, `containerTag`, `customId`, `metadata`, `filterByMetadata`, `entityContext`, and document status tracking: https://supermemory.ai/docs/add-memories
 - Supermemory container tags and metadata filters: https://supermemory.ai/docs/concepts/filtering
 - Supermemory search parameters and response shape: https://supermemory.ai/docs/memory-api/searching/searching-memories
+
+## Self-improving sales pitch loop
+
+Every analyzed call writes a durable `call_analysis` document containing the outcome, blocker, what worked, what to change, customer questions, and next action. The next call for that lead loads the latest analysis into Gemini's structured pitch evidence, the AgentPhone system prompt, and the Moss hot strategy. Pitch documents use the caller run id as their memory `sourceId`, so revisions remain auditable instead of overwriting the prior pitch.
+
+The `pitch_v2` experiment records idempotent `connected`, analyzed outcome, and paid `converted` events. New leads first balance the `control`, `short_warm`, and `data_driven` arms to `PITCH_EXPERIMENT_MIN_SAMPLES_PER_ARM`; afterward they use a Bayesian-smoothed outcome score while reserving `PITCH_EXPERIMENT_EXPLORATION_RATE` for deterministic exploration. A lead's first assignment remains sticky across retries and callbacks. Inspect `/api/experiments` and verify the policy with:
+
+```sh
+npm run check:learning-loop
+```
 
 ## Live Toggles
 

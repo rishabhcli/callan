@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { CallScript, toGeminiJsonSchema } from './reasoning/schemas.js';
 import { compactLeadIntelligence, evidenceTraceText } from './research/leadIntelligence.js';
+import { priorCallLearningPrompt } from './pitchLearning.js';
 
 export const CallScriptSchema = toGeminiJsonSchema(CallScript);
 
@@ -186,6 +187,7 @@ export function buildPitchHotStrategy({ pitch = {}, profile = {}, lead = {} } = 
     context.research.evidenceTrace ? `Cited evidence trail: ${context.research.evidenceTrace}` : null,
     `Tie the offer to these customer needs: ${needs}.`,
     `Use this value prop when the owner gives you a few seconds: ${pitch.valueProp || 'A focused $500 same-day website can make the next customer action obvious.'}`,
+    pitch.priorCallLearning ? `Apply durable prior-call learning: ${priorCallLearningPrompt(pitch.priorCallLearning)}` : null,
     `Close only after positive intent: ${pitch.close || 'If this sounds useful, ask for the best invoice email and send the invoice.'}`,
     `If the owner agrees, follow this rule exactly: ${pitch.emailReadbackInstruction || 'Read the email back exactly and ask the owner to confirm it before saying the invoice is sending.'}. If the readback is wrong, ask for the correction and read it back again.`
   ].filter(Boolean);

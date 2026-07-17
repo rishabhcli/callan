@@ -190,6 +190,12 @@ export const env = {
     timezone: process.env.ACCOUNT_MANAGER_TIMEZONE || process.env.OUTREACH_TIMEZONE || 'America/Los_Angeles'
   },
 
+  memory: {
+    retryEnabled: process.env.MEMORY_RETRY_ENABLED !== 'false',
+    retryIntervalMs: num(process.env.MEMORY_RETRY_INTERVAL_MS, 60_000),
+    retryBatchSize: Math.max(1, Math.floor(num(process.env.MEMORY_RETRY_BATCH_SIZE, 25)))
+  },
+
   ops: {
     safeToSellCheckEnabled: process.env.SAFE_TO_SELL_SELF_CHECK_ENABLED !== 'false',
     safeToSellCheckIntervalMs: num(process.env.SAFE_TO_SELL_SELF_CHECK_INTERVAL_MS, 24 * 60 * 60 * 1000),

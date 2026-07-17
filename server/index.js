@@ -140,6 +140,7 @@ import { sendAgentMailMessage } from './providers/agentmail.js';
 import { startDataRetentionScheduler, stopDataRetentionScheduler } from './dataLifecycle.js';
 import { startAgentMailPoller, stopAgentMailPoller } from './agentmailPoller.js';
 import { aggregateLeadMarketOpportunities, planLaunchFromMarketOpportunity, recordMarketRecommendationOutcome } from './portfolio.js';
+import { MEMORY_RETRY_JOB_TYPE, runMemoryRetryJob, startMemoryRetryScheduler, stopMemoryRetryScheduler } from './memoryRetry.js';
 
 const app = express();
 const adminLimiter = rateLimit({
@@ -431,6 +432,7 @@ const durableJobHandlers = {
   [GROWTH_FOLLOWUP_JOB_TYPE]: handleGrowthFollowupJob,
   [ACCOUNT_MANAGER_RUN_JOB_TYPE]: handleAccountManagerRunJob,
   [ACCOUNT_MANAGER_TASK_JOB_TYPE]: handleAccountManagerTaskJob,
+  [MEMORY_RETRY_JOB_TYPE]: runMemoryRetryJob,
   [OPS_BACKUP_JOB_TYPE]: runOpsBackupJob,
   [OPS_PROVIDER_POSTURE_JOB_TYPE]: runProviderPostureJob,
   [OPS_RECOVER_STUCK_JOB_TYPE]: (payload) => runOpsRecoveryJob(payload, {
@@ -6072,6 +6074,11 @@ const httpServer = app.listen(env.port, () => {
     log.warn('privacy.retention_scheduler_start_failed', { error: err?.message || String(err) });
   }
   try {
+    log.info('memory.retry_scheduler_start', startMemoryRetryScheduler());
+  } catch (err) {
+    log.warn('memory.retry_scheduler_start_failed', { error: err?.message || String(err) });
+  }
+  try {
     log.info('ops.provider_posture_scheduler_start', startProviderPostureScheduler());
   } catch (err) {
     log.warn('ops.provider_posture_scheduler_start_failed', { error: err?.message || String(err) });
@@ -6150,6 +6157,7 @@ function shutdown(signal) {
     () => stopOutreachLoop({ reason: `process_${String(signal).toLowerCase()}` }),
     () => stopDurableJobLoop(),
     () => stopOpsBackupScheduler(),
+    () => stopMemoryRetryScheduler(),
     () => stopDataRetentionScheduler(),
     () => stopProviderPostureScheduler(),
     () => stopOpsRecoveryScheduler(),

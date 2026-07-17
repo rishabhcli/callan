@@ -10,6 +10,7 @@ import { isProviderRuntimeError, providerRuntimeIncident } from './providerIncid
 import { operationalErrorSummary } from './operationalErrors.js';
 import { ACCOUNT_MANAGER_RUN_JOB_TYPE, enqueueAccountManagerRun, handleAccountManagerRunJob } from './accountManager/scheduler.js';
 import { SAFE_TO_RENEW_JOB_TYPE, runSafeToRenewSelfCheck } from './safeToRenew.js';
+import { MEMORY_RETRY_JOB_TYPE, enqueueMemoryRetry, runMemoryRetryJob } from './memoryRetry.js';
 import {
   RENEWAL_CUSTOMER_CONFIRMATION_ACCEPT_ACTION_TYPE,
   RENEWAL_CUSTOMER_CONFIRMATION_ACK_ACTION_TYPE,
@@ -2327,6 +2328,7 @@ export async function refreshStaleOpsMaintenance({
     [OPS_PROVIDER_POSTURE_JOB_TYPE]: runProviderPostureJob,
     [OPS_RECOVER_STUCK_JOB_TYPE]: runOpsRecoveryJob,
     [OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE]: runRetentionCommandLeaseMaintenanceJob,
+    [MEMORY_RETRY_JOB_TYPE]: runMemoryRetryJob,
     [ACCOUNT_MANAGER_RUN_JOB_TYPE]: handleAccountManagerRunJob,
     [SAFE_TO_RENEW_JOB_TYPE]: runSafeToRenewSelfCheck
   };
@@ -2354,6 +2356,7 @@ export async function refreshStaleOpsMaintenance({
     if (job.type === OPS_PROVIDER_POSTURE_JOB_TYPE) queued.push(enqueueProviderPostureRefresh(common));
     if (job.type === OPS_RECOVER_STUCK_JOB_TYPE) queued.push(enqueueOpsRecovery(common));
     if (job.type === OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE) queued.push(enqueueRetentionCommandLeaseMaintenance(common));
+    if (job.type === MEMORY_RETRY_JOB_TYPE) queued.push(enqueueMemoryRetry({ ...common, intervalMs: job.intervalMs }));
     if (job.type === SAFE_TO_RENEW_JOB_TYPE) queued.push(enqueueJob({
       type: SAFE_TO_RENEW_JOB_TYPE,
       payload: {
@@ -2438,6 +2441,12 @@ function recurringOpsJobSpecs() {
       label: 'Safe-to-renew self-check',
       enabled: env.ops.safeToRenewCheckEnabled,
       intervalMs: env.ops.safeToRenewCheckIntervalMs
+    },
+    {
+      type: MEMORY_RETRY_JOB_TYPE,
+      label: 'Persistent memory retry',
+      enabled: env.memory.retryEnabled,
+      intervalMs: env.memory.retryIntervalMs
     },
     {
       type: ACCOUNT_MANAGER_RUN_JOB_TYPE,

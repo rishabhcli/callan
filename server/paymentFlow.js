@@ -367,7 +367,8 @@ export function recordPaidPayment(
           metadata: {
             paymentId: result.row?.id || null,
             stripeInvoiceId: result.row?.stripe_invoice_id || null
-          }
+          },
+          idempotencyKey: `payment:${result.row?.id || stripeId}:converted`
         });
       }
     } catch (err) {

@@ -2,6 +2,7 @@
 // Runs against the synthetic provider unless SUPERMEMORY_API_KEY is set by the caller.
 
 import { mkdtempSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -10,14 +11,16 @@ process.env.DATA_DIR = dataDir;
 process.env.RUN_MODE = process.env.RUN_MODE || 'mock';
 process.env.SUPERMEMORY_API_KEY = process.env.SUPERMEMORY_API_KEY || '';
 
-const { leads, memoryFailures, memoryWriteQueue } = await import('../server/db.js');
+const { db, leads, memoryFailures, memoryWriteQueue } = await import('../server/db.js');
 const {
+  __setSupermemoryProviderForTest,
   addDoc,
   containerTagFor,
   customIdFor,
   listKinds,
   memoryForLead,
   memoryObservability,
+  retryFailedWrites,
   search
 } = await import('../server/memory.js');
 
@@ -162,6 +165,20 @@ assert('failed writes enter retry queue', failedQueueRow?.status === 'failed', J
 }));
 assert('failed writes are visible in memory_failures', unresolvedFailures.some((row) => row.custom_id === failedCustomId), `${unresolvedFailures.length} unresolved failure(s)`);
 
+memoryWriteQueue.mark(failedCustomId, { next_attempt_at: Date.now() - 1 });
+__setSupermemoryProviderForTest({
+  synthetic: false,
+  async add(prepared) {
+    return { id: `recovered_${prepared.custom_id}`, status: 'done' };
+  }
+});
+const retry = await retryFailedWrites({ limit: 10 });
+__setSupermemoryProviderForTest(null);
+const recoveredQueueRow = memoryWriteQueue.getByCustomId(failedCustomId);
+const remainingFailures = memoryFailures.list({ lead_id: leadA, unresolved: true, limit: 20 });
+assert('failed writes retry and recover', retry.succeeded === 1 && recoveredQueueRow?.status === 'succeeded', JSON.stringify({ retry, status: recoveredQueueRow?.status }));
+assert('successful retry resolves failure ledger', !remainingFailures.some((row) => row.custom_id === failedCustomId), `${remainingFailures.length} unresolved failure(s)`);
+
 const leadMemory = await memoryForLead(leadA);
 const observability = memoryObservability();
 assert('per-lead ledger exposes documents/searches/failures', leadMemory.documents.length >= 4 && leadMemory.searches.length >= 2 && leadMemory.failures.length >= 1, JSON.stringify({
@@ -170,6 +187,37 @@ assert('per-lead ledger exposes documents/searches/failures', leadMemory.documen
   failures: leadMemory.failures.length
 }));
 assert('observability reports container isolation', observability.totals.isolation.failed === 0, JSON.stringify(observability.totals.isolation));
+
+db.close();
+let restartProof = null;
+try {
+  const code = `
+    const { db, memoryDocuments, memoryFailures, memoryWriteQueue } = await import('./server/db.js');
+    const pitch = memoryDocuments.get(${JSON.stringify(customIdFor('pitch', leadA, 'sales-pitch'))});
+    const retry = memoryWriteQueue.getByCustomId(${JSON.stringify(failedCustomId)});
+    const failures = memoryFailures.counts();
+    console.log(JSON.stringify({ pitchKind: pitch?.kind || null, retryStatus: retry?.status || null, unresolved: Number(failures?.unresolved || 0) }));
+    db.close();
+  `;
+  const output = execFileSync(process.execPath, ['--input-type=module', '--eval', code], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DATA_DIR: dataDir,
+      RUN_MODE: 'mock',
+      SUPERMEMORY_API_KEY: ''
+    }
+  }).trim();
+  restartProof = JSON.parse(output.split('\n').at(-1));
+} catch (err) {
+  restartProof = { error: err?.message || String(err) };
+}
+assert(
+  'SQLite memory mirror and retry ledger survive a process restart',
+  restartProof?.pitchKind === 'pitch' && restartProof?.retryStatus === 'succeeded' && restartProof?.unresolved === 0,
+  JSON.stringify(restartProof)
+);
 
 const failed = checks.filter((check) => !check.ok);
 console.log('\n=== SUPERMEMORY CHECK SUMMARY ===');

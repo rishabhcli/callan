@@ -9,6 +9,8 @@ import { enqueueGrowthPlanJob } from '../growthQueue.js';
 import { applyMossAnalystFeedback } from '../moss/analysis.js';
 import { enqueueJob } from '../jobs.js';
 import { assertProviderOperational } from '../providerIncidents.js';
+import { currentArmForLead, recordOutcome as recordExperimentOutcome } from '../experiments.js';
+import { PITCH_EXPERIMENT_KEY } from '../experimentArms.js';
 
 const OUTCOME_TO_STATUS = {
   won: 'closing',
@@ -72,6 +74,24 @@ export async function runAnalyst({ leadId, callId }) {
       nextBestAction: postMortem.nextBestAction?.code,
       schemaVersion: postMortem.schemaVersion
     });
+
+    try {
+      const assignment = currentArmForLead(PITCH_EXPERIMENT_KEY, leadId);
+      if (assignment) {
+        recordExperimentOutcome({
+          assignment,
+          outcome: postMortem.outcome,
+          metadata: {
+            callId: postMortem.callId || callId || null,
+            nextBestAction: postMortem.nextBestAction?.code || null,
+            confirmedEmail: postMortem.confirmedEmail === true
+          },
+          idempotencyKey: `call:${postMortem.callId || callId || runId}:analysis`
+        });
+      }
+    } catch (err) {
+      log.warn('experiment.outcome.analysis_failed', { leadId, callId, error: err?.message || String(err) });
+    }
 
     emit('analyst.analysis', {
       worker: 'analyst',

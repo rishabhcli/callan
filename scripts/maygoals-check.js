@@ -20212,6 +20212,10 @@ function configureEnv(dir) {
   process.env.LIVE_BUILDS = 'false';
   process.env.LIVE_PUBLIC_OUTREACH = 'false';
   process.env.AUTONOMOUS_OUTREACH_ENABLED = 'false';
+  // This suite repeatedly boots route servers against one shared database and
+  // asserts that route reads create no background jobs. Memory retry behavior
+  // is covered by check:supermemory and check:learning-loop.
+  process.env.MEMORY_RETRY_ENABLED = 'false';
   process.env.GITHUB_TOKEN = '';
 }
 
@@ -24395,8 +24399,10 @@ async function verifyPortfolioAcquisitionAttemptStrategyRefreshAndOperatingModel
       })) === false
     };
   } catch (err) {
-    err.message = `${err.message}\nportfolio acquisition attempt/strategy route server output:\n${childOutput}`;
-    throw err;
+    throw new Error(
+      `${err?.message || String(err)}\nportfolio acquisition attempt/strategy route server output:\n${childOutput}`,
+      { cause: err }
+    );
   } finally {
     await stopRouteChild(child);
   }
