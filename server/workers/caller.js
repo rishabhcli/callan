@@ -48,6 +48,7 @@ import {
   persistCallbackPromise,
   terminalCallState
 } from '../callState.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 
 const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human. Output only JSON that matches the supplied schema exactly.`;
 
@@ -447,7 +448,7 @@ function computeCallDurationSeconds(callRow) {
   return Math.round((ended - started) / 1000);
 }
 
-async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, verticalPack = null, experimentAssignment = null }) {
+async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, verticalPack = null, experimentAssignment = null, jobContext = null, signal = null }) {
   const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
@@ -532,6 +533,8 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
   };
 
   try {
+    if (signal?.aborted) throw signal.reason || new Error('caller canceled before provider request');
+    const authorization = requireLiveSideEffectAuthorization({ action: 'call', leadId, job: jobContext });
     const voice = await verifyAgentPhoneVoice(env.agentphone.defaultVoice);
     const agent = await ensureAgentPhoneAgent({
       voice: voice.id,
@@ -589,7 +592,8 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       toNumber: normalized,
       systemPrompt,
       initialGreeting: pitch.beginMessage,
-      voice: voice.id
+      voice: voice.id,
+      authorization: { decision: authorization, leadId, job: jobContext, signal }
     });
     providerCallId = placed.id;
     callId = `call_${Date.now().toString(36)}`;
@@ -766,7 +770,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
   }
 }
 
-export async function runCaller({ leadId, toPhone, pitchOverride = null, source = null, scheduledCallId = null }) {
+export async function runCaller({ leadId, toPhone, pitchOverride = null, source = null, scheduledCallId = null, jobContext = null, signal = null }) {
   const runId = `run_${Date.now().toString(36)}`;
   runs.start({ id: runId, lead_id: leadId, worker: 'caller' });
   emit('caller.start', { worker: 'caller', leadId, runId, toPhone: mask(toPhone), source: source || 'manual', scheduledCallId });
@@ -832,6 +836,11 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
     const hotContext = await buildMossHotContext({ leadId, lead, profile, pitch, runId });
 
     const live = modeAllowsSideEffect('calls') && env.live.calls;
+    if (!live && env.runMode !== 'mock') {
+      const error = new Error(`live call refused: ${env.runMode} does not have an enabled call path`);
+      error.code = 'LIVE_CALL_PATH_DISABLED';
+      throw error;
+    }
     if (live) {
       const allowed = callabilityForLead({ lead, profile, disclosureText: disclosure, phone: toPhone || lead.phone });
       recordCallDecision({
@@ -858,7 +867,7 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
       });
     }
     const result = live
-      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment })
+      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment, jobContext, signal })
       : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment });
 
     runs.finish(runId, { state: 'completed', detail: { ...result, mock: !live } });

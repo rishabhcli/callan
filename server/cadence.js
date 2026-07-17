@@ -79,7 +79,8 @@ function leadEmailAddress(leadId) {
 
 function channelViable({ channel, lead, leadId }) {
   if (channel === 'call_retry') return Boolean(normalizePhone(lead?.phone));
-  if (channel === 'sms') return Boolean(normalizePhone(lead?.phone));
+  // SMS is a demo-only simulation until a real, certified provider path exists.
+  if (channel === 'sms') return env.runMode === 'mock' && Boolean(normalizePhone(lead?.phone));
   if (channel === 'email') return leadHasEmailDestination(leadId, lead);
   return true; // archive always viable
 }
@@ -278,6 +279,11 @@ async function executeEmailNudge({ leadId, lead }) {
 }
 
 async function executeSmsNudge({ leadId, lead }) {
+  if (env.runMode !== 'mock') {
+    const error = new Error('SMS nudge refused: no live SMS provider is configured');
+    error.code = 'LIVE_SMS_UNAVAILABLE';
+    throw error;
+  }
   emit('cadence.executing', { leadId, channel: 'sms', businessName: lead.business_name });
   const phone = normalizePhone(lead.phone);
   if (!phone) {

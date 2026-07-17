@@ -18,6 +18,7 @@ import {
 } from '../fulfillment/hooks/index.js';
 import { enqueueHostingUpsell } from '../hostingUpsellQueue.js';
 import { recordBrowserUseSteps } from '../costs.js';
+import { env } from '../env.js';
 import {
   createHandoffCaseFromBuilderAuthWall,
   createHandoffCaseFromProviderFailure,
@@ -94,6 +95,11 @@ export async function runBuilder({ leadId, buildId, target, images = [], onLiveU
     const buildTarget = assertBuildTarget(createBuildTarget(target));
     const submission = buildTarget.createSubmission({ brief, images, lead, buildId });
     const gate = canRunLiveBuildTarget(buildTarget.name);
+    if (!gate.ok && env.runMode !== 'mock') {
+      const error = new Error(`live build refused: ${gate.reason || 'provider gate is closed'}`);
+      error.code = 'LIVE_BUILD_GATE_CLOSED';
+      throw error;
+    }
     let websiteBriefJson = null;
     try { websiteBriefJson = JSON.stringify(prepared.websiteBrief); }
     catch (err) { log.warn('builder.website_brief_serialize_failed', { buildId, err: err?.message }); }

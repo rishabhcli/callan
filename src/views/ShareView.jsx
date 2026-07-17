@@ -137,15 +137,39 @@ export default function ShareView({ token }) {
   const launchApproved = Boolean(data?.approvals?.launch || customerApproved);
 
   const postAction = useCallback(async (path, body) => {
-    const res = await fetch(`/api/share/build/${encodeURIComponent(token)}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined
-    });
-    const text = await res.text();
-    const parsed = text ? JSON.parse(text) : null;
-    if (!res.ok) throw new Error(parsed?.error || res.statusText);
-    return parsed;
+    async function send(verificationAttempted = false) {
+      const res = await fetch(`/api/share/build/${encodeURIComponent(token)}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined
+      });
+      const text = await res.text();
+      const parsed = text ? JSON.parse(text) : null;
+      if (res.status === 428 && parsed?.code === 'PORTAL_VERIFICATION_REQUIRED' && !verificationAttempted) {
+        const request = await fetch(`/api/share/build/${encodeURIComponent(token)}/verification/request`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const requestBody = await request.json().catch(() => null);
+        if (!request.ok) throw new Error(requestBody?.error || 'Could not send the verification code.');
+        const code = window.prompt(`Enter the 6-digit code sent to ${requestBody.sentTo}.`);
+        if (!code) throw new Error('Email verification was cancelled.');
+        const confirmation = await fetch(`/api/share/build/${encodeURIComponent(token)}/verification/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code })
+        });
+        const confirmationBody = await confirmation.json().catch(() => null);
+        if (!confirmation.ok) throw new Error(confirmationBody?.error || 'Verification code was not accepted.');
+        return send(true);
+      }
+      if (!res.ok) throw new Error(parsed?.error || res.statusText);
+      if (parsed?.portalRotation?.url) {
+        window.location.replace(parsed.portalRotation.url);
+      }
+      return parsed;
+    }
+    return send(false);
   }, [token]);
 
   const handleAccept = useCallback(async () => {

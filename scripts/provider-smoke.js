@@ -139,7 +139,8 @@ async function smokeBrowserUse() {
   try {
     const adapter = new BrowserUseLovableAdapter({
       apiKey: env.browserUse.apiKey,
-      baseUrl: env.browserUse.baseUrl
+      baseUrl: env.browserUse.baseUrl,
+      authorizationContext: { smoke: true }
     });
     const session = await adapter.createSession({ keepAlive: false });
     try { await adapter.stopSession(session.sessionId); } catch {}
@@ -162,7 +163,8 @@ async function smokeLovable() {
   }
   const adapter = new BrowserUseLovableAdapter({
     apiKey: env.browserUse.apiKey,
-    baseUrl: env.browserUse.baseUrl
+    baseUrl: env.browserUse.baseUrl,
+    authorizationContext: { smoke: true }
   });
   let session = null;
   const events = [];

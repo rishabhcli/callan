@@ -14,6 +14,7 @@ import { reputationReadinessReport } from './reputation.js';
 import { adminAuthPosture } from './adminAuth.js';
 import { providerRuntimeIncident } from './providerIncidents.js';
 import { operationalErrorSummary } from './operationalErrors.js';
+import { existsSync, readFileSync } from 'node:fs';
 
 export const PROVIDER_ORDER = ['gemini', 'supermemory', 'moss', 'agentphone', 'browserUse', 'lovable', 'v0', 'agentmail', 'stripe'];
 const LIVE_PROVIDER_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
@@ -51,8 +52,9 @@ export function liveReadiness() {
   const reputation = reputationReadinessReport();
   const jobs = durableJobs.summary();
   const admin = adminAuthPosture({ mode });
-  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin });
-  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs });
+  const providerCertification = providerCertificationStatus();
+  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin, providerCertification });
+  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification });
   const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs });
   const nextActions = nextActionsFor([...blockers, ...productionBlockers]);
 
@@ -68,6 +70,7 @@ export function liveReadiness() {
     promotionGates,
     nextActions,
     providers,
+    providerCertification,
     webhooks,
     fulfillment: fulfillmentReadiness(),
     sideEffects,
@@ -398,7 +401,7 @@ function quotaCostStatus(name, smokeRow) {
   return detail.quota || detail.usage || 'not reported';
 }
 
-function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin }) {
+function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin, providerCertification }) {
   const blockers = [];
   if (!isValidRunMode(mode)) blockers.push(`invalid RUN_MODE: ${mode}; expected one of ${RUN_MODES.join(', ')}`);
 
@@ -413,7 +416,7 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (mode === 'production_live') {
-    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }));
+    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification }));
   }
   if (admin?.required && !admin.ok) blockers.push(...admin.blockers);
 
@@ -436,7 +439,7 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
   return unique(blockers);
 }
 
-function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }) {
+function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, providerCertification = providerCertificationStatus() }) {
   const blockers = [];
   const admin = adminAuthPosture({ mode: PRODUCTION_LIVE_MODE });
   if (env.runMode !== 'production_live') blockers.push('RUN_MODE is not production_live');
@@ -444,6 +447,17 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, 
   if (env.nodeEnv !== 'production') blockers.push('NODE_ENV must be production for production_live');
   if (!isHttpsPublicUrl(env.publicUrl)) blockers.push('APP_PUBLIC_URL must be a public https URL for production webhooks');
   if (!env.outreach.enabled) blockers.push('AUTONOMOUS_OUTREACH_ENABLED must be true for production_live');
+  if (String(env.portal?.tokenSecret || '').length < 32) blockers.push('PORTAL_TOKEN_SECRET must be at least 32 characters for production_live');
+  if (String(env.safety?.interlockSecret || '').length < 32) blockers.push('SAFETY_INTERLOCK_SECRET must be at least 32 characters for production_live');
+  if (!(env.admin?.operatorTokens || []).length) blockers.push('ADMIN_API_TOKENS_JSON must define named operator identities for production_live');
+  if (!env.admin?.mfaEnforced) blockers.push('ADMIN_MFA_ENFORCED must be true for production_live');
+  if (env.admin?.apiToken) blockers.push('ADMIN_API_TOKEN must be unset when production_live uses named operator identities');
+  if (!env.privacy?.retentionEnabled) blockers.push('DATA_RETENTION_ENABLED must be true for production_live');
+  if (!env.privacy?.dataAtRestEncrypted) blockers.push('DATA_AT_REST_ENCRYPTED must attest encrypted production storage');
+  if (!env.privacy?.backupsEncrypted) blockers.push('BACKUPS_ENCRYPTED must attest encrypted backup storage');
+  if (env.deployment?.replicaCount !== 1) blockers.push('SQLite deployment requires APP_REPLICA_COUNT=1');
+  if (env.deployment?.singleNodePilotAck !== 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS') blockers.push('SINGLE_NODE_PILOT_ACK must equal I_ACCEPT_SINGLE_NODE_PILOT_LIMITS');
+  blockers.push(...(providerCertification.blockers || []));
   blockers.push(...admin.blockers);
 
   for (const [name, row] of Object.entries(providers || {})) {
@@ -544,6 +558,53 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
       nextAction: 'set AUTONOMOUS_OUTREACH_ENABLED=true after review gates are green'
     }),
     gate({
+      name: 'portal_token_secret',
+      label: 'Portal token signing secret',
+      ok: String(env.portal?.tokenSecret || '').length >= 32,
+      blockers: String(env.portal?.tokenSecret || '').length >= 32 ? [] : ['PORTAL_TOKEN_SECRET must be at least 32 characters for production_live'],
+      nextAction: 'set a random PORTAL_TOKEN_SECRET of at least 32 characters and rotate existing portal links'
+    }),
+    gate({
+      name: 'safety_interlock_secret',
+      label: 'Signed safety interlock',
+      ok: String(env.safety?.interlockSecret || '').length >= 32,
+      blockers: String(env.safety?.interlockSecret || '').length >= 32 ? [] : ['SAFETY_INTERLOCK_SECRET must be at least 32 characters for production_live'],
+      nextAction: 'set a random SAFETY_INTERLOCK_SECRET of at least 32 characters, then generate a fresh safe-to-sell snapshot'
+    }),
+    gate({
+      name: 'operator_identity',
+      label: 'Named operator identity and MFA',
+      ok: (env.admin?.operatorTokens || []).length > 0 && env.admin?.mfaEnforced === true && !env.admin?.apiToken,
+      blockers: [
+        ...((env.admin?.operatorTokens || []).length ? [] : ['ADMIN_API_TOKENS_JSON must define named operator identities for production_live']),
+        ...(env.admin?.mfaEnforced ? [] : ['ADMIN_MFA_ENFORCED must be true for production_live']),
+        ...(env.admin?.apiToken ? ['ADMIN_API_TOKEN must be unset when production_live uses named operator identities'] : [])
+      ],
+      nextAction: 'configure named viewer/operator/admin credentials behind an MFA-enforced operator login and remove ADMIN_API_TOKEN'
+    }),
+    gate({
+      name: 'sensitive_data_lifecycle',
+      label: 'Sensitive data lifecycle',
+      ok: env.privacy?.retentionEnabled === true && env.privacy?.dataAtRestEncrypted === true && env.privacy?.backupsEncrypted === true,
+      blockers: [
+        ...(env.privacy?.retentionEnabled ? [] : ['DATA_RETENTION_ENABLED must be true for production_live']),
+        ...(env.privacy?.dataAtRestEncrypted ? [] : ['DATA_AT_REST_ENCRYPTED must attest encrypted production storage']),
+        ...(env.privacy?.backupsEncrypted ? [] : ['BACKUPS_ENCRYPTED must attest encrypted backup storage'])
+      ],
+      nextAction: 'enable the retention scheduler and deploy the database and backups on encrypted storage'
+    }),
+    gate({
+      name: 'single_node_pilot',
+      label: 'Single-node pilot scope',
+      ok: env.deployment?.replicaCount === 1 && env.deployment?.singleNodePilotAck === 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS',
+      blockers: [
+        ...(env.deployment?.replicaCount === 1 ? [] : ['SQLite deployment requires APP_REPLICA_COUNT=1']),
+        ...(env.deployment?.singleNodePilotAck === 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS' ? [] : ['SINGLE_NODE_PILOT_ACK must equal I_ACCEPT_SINGLE_NODE_PILOT_LIMITS'])
+      ],
+      nextAction: 'limit this release to one controlled replica and explicitly accept the single-node availability boundary'
+    }),
+    providerCertificationGate(),
+    gate({
       name: 'live_side_effect_flags',
       label: 'Live side-effect flags',
       ok: Object.values(liveMatrix).every((row) => row.allowed),
@@ -643,9 +704,88 @@ function adminAuthGate(admin) {
     detail: {
       required: !!admin?.required,
       configured: !!admin?.configured,
-      strong: !!admin?.strong
+      strong: !!admin?.strong,
+      namedOperatorCount: Number(admin?.namedOperatorCount || 0),
+      identityBacked: !!admin?.identityBacked
     }
   });
+}
+
+function providerCertificationGate() {
+  const status = providerCertificationStatus();
+  return gate({
+    name: 'provider_certification',
+    label: 'Staging provider and capacity certification',
+    ok: status.ok,
+    blockers: status.blockers,
+    nextAction: 'run owned-target provider certification plus the one-hour 3x-capacity soak, then set PROVIDER_CERTIFICATION_FILE',
+    detail: { file: status.file || null, certifiedProviders: status.certifiedProviders || [], loadTest: status.loadTest || null }
+  });
+}
+
+export function providerCertificationStatus({ now = Date.now(), file = env.deployment?.providerCertificationFile } = {}) {
+  if (!file) return { ok: false, file: null, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE is required for production_live'] };
+  if (!existsSync(file)) return { ok: false, file, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE does not exist'] };
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return { ok: false, file, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE is not valid JSON'] };
+  }
+  const rows = Array.isArray(manifest?.providers) ? manifest.providers : [];
+  const blockers = [];
+  const certifiedProviders = [];
+  if (manifest?.version !== 1) blockers.push('provider certification version must be 1');
+  if (manifest?.environment !== 'staging') blockers.push('provider certification environment must be staging');
+  for (const provider of PRODUCTION_REQUIRED_PROVIDERS) {
+    const row = rows.find((item) => item?.provider === provider);
+    if (!row) {
+      blockers.push(`${provider} staging certification is missing`);
+      continue;
+    }
+    const certifiedAt = Date.parse(row.certifiedAt);
+    if (!Number.isFinite(certifiedAt) || now - certifiedAt > 90 * 24 * 60 * 60 * 1000) blockers.push(`${provider} staging certification is missing or stale`);
+    for (const field of ['ownedTarget', 'requestSchema', 'responseSchema', 'quotaVerified', 'retryPolicyVerified', 'webhookOrderingVerified', 'outageBehaviorVerified', 'credentialScopeVerified']) {
+      if (!certificationEvidencePresent(row[field])) blockers.push(`${provider} certification missing ${field}`);
+    }
+    if (provider !== 'gemini' && !certificationEvidencePresent(row.idempotencyBehavior)) blockers.push(`${provider} certification missing idempotencyBehavior`);
+    if (!blockers.some((blocker) => blocker.startsWith(`${provider} `))) certifiedProviders.push(provider);
+  }
+  const loadTest = manifest?.loadTest && typeof manifest.loadTest === 'object' ? manifest.loadTest : {};
+  const loadCompletedAt = Date.parse(loadTest.completedAt);
+  const forecastConcurrency = Number(loadTest.forecastConcurrentWorkflows);
+  const testedConcurrency = Number(loadTest.testedConcurrentWorkflows);
+  const durationMinutes = Number(loadTest.durationMinutes);
+  const sqliteBusyErrors = Number(loadTest.sqliteBusyErrors);
+  if (!Number.isFinite(loadCompletedAt) || now - loadCompletedAt > 90 * 24 * 60 * 60 * 1000) blockers.push('load/soak certification is missing or stale');
+  if (!(forecastConcurrency > 0)) blockers.push('load/soak certification missing forecastConcurrentWorkflows');
+  if (!(testedConcurrency >= forecastConcurrency * 3)) blockers.push('load/soak certification must exercise at least 3x forecast concurrency');
+  if (!(durationMinutes >= 60)) blockers.push('load/soak certification must run for at least 60 minutes');
+  if (sqliteBusyErrors !== 0) blockers.push('load/soak certification recorded SQLite busy errors');
+  for (const field of ['webhookBurstVerified', 'sseFanoutVerified', 'slowProviderVerified']) {
+    if (loadTest[field] !== true) blockers.push(`load/soak certification missing ${field}`);
+  }
+  return {
+    ok: blockers.length === 0,
+    file,
+    certifiedProviders,
+    blockers,
+    loadTest: {
+      completedAt: loadTest.completedAt || null,
+      forecastConcurrentWorkflows: Number.isFinite(forecastConcurrency) ? forecastConcurrency : null,
+      testedConcurrentWorkflows: Number.isFinite(testedConcurrency) ? testedConcurrency : null,
+      durationMinutes: Number.isFinite(durationMinutes) ? durationMinutes : null,
+      sqliteBusyErrors: Number.isFinite(sqliteBusyErrors) ? sqliteBusyErrors : null,
+      webhookBurstVerified: loadTest.webhookBurstVerified === true,
+      sseFanoutVerified: loadTest.sseFanoutVerified === true,
+      slowProviderVerified: loadTest.slowProviderVerified === true
+    }
+  };
+}
+
+function certificationEvidencePresent(value) {
+  const text = String(value || '').trim();
+  return text.length >= 8 && !/replace[-_ ]?with|placeholder|todo/i.test(text);
 }
 
 function dryRunSmokeGate(providers) {

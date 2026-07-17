@@ -596,7 +596,7 @@ Launch modes are intentionally separate:
 | `production_review` | no | no | no | no | no | no |
 | `production_live` | compliance-gated | compliance-gated | confirmed invoice consent | opt-in | compliance-gated | opt-in |
 
-`production_live` additionally requires `PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH`, `NODE_ENV=production`, a strong `ADMIN_API_TOKEN`, public `https://` `APP_PUBLIC_URL`, configured webhooks, passing provider smoke rows, and the relevant `LIVE_*` flags.
+`production_live` is a controlled single-node pilot posture, not an unrestricted multi-tenant deployment. It additionally requires `PRODUCTION_LIVE_ACK=I_UNDERSTAND_LIVE_OUTREACH`, `NODE_ENV=production`, named role-scoped credentials in `ADMIN_API_TOKENS_JSON`, an upstream MFA attestation, public `https://` `APP_PUBLIC_URL`, encrypted storage/backup attestations, configured webhooks, fresh live provider smoke, a signed safe-to-sell snapshot, provider certification and load/soak evidence, the single-node acknowledgement, and the relevant `LIVE_*` flags. The legacy shared `ADMIN_API_TOKEN` must be unset in this mode.
 
 For a judge-safe live demo against owned targets only:
 
@@ -651,6 +651,7 @@ SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+15555550100 npm run smoke:providers -- --
 npm run check:deploy
 npm run check:production
 npm run check:safety
+npm run check:production-safety
 npm run drill:reliability
 ```
 
@@ -658,9 +659,17 @@ npm run drill:reliability
 
 `check:production` is read-only. It reports provider configured status, webhook status, smoke status, last error, quota/cost status, blocker reasons, and the next action for every provider. It exits report-only by default unless the app is already in `production_live`; use `npm run check:production -- --strict` to make production blockers fail locally.
 
-The readiness payload also exposes separate promotion gates for `production_review` and `production_live`. Review mode requires production credentials, a strong `ADMIN_API_TOKEN`, webhook secrets, fresh dry-run/config smoke, healthy jobs, and no live side-effect flags. Live mode requires the explicit production ack, production `NODE_ENV`, public HTTPS URL, fresh webhooks, fresh live smoke for every required provider, enabled side-effect flags, and healthy compliance/reputation/job gates.
+The readiness payload also exposes separate promotion gates for `production_review` and `production_live`. Review mode requires production credentials, protected admin access, webhook secrets, fresh dry-run/config smoke, healthy jobs, and no live side-effect flags. Live mode adds the explicit production ack, production `NODE_ENV`, public HTTPS URL, named operator identities and MFA attestation, encrypted data and backups, retention scheduling, fresh webhooks and live smoke, enabled side-effect flags, signed safe-to-sell evidence, healthy compliance/reputation/job gates, and the pilot qualification manifest described below.
 
-Operator API reads and mutations accept `Authorization: Bearer $ADMIN_API_TOKEN` or `X-Admin-Token: $ADMIN_API_TOKEN`. The console keeps the token only in page memory—it is not bundled into the frontend, written to browser storage, or copied into a cookie—so a full refresh requires re-entering it. Local mock/dev runs remain usable without a token unless `ADMIN_API_TOKEN` is set; `production_review`, `production_live`, and `NODE_ENV=production` require a strong token at process startup before health/readiness internals, leads, jobs, ops dashboards, discovery, calls, builds, outreach controls, aftercare actions, backup, reset, export, self-check, or stuck-job recovery controls can be used. `/api/ping` is the intentionally public liveness probe; the referral form uses a dedicated rate-limited public intake route; provider webhooks keep their provider signatures; customer share-link actions stay scoped to the portal token; and hosting accept/preview image routes remain scoped public links instead of operator-token routes.
+Operator API reads and mutations accept a bearer or `X-Admin-Token` credential. Production-live credentials are named `viewer`, `operator`, or `admin` entries in `ADMIN_API_TOKENS_JSON`, so mutations have an attributable audit actor and role check; `ADMIN_MFA_ENFORCED=true` is an attestation that the upstream secret/identity delivery system enforced MFA. The app does not itself provide an OIDC login or MFA challenge, so deploy it behind an identity-aware access proxy and deliver these credentials through a secret manager. The console keeps the credential only in page memory—it is not bundled into the frontend, written to browser storage, or copied into a cookie—so a full refresh requires re-entering it.
+
+The customer portal stores only HMAC-derived token hashes, defaults links to seven days, rotates links after sensitive mutations, and requires a short-lived email OTP for quote acceptance, scope approval, launch approval, and renewal changes in `production_live`. Raw portal tokens are not written to logs. This is still a bearer-link portal for non-sensitive reads; use a shorter `PORTAL_TOKEN_TTL_HOURS` if the customer risk profile requires it.
+
+Every final live provider boundary rechecks mode, its `LIVE_*` flag, the global pause, per-lead cost, durable-job lease ownership, and—under `production_live`—a fresh signed safe-to-sell snapshot plus the production acknowledgement. Job handlers heartbeat their leases and cannot complete or create another provider effect after lease loss. Mock reasoning, research, calls, builds, SMS, and mock-tagged SSE events are rejected outside `RUN_MODE=mock`; Gemini validation failures do not silently switch a live flow to synthetic output.
+
+Production provider and capacity qualification is deliberately external evidence, because a local test cannot prove third-party schemas, quotas, webhook ordering, or real infrastructure capacity. Copy `config/provider-certification.example.json`, add a fresh owned-target receipt for every required provider, and record a staging soak of at least 60 minutes at three times forecast workflow concurrency. The soak must verify zero SQLite busy errors, webhook bursts, SSE fanout, and slow-provider behavior. Set `PROVIDER_CERTIFICATION_FILE` to that manifest; readiness fails closed if it is absent or older than 90 days.
+
+SQLite production is limited to exactly one replica. Set `APP_REPLICA_COUNT=1` and `SINGLE_NODE_PILOT_ACK=I_ACCEPT_SINGLE_NODE_PILOT_LIMITS`; move persistence and scheduling to shared infrastructure before horizontal scaling or multi-tenant use.
 
 Container deployment, persistent-volume requirements, webhook registration, promotion order, health checks, rollback, and the single-replica SQLite constraint are documented in [DEPLOYMENT.md](./DEPLOYMENT.md).
 

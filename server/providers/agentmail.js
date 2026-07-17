@@ -2,6 +2,8 @@ import { canEmail, env } from '../env.js';
 import { log } from '../logger.js';
 import { recordAgentMailSend } from '../costs.js';
 import { normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
+import { assertMockProvenanceAllowed } from '../sse.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 12;
 const DEFAULT_MAX_RETRIES = 2;
@@ -84,6 +86,7 @@ export function classifyAgentMailFailure(err) {
 }
 
 export function createMockAgentMailSendResult({ threadId, messageId, subject } = {}) {
+  assertMockProvenanceAllowed('agentmail.mock_send_result', { mock: true });
   const id = messageId || `mock-agentmail-message-${Date.now().toString(36)}`;
   return {
     mock: true,
@@ -113,6 +116,19 @@ export async function sendAgentMailMessage({
   requireAgentMailConfig(inboxId);
   const recipients = normalizeAddressList(to || toEmail);
   if (!recipients.length) throw new Error('AgentMail send requires at least one recipient');
+  const blockedRecipient = recipients.find((recipient) => !canEmail(recipient));
+  if (blockedRecipient) {
+    const err = new Error('AgentMail recipient is not allowed by the current run mode and target allowlist');
+    err.code = 'EMAIL_TARGET_NOT_ALLOWED';
+    err.retryable = false;
+    throw err;
+  }
+  requireLiveSideEffectAuthorization({
+    action: 'email',
+    leadId,
+    job: options.authorization?.job || null,
+    smoke: options.authorization?.smoke === true
+  });
 
   const mail = await agentMailClient();
   const res = await agentMailCall('sendMessage', () => mail.inboxes.messages.send(inboxId, compact({
@@ -125,7 +141,7 @@ export async function sendAgentMailMessage({
     text,
     html,
     attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined
-  }), requestOptions(options)));
+  }), sideEffectRequestOptions(options)));
 
   const normalized = normalizeAgentMailSendResult(res, { inboxId, subject, toEmail: recipients[0] });
   if (leadId) {
@@ -163,6 +179,20 @@ export async function replyAgentMailMessage({
   }
 
   requireAgentMailConfig(inboxId);
+  const replyRecipients = normalizeAddressList(toEmail);
+  const blockedRecipient = replyRecipients.find((recipient) => !canEmail(recipient));
+  if (blockedRecipient) {
+    const err = new Error('AgentMail reply recipient is not allowed by the current run mode and target allowlist');
+    err.code = 'EMAIL_TARGET_NOT_ALLOWED';
+    err.retryable = false;
+    throw err;
+  }
+  requireLiveSideEffectAuthorization({
+    action: 'email',
+    leadId,
+    job: options.authorization?.job || null,
+    smoke: options.authorization?.smoke === true
+  });
   const mail = await agentMailClient();
   const res = await agentMailCall('replyMessage', () => mail.inboxes.messages.reply(inboxId, messageId, compact({
     labels,
@@ -172,7 +202,7 @@ export async function replyAgentMailMessage({
     text,
     html,
     attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined
-  }), requestOptions(options)));
+  }), sideEffectRequestOptions(options)));
 
   const normalized = normalizeAgentMailSendResult(res, { inboxId, subject, repliedToMessageId: messageId });
   if (leadId) {
@@ -291,7 +321,10 @@ export async function smokeAgentMailSend({
     };
   }
 
-  const result = await sendAgentMailMessage({ toEmail, subject, text }, { maxRetries: 1, timeoutSeconds: 10 });
+  const result = await sendAgentMailMessage(
+    { toEmail, subject, text },
+    { maxRetries: 1, timeoutSeconds: 10, authorization: { smoke: true } }
+  );
   return {
     provider: PROVIDER,
     status: 'ok',
@@ -402,6 +435,12 @@ function requestOptions({ timeoutSeconds = DEFAULT_TIMEOUT_SECONDS, maxRetries =
     maxRetries,
     abortSignal
   });
+}
+
+function sideEffectRequestOptions(options = {}) {
+  // Provider-internal retries cannot re-evaluate pause/lease/readiness and may
+  // duplicate a send. Let the durable job ledger perform fenced retries.
+  return requestOptions({ ...options, maxRetries: 0 });
 }
 
 async function agentMailCall(action, fn) {

@@ -2,6 +2,7 @@ import { env, modeAllowsSideEffect } from '../env.js';
 import { log } from '../logger.js';
 import { normalizePhone } from '../compliance.js';
 import { fetchJson, normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 
 const PROVIDER = 'agentphone';
 const AGENT_NAME = 'callmemaybe-agent-v1';
@@ -192,11 +193,21 @@ export async function placeAgentPhoneCall({
   initialGreeting,
   voice,
   variables,
+  authorization = {},
   config = env.agentphone
 } = {}) {
   requireAgentPhone(config);
   if (!agentId) throw new Error('AgentPhone call requires agentId');
   if (!toNumber) throw new Error('AgentPhone call requires toNumber');
+  if (authorization?.signal?.aborted) throw authorization.signal.reason || new Error('AgentPhone call canceled');
+  // Re-evaluate at the actual placement boundary. An earlier worker decision
+  // can become stale while agent/voice setup is running.
+  requireLiveSideEffectAuthorization({
+    action: 'call',
+    leadId: authorization.leadId || null,
+    job: authorization.job || null,
+    smoke: authorization.smoke === true
+  });
 
   const body = compactObject({
     agentId,
@@ -489,7 +500,8 @@ export async function agentPhoneOwnedNumberSmoke({
     toNumber: normalized,
     voice: verifiedVoice.id,
     initialGreeting: 'Hi, this is a callmemaybe owned-number smoke test. This call is automated and recorded.',
-    systemPrompt: 'Say this is a smoke test, ask whether audio is clear, then end politely.'
+    systemPrompt: 'Say this is a smoke test, ask whether audio is clear, then end politely.',
+    authorization: { smoke: true }
   });
   return {
     provider: PROVIDER,

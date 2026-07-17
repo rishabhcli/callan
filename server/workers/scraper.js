@@ -10,6 +10,7 @@ import { queueLeadForOutreach } from '../outreach.js';
 import { scoreOnlinePresence } from '../presenceScorer.js';
 import { enrichBusinessProfile } from '../profileEnrichment.js';
 import { browserResearchLiveEnabled, discoverBrowserUseResearchProfiles } from '../research/browserUseSwarm.js';
+import { fetchSafePublicText } from '../providers/browserUse.js';
 
 const MOCK_SYSTEM = 'You invent plausible small-business records for hackathon demos. Match the requested niche and city exactly. Never repeat names. Evaluate online presence strength honestly. Include services, provenance, presence evidence, leadIntelligence with cited review themes, positive proof, pain points, missing customer info, competitor gaps, website issues, listing consistency, CTA, scores, and a null notWorthCallingReason unless presence is strong. Do not invent external URLs or contact emails; use null for external URL/email fields in mock data. Output ONLY JSON matching the provided schema.';
 const NORMALIZE_SYSTEM = 'Normalize raw research into a BusinessProfile. Evaluate whether the business has no, weak, mixed, or strong online presence. Capture what the business does, what it likely needs, public phone/address provenance, website/social/listing evidence, business hours, services, reasons, a 0-1 confidence score, leadIntelligence with every claim cited to source evidence/source ids, and explicit notWorthCallingReason when strong enough to block outreach. Never invent a website URL or contact email; only include URLs/emails visible in the provided source text. Output ONLY JSON matching the provided schema.';
@@ -23,12 +24,6 @@ const WEBSITE_NONE_RE = /\b(none|not shown|not listed|no website|n\/a|missing)\b
 const URL_RE = /https?:\/\/[^\s)"'<>]+/gi;
 const PHONE_RE = /(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/;
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-
-const DIRECT_HEADERS = {
-  'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'accept-language': 'en-US,en;q=0.9',
-  'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
-};
 
 const DIRECTORY_SOURCES = [
   {
@@ -218,8 +213,11 @@ export async function runScraper({ niche, city, count = 4 }) {
 }
 
 function pickMode() {
-  if (['autonomous_live', 'production_live'].includes(env.runMode) && canStartBrowserSession() && browserResearchLiveEnabled()) return 'live';
-  return 'mock';
+  if (env.runMode === 'mock') return 'mock';
+  if (canStartBrowserSession() && browserResearchLiveEnabled()) return 'live';
+  const error = new Error(`live research refused: ${env.runMode} does not have an enabled Browser Use research path`);
+  error.code = 'LIVE_RESEARCH_PATH_DISABLED';
+  throw error;
 }
 
 async function safeAddProfileDoc(containerTag, profile, metadata) {
@@ -1111,19 +1109,7 @@ function mockSourceUrl({ city, niche, index }) {
 }
 
 async function fetchText(url, { timeoutMs }) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      headers: DIRECT_HEADERS,
-      signal: controller.signal,
-      redirect: 'follow'
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
-  }
+  return fetchSafePublicText(url, timeoutMs);
 }
 
 function parseJsonBlock(text) {

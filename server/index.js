@@ -1,11 +1,11 @@
 import express from 'express';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { env, isValidRunMode } from './env.js';
 import { log } from './logger.js';
 import { attachStream, emit } from './sse.js';
-import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, accountManagerPlans, accountTasks, handoffCases, portfolioOperatingModel, portfolioOperatorInbox } from './db.js';
+import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, portalTokens, accountManagerPlans, accountTasks, handoffCases, portfolioOperatingModel, portfolioOperatorInbox } from './db.js';
 import { marginForLead } from './costs.js';
 import { DiscoverRequest, CallRequest, FollowupRequest, BuildRequest } from './types.js';
 import {
@@ -136,6 +136,8 @@ import { OPS_BACKUP_JOB_TYPE, OPS_PROVIDER_POSTURE_JOB_TYPE, OPS_RECOVER_STUCK_J
 import { SAFE_TO_SELL_JOB_TYPE, buildProviderProofMatrix, buildSafeToSellDecisionReceipt, buildSafeToSellNextActions, compactSafeToSellReceiptHistory, enqueueSafeToSellSelfCheck, runSafeToSellSelfCheck, safeToSellSnapshotStatus, startSafeToSellSelfCheckScheduler, stopSafeToSellSelfCheckScheduler } from './safeToSell.js';
 import { SAFE_TO_RENEW_JOB_TYPE, buildSafeToRenewStatus, compactSafeToRenewReceiptHistory, enqueueSafeToRenewSelfCheck, runSafeToRenewSelfCheck, safeToRenewSnapshotStatus, startSafeToRenewSelfCheckScheduler, stopSafeToRenewSelfCheckScheduler } from './safeToRenew.js';
 import { adminAuthPosture, isOperatorProtectedRequest, requireAdmin } from './adminAuth.js';
+import { sendAgentMailMessage } from './providers/agentmail.js';
+import { startDataRetentionScheduler, stopDataRetentionScheduler } from './dataLifecycle.js';
 import { startAgentMailPoller, stopAgentMailPoller } from './agentmailPoller.js';
 import { aggregateLeadMarketOpportunities, planLaunchFromMarketOpportunity, recordMarketRecommendationOutcome } from './portfolio.js';
 
@@ -161,6 +163,13 @@ const scopedLinkLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { ok: false, code: 'SCOPED_LINK_RATE_LIMITED', error: 'too many requests; try again later' }
+});
+const portalVerificationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { ok: false, code: 'PORTAL_VERIFICATION_RATE_LIMITED', error: 'too many verification requests; try again later' }
 });
 
 if (!isValidRunMode(env.runMode)) {
@@ -188,10 +197,15 @@ app.use(helmet({
       frameAncestors: ["'none'"],
       frameSrc: [
         "'self'",
-        'https:',
+        ...(env.security?.previewFrameSources || []),
         ...(env.nodeEnv === 'production' ? [] : ['http://localhost:*', 'http://127.0.0.1:*'])
       ],
-      imgSrc: ["'self'", 'data:', 'https:'],
+      imgSrc: [
+        "'self'",
+        'data:',
+        ...(env.security?.previewImageSources || []),
+        ...(env.nodeEnv === 'production' ? [] : ['https:'])
+      ],
       objectSrc: ["'none'"],
       scriptSrc: ["'self'", (_req, res) => `'nonce-${res.locals.cspNonce}'`],
       scriptSrcAttr: ["'none'"],
@@ -214,10 +228,49 @@ app.use('/api', (_req, res, next) => {
 app.use('/api/referrals/leads', publicIntakeLimiter);
 app.use('/api/hosting/accept', publicIntakeLimiter);
 app.use('/api/share/build', scopedLinkLimiter);
+app.use('/api/share/build', (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase())) return next();
+  const fetchSite = String(req.get('sec-fetch-site') || '').toLowerCase();
+  const origin = String(req.get('origin') || '').trim();
+  if (fetchSite === 'cross-site') {
+    return res.status(403).json({ ok: false, code: 'PORTAL_CSRF_BLOCKED', error: 'cross-site portal mutations are not allowed' });
+  }
+  if (origin) {
+    try {
+      if (!portalOriginAllowed(origin)) {
+        return res.status(403).json({ ok: false, code: 'PORTAL_CSRF_BLOCKED', error: 'portal request origin is not allowed' });
+      }
+    } catch {
+      return res.status(403).json({ ok: false, code: 'PORTAL_CSRF_BLOCKED', error: 'portal request origin is invalid' });
+    }
+  }
+  return next();
+});
+
+function portalOriginAllowed(origin) {
+  const candidate = new URL(origin);
+  const configured = new URL(env.publicUrl);
+  if (candidate.origin === configured.origin) return true;
+  if (env.nodeEnv === 'production') return false;
+  const local = new Set(['localhost', '127.0.0.1', '::1']);
+  return local.has(candidate.hostname) && local.has(configured.hostname);
+}
 
 app.use((req, res, next) => {
   if (!isOperatorProtectedRequest(req)) return next();
-  return adminLimiter(req, res, () => requireAdmin(req, res, next));
+  return adminLimiter(req, res, () => requireAdmin(req, res, () => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(req.method || '').toUpperCase())) {
+      auditTrail.add({
+        event_type: 'operator.api_mutation',
+        actor: req.operatorAuth?.id || 'unknown_operator',
+        entity_type: 'api_route',
+        entity_id: String(req.path || req.originalUrl || '').slice(0, 240),
+        action: String(req.method || '').toUpperCase(),
+        metadata: { role: req.operatorAuth?.role || null, attributable: req.operatorAuth?.attributable === true }
+      });
+    }
+    next();
+  }));
 });
 
 const fire = (worker, args, _fn, options = {}) => {
@@ -5497,6 +5550,63 @@ function portalActionFailed(res, eventType, err, metadata = {}) {
   res.status(status).json({ error: err?.message || 'portal_action_failed' });
 }
 
+function portalLogContext(access) {
+  return {
+    portalTokenId: access?.tokenRow?.id || null,
+    leadId: access?.lead?.id || null
+  };
+}
+
+function rotatePortalAfterSensitiveAction(access, result, reason) {
+  const rotated = portalTokens.rotate({
+    lead_id: access.lead.id,
+    purpose: access.tokenRow?.purpose || 'build_share',
+    metadata: { source: 'sensitive_portal_action' },
+    reason
+  });
+  return {
+    ...result,
+    portalRotation: {
+      tokenId: rotated.row?.id || null,
+      url: `/share/build/${encodeURIComponent(rotated.token)}`,
+      reason
+    }
+  };
+}
+
+function requireRecentPortalEmailVerification(access, res) {
+  if (env.runMode !== 'production_live') return true;
+  const status = portalTokens.sensitiveVerificationStatus({ id: access.tokenRow?.id });
+  if (status.ok) return true;
+  res.status(428).json({
+    ok: false,
+    code: 'PORTAL_VERIFICATION_REQUIRED',
+    error: 'A recent email verification code is required for this sensitive action.'
+  });
+  return false;
+}
+
+function portalVerificationEmail(leadId) {
+  const payment = db.prepare(`
+    SELECT customer_email AS email
+    FROM payments
+    WHERE lead_id = ? AND customer_email IS NOT NULL AND TRIM(customer_email) <> ''
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(leadId);
+  const intake = db.prepare(`SELECT contact_email AS email FROM customer_intake WHERE lead_id = ?`).get(leadId);
+  for (const value of [payment?.email, intake?.email]) {
+    const email = String(value || '').trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return email;
+  }
+  return null;
+}
+
+function maskPortalEmail(email) {
+  const [local = '', domain = ''] = String(email || '').split('@');
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
 function customerCommerceState(commerce) {
   if (!commerce?.plan) return null;
   return {
@@ -5542,20 +5652,52 @@ app.get('/api/share/build/:token', (req, res) => {
       commerce: customerCommerceState(commerce)
     });
   } catch (err) {
-    log.warn('portal.state_failed', { token: req.params.token, error: err?.message || String(err) });
+    log.warn('portal.state_failed', { portalTokenId: access.tokenRow?.id || null, leadId: access.lead?.id || null, error: err?.message || String(err) });
     res.status(500).json({ error: err?.message || 'portal_state_failed' });
   }
 });
 
 // Customer-portal POST endpoints (token-scoped, auditable, idempotent where providers allow).
+app.post('/api/share/build/:token/verification/request', portalVerificationLimiter, async (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  const email = portalVerificationEmail(access.lead.id);
+  if (!email) {
+    return res.status(409).json({ ok: false, code: 'PORTAL_VERIFICATION_EMAIL_MISSING', error: 'A confirmed customer email is required before this action.' });
+  }
+  const code = String(randomInt(100000, 1000000));
+  try {
+    portalTokens.beginSensitiveVerification({ id: access.tokenRow.id, code });
+    await sendAgentMailMessage({
+      toEmail: email,
+      subject: 'Your Callan verification code',
+      text: `Your Callan verification code is ${code}. It expires in 10 minutes. If you did not request this, ignore this email.`,
+      leadId: access.lead.id,
+      costKind: 'portal_sensitive_action_verification'
+    });
+    return res.json({ ok: true, sentTo: maskPortalEmail(email), expiresInSeconds: 600 });
+  } catch (err) {
+    portalActionFailed(res, 'portal.verification_send_failed', err, portalLogContext(access));
+  }
+});
+
+app.post('/api/share/build/:token/verification/confirm', (req, res) => {
+  const access = portalAccessForRequest(req, res);
+  if (!access) return;
+  const result = portalTokens.confirmSensitiveVerification({ id: access.tokenRow.id, code: req.body?.code });
+  if (!result.ok) return res.status(400).json({ ok: false, code: 'PORTAL_VERIFICATION_FAILED', error: result.reason });
+  return res.json({ ok: true, verifiedAt: result.verifiedAt });
+});
+
 app.post('/api/share/build/:token/accept', async (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = await portalAcceptQuote({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'quote_accepted'));
   } catch (err) {
-    portalActionFailed(res, 'portal.accept_quote_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.accept_quote_failed', err, portalLogContext(access));
   }
 });
 
@@ -5568,22 +5710,23 @@ app.post('/api/share/build/:token/edit', async (req, res) => {
     const result = await portalRequestRevision({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null, note });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.request_edit_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.request_edit_failed', err, portalLogContext(access));
   }
 });
 
 app.post('/api/share/build/:token/approve-launch', async (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = await portalApproveLaunch({
       leadId: access.lead.id,
       tokenId: access.tokenRow?.id || null,
       notes: req.body?.notes || ''
     });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'launch_approved'));
   } catch (err) {
-    portalActionFailed(res, 'portal.approve_launch_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.approve_launch_failed', err, portalLogContext(access));
   }
 });
 
@@ -5598,37 +5741,39 @@ app.post('/api/share/build/:token/intake', async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.update_intake_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.update_intake_failed', err, portalLogContext(access));
   }
 });
 
 app.post('/api/share/build/:token/scope/approve', (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = portalApproveScope({
       leadId: access.lead.id,
       tokenId: access.tokenRow?.id || null,
       notes: req.body?.notes || ''
     });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'scope_approved'));
   } catch (err) {
-    portalActionFailed(res, 'portal.approve_scope_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.approve_scope_failed', err, portalLogContext(access));
   }
 });
 
 app.post('/api/share/build/:token/launch/approve', async (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = await portalApproveLaunch({
       leadId: access.lead.id,
       tokenId: access.tokenRow?.id || null,
       notes: req.body?.notes || ''
     });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'launch_approved'));
   } catch (err) {
-    portalActionFailed(res, 'portal.approve_launch_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.approve_launch_failed', err, portalLogContext(access));
   }
 });
 
@@ -5646,7 +5791,7 @@ app.post('/api/share/build/:token/revision', async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.request_revision_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.request_revision_failed', err, portalLogContext(access));
   }
 });
 
@@ -5663,7 +5808,7 @@ app.post('/api/share/build/:token/asset', async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.record_asset_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.record_asset_failed', err, portalLogContext(access));
   }
 });
 
@@ -5684,7 +5829,7 @@ app.post('/api/share/build/:token/callback', (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.book_callback_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.book_callback_failed', err, portalLogContext(access));
   }
 });
 
@@ -5704,7 +5849,7 @@ app.post('/api/share/build/:token/commerce', async (req, res) => {
       contactEventId: result.contactEventId
     });
   } catch (err) {
-    portalActionFailed(res, 'portal.commerce_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.commerce_failed', err, portalLogContext(access));
   }
 });
 
@@ -5720,13 +5865,14 @@ app.post('/api/share/build/:token/renewal/review', (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.renewal_review_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.renewal_review_failed', err, portalLogContext(access));
   }
 });
 
 app.post('/api/share/build/:token/renewal/change-request', (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = portalRequestRenewalChange({
       leadId: access.lead.id,
@@ -5735,9 +5881,9 @@ app.post('/api/share/build/:token/renewal/change-request', (req, res) => {
       note: req.body?.note || '',
       requestType: req.body?.requestType || 'change'
     });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'renewal_change_requested'));
   } catch (err) {
-    portalActionFailed(res, 'portal.renewal_change_request_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.renewal_change_request_failed', err, portalLogContext(access));
   }
 });
 
@@ -5753,13 +5899,14 @@ app.post('/api/share/build/:token/renewal/confirmations/:confirmationId/acknowle
     });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.renewal_confirmation_acknowledge_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.renewal_confirmation_acknowledge_failed', err, portalLogContext(access));
   }
 });
 
 app.post('/api/share/build/:token/renewal/confirmations/:confirmationId/accept', (req, res) => {
   const access = portalAccessForRequest(req, res);
   if (!access) return;
+  if (!requireRecentPortalEmailVerification(access, res)) return;
   try {
     const result = portalAcceptRenewalCustomerConfirmation({
       leadId: access.lead.id,
@@ -5767,9 +5914,9 @@ app.post('/api/share/build/:token/renewal/confirmations/:confirmationId/accept',
       confirmationId: req.params.confirmationId,
       note: req.body?.note || ''
     });
-    res.json(result);
+    res.json(rotatePortalAfterSensitiveAction(access, result, 'renewal_confirmation_accepted'));
   } catch (err) {
-    portalActionFailed(res, 'portal.renewal_confirmation_accept_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.renewal_confirmation_accept_failed', err, portalLogContext(access));
   }
 });
 
@@ -5781,7 +5928,7 @@ app.post('/api/share/build/:token/opt-out', (req, res) => {
     const result = portalOptOut({ leadId: access.lead.id, tokenId: access.tokenRow?.id || null, reason });
     res.json(result);
   } catch (err) {
-    portalActionFailed(res, 'portal.opt_out_failed', err, { token: req.params.token });
+    portalActionFailed(res, 'portal.opt_out_failed', err, portalLogContext(access));
   }
 });
 
@@ -5876,7 +6023,7 @@ app.use('/api', (req, res) => {
     code: 'API_NOT_FOUND',
     error: 'API route not found',
     method: req.method,
-    path: req.path
+    path: safeRequestPath(req)
   });
 });
 
@@ -5892,7 +6039,7 @@ app.use((err, req, res, _next) => {
   const safeStatus = status >= 400 && status < 600 ? status : 500;
   log.error('http.request_failed', {
     method: req.method,
-    path: req.path,
+    path: safeRequestPath(req),
     status: safeStatus,
     error: err?.message || String(err)
   });
@@ -5905,6 +6052,12 @@ app.use((err, req, res, _next) => {
   });
 });
 
+function safeRequestPath(req) {
+  return String(req?.path || req?.originalUrl || '')
+    .replace(/(\/api\/share\/build\/)[^/?#]+/i, '$1:token')
+    .replace(/(\/share\/build\/)[^/?#]+/i, '$1:token');
+}
+
 const httpServer = app.listen(env.port, () => {
   log.info(`callmemaybe server listening`, { port: env.port, mode: env.runMode });
   startDurableJobLoop(durableJobHandlers);
@@ -5912,6 +6065,11 @@ const httpServer = app.listen(env.port, () => {
     log.info('ops.backup_scheduler_start', startOpsBackupScheduler());
   } catch (err) {
     log.warn('ops.backup_scheduler_start_failed', { error: err?.message || String(err) });
+  }
+  try {
+    log.info('privacy.retention_scheduler_start', startDataRetentionScheduler());
+  } catch (err) {
+    log.warn('privacy.retention_scheduler_start_failed', { error: err?.message || String(err) });
   }
   try {
     log.info('ops.provider_posture_scheduler_start', startProviderPostureScheduler());
@@ -5992,6 +6150,7 @@ function shutdown(signal) {
     () => stopOutreachLoop({ reason: `process_${String(signal).toLowerCase()}` }),
     () => stopDurableJobLoop(),
     () => stopOpsBackupScheduler(),
+    () => stopDataRetentionScheduler(),
     () => stopProviderPostureScheduler(),
     () => stopOpsRecoveryScheduler(),
     () => stopRetentionCommandLeaseMaintenanceScheduler(),

@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { env } from './env.js';
@@ -62,6 +62,8 @@ db.exec(`
     locked_by TEXT,
     locked_at INTEGER,
     lease_expires_at INTEGER,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_at INTEGER,
     error TEXT,
     result_json TEXT,
     idempotency_key TEXT,
@@ -225,6 +227,11 @@ db.exec(`
     id TEXT PRIMARY KEY,
     lead_id TEXT NOT NULL,
     token TEXT NOT NULL UNIQUE,
+    token_hash TEXT,
+    verification_code_hash TEXT,
+    verification_expires_at INTEGER,
+    verification_attempts INTEGER NOT NULL DEFAULT 0,
+    sensitive_verified_at INTEGER,
     purpose TEXT NOT NULL DEFAULT 'build_share',
     status TEXT NOT NULL DEFAULT 'active',
     expires_at INTEGER NOT NULL,
@@ -299,6 +306,7 @@ db.exec(`
     live_smoke_count INTEGER NOT NULL DEFAULT 0,
     blocker_count INTEGER NOT NULL DEFAULT 0,
     report_json TEXT NOT NULL,
+    signature TEXT,
     generated_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
@@ -6005,6 +6013,14 @@ db.exec(`
 `);
 
 ensureColumn('leads', 'research_status', "TEXT NOT NULL DEFAULT 'new'");
+ensureColumn('jobs', 'lease_generation', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('jobs', 'last_heartbeat_at', 'INTEGER');
+ensureColumn('portal_tokens', 'token_hash', 'TEXT');
+ensureColumn('portal_tokens', 'verification_code_hash', 'TEXT');
+ensureColumn('portal_tokens', 'verification_expires_at', 'INTEGER');
+ensureColumn('portal_tokens', 'verification_attempts', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('portal_tokens', 'sensitive_verified_at', 'INTEGER');
+ensureColumn('safe_to_sell_reports', 'signature', 'TEXT');
 ensureColumn('leads', 'outreach_status', "TEXT NOT NULL DEFAULT 'not_queued'");
 ensureColumn('leads', 'risk_status', "TEXT NOT NULL DEFAULT 'unknown'");
 ensureColumn('leads', 'consent_status', "TEXT NOT NULL DEFAULT 'unknown'");
@@ -39384,7 +39400,9 @@ export const leads = {
   }
 };
 
-const DEFAULT_PORTAL_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_tokens_token_hash ON portal_tokens(token_hash) WHERE token_hash IS NOT NULL`);
+
+const DEFAULT_PORTAL_TOKEN_TTL_MS = Math.max(1, Number(env.portal?.tokenTtlHours) || 168) * 60 * 60 * 1000;
 
 export const portalTokens = {
   ensureActive({ lead_id, purpose = 'build_share', expiresInMs = DEFAULT_PORTAL_TOKEN_TTL_MS, metadata = null, now = Date.now() } = {}) {
@@ -39398,16 +39416,22 @@ export const portalTokens = {
       ORDER BY created_at DESC
       LIMIT 1
     `).get(lead_id, purpose, now);
-    if (existing) return { token: existing.token, row: hydratePortalToken(existing), reused: true };
+    if (existing) {
+      const recovered = recoverPortalToken(existing);
+      if (recovered) return { token: recovered, row: hydratePortalToken(existing), reused: true };
+      db.prepare(`UPDATE portal_tokens SET status = 'revoked' WHERE id = ?`).run(existing.id);
+    }
 
-    const token = portalTokenValue();
     const id = portalTokenId();
+    const tokenRecord = { id, lead_id, purpose, created_at: now };
+    const token = portalTokenValue(tokenRecord);
+    const tokenHash = portalTokenDigest(token);
     const expiresAt = now + Math.max(60_000, Number(expiresInMs) || DEFAULT_PORTAL_TOKEN_TTL_MS);
     db.prepare(`
       INSERT INTO portal_tokens (
-        id, lead_id, token, purpose, status, expires_at, created_at, metadata_json
-      ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
-    `).run(id, lead_id, token, purpose, expiresAt, now, jsonText(metadata));
+        id, lead_id, token, token_hash, purpose, status, expires_at, created_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    `).run(id, lead_id, portalTokenMarker(tokenHash), tokenHash, purpose, expiresAt, now, jsonText(metadata));
     insertAuditEvent({
       created_at: now,
       event_type: 'portal.token.created',
@@ -39481,8 +39505,19 @@ export const portalTokens = {
     const raw = String(token || '').trim();
     if (!raw) return { ok: false, reason: 'token_required', row: null, lead: null };
     this.expireStale(now);
-    const row = db.prepare(`SELECT * FROM portal_tokens WHERE token = ?`).get(raw);
+    const digest = portalTokenDigest(raw);
+    const row = db.prepare(`
+      SELECT * FROM portal_tokens
+      WHERE token_hash = ? OR (token_hash IS NULL AND token = ?)
+      LIMIT 1
+    `).get(digest, raw);
     if (!row) return { ok: false, reason: 'not_found', row: null, lead: null };
+    if (!row.token_hash) {
+      db.prepare(`UPDATE portal_tokens SET token = ?, token_hash = ? WHERE id = ?`)
+        .run(portalTokenMarker(digest), digest, row.id);
+      row.token = portalTokenMarker(digest);
+      row.token_hash = digest;
+    }
     if (row.status !== 'active') return { ok: false, reason: row.status || 'inactive', row: hydratePortalToken(row), lead: null };
     if (row.expires_at <= now) {
       db.prepare(`UPDATE portal_tokens SET status = 'expired' WHERE id = ? AND status = 'active'`).run(row.id);
@@ -39516,6 +39551,42 @@ export const portalTokens = {
       dedupe_key: `trust_portal_token:${row.id}:first_used`
     });
     return { ok: true, reason: 'active', row: hydratePortalToken({ ...row, last_used_at: now }), lead: leads.get(row.lead_id) };
+  },
+  beginSensitiveVerification({ id, code, expiresInMs = 10 * 60 * 1000, now = Date.now() } = {}) {
+    if (!id || !code) throw new Error('portal token id and verification code are required');
+    const row = db.prepare(`SELECT * FROM portal_tokens WHERE id = ?`).get(id);
+    if (!row || row.status !== 'active' || row.expires_at <= now) throw new Error('active portal token required');
+    const expiresAt = now + Math.max(60_000, Number(expiresInMs) || 10 * 60 * 1000);
+    db.prepare(`
+      UPDATE portal_tokens
+      SET verification_code_hash = ?, verification_expires_at = ?, verification_attempts = 0, sensitive_verified_at = NULL
+      WHERE id = ?
+    `).run(portalVerificationDigest(id, code), expiresAt, id);
+    return { tokenId: id, expiresAt };
+  },
+  confirmSensitiveVerification({ id, code, now = Date.now() } = {}) {
+    const row = db.prepare(`SELECT * FROM portal_tokens WHERE id = ?`).get(id);
+    if (!row || row.status !== 'active' || row.expires_at <= now) return { ok: false, reason: 'inactive_portal_token' };
+    if (!row.verification_code_hash || !row.verification_expires_at) return { ok: false, reason: 'verification_not_requested' };
+    if (row.verification_expires_at <= now) return { ok: false, reason: 'verification_expired' };
+    if (Number(row.verification_attempts || 0) >= 5) return { ok: false, reason: 'verification_attempts_exhausted' };
+    const matches = constantTimeStringEqual(row.verification_code_hash, portalVerificationDigest(id, code));
+    if (!matches) {
+      db.prepare(`UPDATE portal_tokens SET verification_attempts = verification_attempts + 1 WHERE id = ?`).run(id);
+      return { ok: false, reason: 'verification_code_invalid' };
+    }
+    db.prepare(`
+      UPDATE portal_tokens
+      SET sensitive_verified_at = ?, verification_code_hash = NULL, verification_expires_at = NULL, verification_attempts = 0
+      WHERE id = ?
+    `).run(now, id);
+    return { ok: true, tokenId: id, verifiedAt: now };
+  },
+  sensitiveVerificationStatus({ id, maxAgeMs = 15 * 60 * 1000, now = Date.now() } = {}) {
+    const row = db.prepare(`SELECT status, expires_at, sensitive_verified_at FROM portal_tokens WHERE id = ?`).get(id);
+    const verifiedAt = Number(row?.sensitive_verified_at || 0) || null;
+    const ok = row?.status === 'active' && row.expires_at > now && verifiedAt && now - verifiedAt <= Math.max(60_000, Number(maxAgeMs) || 15 * 60 * 1000);
+    return { ok: Boolean(ok), tokenId: id || null, verifiedAt, maxAgeMs, reason: ok ? null : 'recent_email_verification_required' };
   },
   expireStale(now = Date.now()) {
     return db.prepare(`
@@ -39942,6 +40013,8 @@ export const durableJobs = {
             locked_by = ?,
             locked_at = ?,
             lease_expires_at = ?,
+            lease_generation = COALESCE(lease_generation, 0) + 1,
+            last_heartbeat_at = ?,
             error = NULL,
             updated_at = ?
         WHERE id = ?
@@ -39949,13 +40022,47 @@ export const durableJobs = {
             (status IN ('queued', 'retry') AND next_attempt_at <= ?)
             OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
           )
-      `).run(workerId || 'job-worker', now, leaseExpiresAt, now, row.id, now, now);
+      `).run(workerId || 'job-worker', now, leaseExpiresAt, now, now, row.id, now, now);
       if (info.changes <= 0) return null;
       return db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(row.id);
     });
     return hydrateJob(claimOne());
   },
-  complete(id, { result, now = Date.now() } = {}) {
+  renewLease(id, {
+    workerId,
+    leaseGeneration,
+    leaseMs = 5 * 60 * 1000,
+    now = Date.now()
+  } = {}) {
+    if (!id || !workerId || !Number.isFinite(Number(leaseGeneration))) return null;
+    const leaseExpiresAt = now + Math.max(1_000, Number(leaseMs) || 5 * 60 * 1000);
+    const info = db.prepare(`
+      UPDATE jobs
+      SET lease_expires_at = ?, last_heartbeat_at = ?, updated_at = ?
+      WHERE id = ?
+        AND status = 'running'
+        AND locked_by = ?
+        AND lease_generation = ?
+        AND lease_expires_at > ?
+    `).run(leaseExpiresAt, now, now, id, workerId, Number(leaseGeneration), now);
+    return info.changes > 0 ? hydrateJob(this.get(id)) : null;
+  },
+  ownsLease({ id, workerId, leaseGeneration, now = Date.now() } = {}) {
+    if (!id || !workerId || !Number.isFinite(Number(leaseGeneration))) return false;
+    const row = db.prepare(`
+      SELECT 1 AS owned
+      FROM jobs
+      WHERE id = ?
+        AND status = 'running'
+        AND locked_by = ?
+        AND lease_generation = ?
+        AND lease_expires_at > ?
+      LIMIT 1
+    `).get(id, workerId, Number(leaseGeneration), now);
+    return row?.owned === 1;
+  },
+  complete(id, { result, now = Date.now(), workerId = null, leaseGeneration = null } = {}) {
+    const fenced = workerId && Number.isFinite(Number(leaseGeneration));
     db.prepare(`
       UPDATE jobs
       SET status = 'completed',
@@ -39967,7 +40074,14 @@ export const durableJobs = {
           updated_at = ?,
           finished_at = ?
       WHERE id = ?
-    `).run(result === undefined ? null : JSON.stringify(result), now, now, id);
+        ${fenced ? "AND status = 'running' AND locked_by = ? AND lease_generation = ? AND lease_expires_at > ?" : ''}
+    `).run(
+      result === undefined ? null : JSON.stringify(result),
+      now,
+      now,
+      id,
+      ...(fenced ? [workerId, Number(leaseGeneration), now] : [])
+    );
     return hydrateJob(this.get(id));
   },
   fail(id, {
@@ -39976,13 +40090,16 @@ export const durableJobs = {
     retryable,
     now = Date.now(),
     baseDelayMs = 30_000,
-    maxDelayMs = 15 * 60 * 1000
+    maxDelayMs = 15 * 60 * 1000,
+    workerId = null,
+    leaseGeneration = null
   } = {}) {
     const row = this.get(id);
     if (!row) return null;
     const terminal = retryable === false || row.attempts >= row.max_attempts;
     const retryDelay = terminal ? 0 : retryDelayFor(row.attempts, { baseDelayMs, maxDelayMs });
     const nextStatus = terminal ? 'failed' : 'retry';
+    const fenced = workerId && Number.isFinite(Number(leaseGeneration));
     db.prepare(`
       UPDATE jobs
       SET status = ?,
@@ -39995,6 +40112,7 @@ export const durableJobs = {
           updated_at = ?,
           finished_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END
       WHERE id = ?
+        ${fenced ? "AND status = 'running' AND locked_by = ? AND lease_generation = ? AND lease_expires_at > ?" : ''}
     `).run(
       nextStatus,
       normalizeJobError(error),
@@ -40003,7 +40121,8 @@ export const durableJobs = {
       now,
       nextStatus,
       now,
-      id
+      id,
+      ...(fenced ? [workerId, Number(leaseGeneration), now] : [])
     );
     return hydrateJob(this.get(id));
   },
@@ -46139,14 +46258,16 @@ export const safeToSellReports = {
       blocker_count: Array.isArray(report.stillBlocked) ? report.stillBlocked.length : 0,
       report_json: jsonText(redactedReport) || '{}',
       generated_at: generatedAt,
-      created_at: now
+      created_at: now,
+      signature: null
     };
+    row.signature = signSafeToSellRow(row);
     db.prepare(`
       INSERT INTO safe_to_sell_reports (
-        id, ok, mode, command, dry_run_count, live_smoke_count, blocker_count, report_json, generated_at, created_at
+        id, ok, mode, command, dry_run_count, live_smoke_count, blocker_count, report_json, generated_at, created_at, signature
       )
       VALUES (
-        @id, @ok, @mode, @command, @dry_run_count, @live_smoke_count, @blocker_count, @report_json, @generated_at, @created_at
+        @id, @ok, @mode, @command, @dry_run_count, @live_smoke_count, @blocker_count, @report_json, @generated_at, @created_at, @signature
       )
     `).run(row);
     return hydrateSafeToSellReport(row);
@@ -46158,6 +46279,11 @@ export const safeToSellReports = {
       ORDER BY generated_at DESC, created_at DESC
       LIMIT 1
     `).get());
+  },
+  verify(id) {
+    const row = db.prepare(`SELECT * FROM safe_to_sell_reports WHERE id = ?`).get(id);
+    if (!row?.signature) return false;
+    return constantTimeStringEqual(row.signature, signSafeToSellRow(row));
   },
   list({ since = 0, limit = 25 } = {}) {
     const checkedSince = Math.max(0, Number(since) || 0);
@@ -46203,8 +46329,23 @@ function hydrateSafeToSellReport(row) {
     blockerCount: row.blocker_count,
     generatedAt: row.generated_at,
     createdAt: row.created_at,
+    signature: row.signature || null,
     report: safeJson(row.report_json) || {}
   };
+}
+
+function signSafeToSellRow(row) {
+  const secret = env.safety?.interlockSecret || env.portal?.tokenSecret || env.admin?.apiToken || 'callan-local-development-only-interlock-secret';
+  const payload = [row.id, row.ok, row.mode, row.report_json, row.generated_at, row.created_at]
+    .map((value) => String(value ?? ''))
+    .join('\n');
+  return createHmac('sha256', secret).update(payload).digest('hex');
+}
+
+function constantTimeStringEqual(left, right) {
+  const a = Buffer.from(String(left || ''));
+  const b = Buffer.from(String(right || ''));
+  return a.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 
 export const safeToRenewReports = {
@@ -66572,8 +66713,38 @@ function portalTokenId() {
   return `ptok_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
 }
 
-function portalTokenValue() {
-  return `pt_${randomBytes(32).toString('base64url')}`;
+function portalTokenValue(row = {}) {
+  const secret = env.portal?.tokenSecret || env.admin?.apiToken || 'callan-local-development-only-portal-secret';
+  const material = [row.id, row.lead_id, row.purpose, row.created_at].map((part) => String(part || '')).join(':');
+  return `pt_${createHmac('sha256', secret).update(material).digest('base64url')}`;
+}
+
+function portalTokenDigest(token) {
+  return createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function portalTokenMarker(digest) {
+  return `sha256:${digest}`;
+}
+
+function portalVerificationDigest(tokenId, code) {
+  const secret = env.portal?.tokenSecret || env.admin?.apiToken || 'callan-local-development-only-portal-secret';
+  return createHmac('sha256', secret).update(`${tokenId}:${String(code || '').trim()}`).digest('hex');
+}
+
+function recoverPortalToken(row) {
+  if (!row) return null;
+  if (!row.token_hash && row.token && !String(row.token).startsWith('sha256:')) {
+    const raw = String(row.token);
+    const digest = portalTokenDigest(raw);
+    db.prepare(`UPDATE portal_tokens SET token = ?, token_hash = ? WHERE id = ?`)
+      .run(portalTokenMarker(digest), digest, row.id);
+    row.token = portalTokenMarker(digest);
+    row.token_hash = digest;
+    return raw;
+  }
+  const derived = portalTokenValue(row);
+  return row.token_hash === portalTokenDigest(derived) ? derived : null;
 }
 
 function portalActionId(type = 'action') {
@@ -66632,8 +66803,14 @@ function revisionIdFor({ build_id, attempt }) {
 
 function hydratePortalToken(row) {
   if (!row) return null;
+  const {
+    token: _token,
+    token_hash: _tokenHash,
+    verification_code_hash: _verificationCodeHash,
+    ...safeRow
+  } = row;
   return {
-    ...row,
+    ...safeRow,
     metadata: safeJson(row.metadata_json) || null
   };
 }

@@ -1,5 +1,6 @@
 import { env } from '../env.js';
 import { fetchJson, normalizeProviderError, providerConfigured, smokeDetail } from './core.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 
 const PROVIDER = 'v0';
 const DEFAULT_BASE_URL = 'https://api.v0.dev';
@@ -85,12 +86,13 @@ export function extractV0FinalUrl(value) {
 }
 
 export class V0Provider {
-  constructor({ apiKey, baseUrl, modelId, live = false } = {}) {
+  constructor({ apiKey, baseUrl, modelId, live = false, authorizationContext = {} } = {}) {
     const config = v0Config();
     this.apiKey = apiKey ?? config.apiKey;
     this.baseUrl = (baseUrl || config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.modelId = modelId || config.modelId;
     this.live = live;
+    this.authorizationContext = authorizationContext;
   }
 
   async createProject({ name, description, instructions }) {
@@ -157,6 +159,7 @@ export class V0Provider {
   requireLive(action) {
     if (!env.live.builds) throw providerError(`${PROVIDER}.${action} requires LIVE_BUILDS=true`, { retryable: false, code: 'live_gate' });
     if (!this.apiKey) throw providerError(`${PROVIDER}.${action} requires V0_API_KEY`, { retryable: false, code: 'auth' });
+    requireLiveSideEffectAuthorization({ action: 'build', ...this.authorizationContext });
   }
 
   async get(path, action) {

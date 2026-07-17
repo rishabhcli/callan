@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import Stripe from 'stripe';
 import { env } from '../env.js';
 import { normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 
 export const STRIPE_API_VERSION = '2026-02-25.clover';
 const PROVIDER = 'stripe';
@@ -142,13 +143,14 @@ async function findReusableCustomer(stripe, { email, leadId }) {
   };
 }
 
-async function getOrCreateInvoiceCustomer(stripe, { leadId, businessName, toEmail, idempotencyKey }) {
+async function getOrCreateInvoiceCustomer(stripe, { leadId, businessName, toEmail, idempotencyKey, authorize }) {
   const email = normalizeStripeEmail(toEmail);
   if (!email) throw new Error('Stripe invoice requires a customer email');
 
   const reusable = await findReusableCustomer(stripe, { email, leadId });
   if (reusable.customer) return reusable;
 
+  authorize?.();
   const customer = await stripe.customers.create(
     {
       email,
@@ -175,18 +177,27 @@ export async function createHostedInvoice({
   productName = env.stripe.productName,
   daysUntilDue = 7,
   offerVersion,
-  metadata = {}
+  metadata = {},
+  authorization = {}
 }) {
   if (!idempotencyKey) throw new Error('Stripe invoice idempotencyKey missing');
   const email = normalizeStripeEmail(toEmail);
 
   try {
+    const authorize = () => requireLiveSideEffectAuthorization({
+      action: 'invoice',
+      leadId,
+      job: authorization.job || null,
+      smoke: authorization.smoke === true
+    });
+    authorize();
     const stripe = stripeClient();
     const customerResult = await getOrCreateInvoiceCustomer(stripe, {
       leadId,
       businessName,
       toEmail,
-      idempotencyKey
+      idempotencyKey,
+      authorize
     });
     const customer = customerResult.customer;
     const invoiceMetadata = cleanMetadata({
@@ -197,6 +208,7 @@ export async function createHostedInvoice({
       ...metadata
     });
 
+    authorize();
     await stripe.invoiceItems.create(
       {
         customer: customer.id,
@@ -208,6 +220,7 @@ export async function createHostedInvoice({
       { idempotencyKey: `${idempotencyKey}:item` }
     );
 
+    authorize();
     const invoice = await stripe.invoices.create(
       {
         customer: customer.id,
@@ -219,9 +232,11 @@ export async function createHostedInvoice({
       { idempotencyKey: `${idempotencyKey}:invoice` }
     );
 
-    const finalized = invoice.status === 'draft'
-      ? await stripe.invoices.finalizeInvoice(invoice.id, {}, { idempotencyKey: `${idempotencyKey}:finalize` })
-      : invoice;
+    let finalized = invoice;
+    if (invoice.status === 'draft') {
+      authorize();
+      finalized = await stripe.invoices.finalizeInvoice(invoice.id, {}, { idempotencyKey: `${idempotencyKey}:finalize` });
+    }
 
     if (!finalized.hosted_invoice_url) {
       throw new Error(`Stripe invoice ${finalized.id} finalized without a hosted_invoice_url`);
@@ -252,7 +267,8 @@ export async function applyStripeSubscriptionChange({
   changeType = 'other',
   targetStripePriceId = null,
   idempotencyKey,
-  metadata = {}
+  metadata = {},
+  authorization = {}
 } = {}) {
   if (!stripeSubscriptionId) throw new Error('Stripe subscription id required');
   if (!idempotencyKey) throw new Error('Stripe subscription change idempotencyKey missing');
@@ -264,6 +280,13 @@ export async function applyStripeSubscriptionChange({
   });
 
   try {
+    const authorize = () => requireLiveSideEffectAuthorization({
+      action: 'subscription',
+      leadId: metadata.leadId || null,
+      job: authorization.job || null,
+      smoke: authorization.smoke === true
+    });
+    authorize();
     const stripe = stripeClient();
     let updatePayload;
     if (cleanChangeType === 'cancel') {
@@ -297,6 +320,7 @@ export async function applyStripeSubscriptionChange({
       throw new Error(`Stripe subscription change ${cleanChangeType} requires targetStripePriceId`);
     }
 
+    authorize();
     const updated = await stripe.subscriptions.update(
       stripeSubscriptionId,
       updatePayload,
@@ -341,7 +365,8 @@ export async function createStripeSmokeInvoice() {
     idempotencyKey,
     amountCents,
     productName: 'callmemaybe Stripe smoke invoice',
-    metadata: { smoke: 'true' }
+    metadata: { smoke: 'true' },
+    authorization: { smoke: true }
   });
 }
 

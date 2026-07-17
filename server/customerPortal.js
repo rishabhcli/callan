@@ -50,11 +50,11 @@ function requireLead(leadId) {
   return lead;
 }
 
-export function ensurePortalTokenForLead({ leadId, purpose = 'build_share', ttlMs = 30 * 86400000, metadata = {} } = {}) {
+export function ensurePortalTokenForLead({ leadId, purpose = 'build_share', ttlMs = Math.max(1, Number(env.portal?.tokenTtlHours) || 168) * 3600000, metadata = {} } = {}) {
   requireLead(leadId);
   if (!portalTokens?.ensureActive) return { token: leadId, path: `/share/build/${encodeURIComponent(leadId)}`, url: `/share/build/${encodeURIComponent(leadId)}`, fallback: true };
   const result = portalTokens.ensureActive({ lead_id: leadId, purpose, expiresInMs: ttlMs, metadata });
-  const token = result?.token || result?.row?.token || leadId;
+  const token = result?.token || leadId;
   return { token, row: result?.row || null, reused: !!result?.reused, path: `/share/build/${encodeURIComponent(token)}`, url: `/share/build/${encodeURIComponent(token)}` };
 }
 

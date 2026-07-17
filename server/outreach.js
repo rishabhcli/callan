@@ -16,6 +16,7 @@ import { runCaller } from './workers/caller.js';
 import { scoreOnlinePresence } from './presenceScorer.js';
 import { applyPriorityToLead, refreshAllPriorityScores } from './leadPriority.js';
 import { executeDueChannel, listDueCadenceLeads } from './cadence.js';
+import { endAgentPhoneCall } from './providers/agentphone.js';
 
 export const OUTREACH_LEAD_JOB_TYPE = 'outreach.lead';
 
@@ -67,16 +68,46 @@ export function stopOutreachLoop({ reason = 'operator_stop' } = {}) {
   setAutonomyPaused(true, reason);
   if (timer) clearInterval(timer);
   timer = null;
+  const terminationRequested = requestActiveCallTermination(reason);
   emit('outreach.stopped', { paused: true, reason });
-  return outreachStatus();
+  return { ...outreachStatus(), terminationRequested };
 }
 
 export function pauseOutreachLoop({ reason = 'operator_pause' } = {}) {
   setAutonomyPaused(true, reason);
   if (timer) clearInterval(timer);
   timer = null;
+  const terminationRequested = requestActiveCallTermination(reason);
   emit('outreach.paused', { reason });
-  return outreachStatus();
+  return { ...outreachStatus(), terminationRequested };
+}
+
+function requestActiveCallTermination(reason) {
+  const rows = db.prepare(`
+    SELECT id, lead_id, provider_call_id
+    FROM calls
+    WHERE state IN ('in_progress', 'ringing', 'active')
+      AND provider_call_id IS NOT NULL
+  `).all();
+  for (const row of rows) {
+    endAgentPhoneCall(row.provider_call_id)
+      .then(() => emit('outreach.active_call_ended', {
+        worker: 'caller',
+        leadId: row.lead_id,
+        callId: row.id,
+        providerCallId: row.provider_call_id,
+        reason
+      }))
+      .catch((err) => emit('outreach.active_call_end_failed', {
+        worker: 'caller',
+        leadId: row.lead_id,
+        callId: row.id,
+        providerCallId: row.provider_call_id,
+        reason,
+        error: err?.message || String(err)
+      }));
+  }
+  return rows.length;
 }
 
 export function resumeOutreachLoop({ reason = 'operator_resume' } = {}) {
@@ -275,8 +306,7 @@ export function canRouteCallLead(leadId, options = {}) {
   const explanation = explainLeadCallability(leadId, {
     ...options,
     ignoreQueueState: true,
-    ignoreRetryBackoff: true,
-    ignorePause: true
+    ignoreRetryBackoff: true
   });
   return explanation.callable ? { ok: true, explanation } : { ok: false, explanation };
 }
@@ -305,7 +335,7 @@ export function enqueueOutreachLeadJob({
   });
 }
 
-export async function handleOutreachLeadJob(payload = {}) {
+export async function handleOutreachLeadJob(payload = {}, durableJob = null, execution = {}) {
   const leadId = payload.leadId;
   if (!leadId) return { ok: false, skipped: true, reason: 'missing_leadId' };
   const lead = leads.get(leadId);
@@ -319,13 +349,24 @@ export async function handleOutreachLeadJob(payload = {}) {
     businessName: lead.business_name,
     startedAt: Date.now(),
     phoneClassification: payload.phoneClassification || lead.phone_classification || null,
-    durable: true
+    durable: true,
+    durableJob,
+    signal: execution.signal || null
   };
   const explanation = explainCallabilityForLead(lead, {
     ignoreQueueState: true,
-    ignoreRetryBackoff: true,
-    ignorePause: true
+    ignoreRetryBackoff: true
   });
+  if (!explanation.callable) {
+    handleUncallableQueuedLead(lead, explanation);
+    return {
+      ok: false,
+      skipped: true,
+      blocked: true,
+      reason: explanation.blockers?.[0]?.reason || 'outreach no longer authorized',
+      leadId
+    };
+  }
   const result = await runLeadOutreach(lead, explanation, { job });
   return { ok: true, leadId, source: payload.source || 'durable_job', ...(result || {}) };
 }
@@ -480,6 +521,21 @@ async function drainDueCadence() {
 }
 
 async function runLeadOutreach(lead, explanation, { check = null, job = null } = {}) {
+  // Queue-time approval can be stale. Recheck pause/readiness/quota and lead
+  // state immediately before entering the caller/provider path.
+  const lastMile = explainCallabilityForLead(leads.get(lead.id) || lead, {
+    ignoreQueueState: true,
+    ignoreRetryBackoff: true
+  });
+  if (!lastMile.callable) {
+    handleUncallableQueuedLead(leads.get(lead.id) || lead, lastMile);
+    return {
+      ok: false,
+      blocked: true,
+      reason: lastMile.blockers?.[0]?.reason || 'outreach no longer authorized'
+    };
+  }
+  explanation = lastMile;
   const disclosureText = recordingDisclosure(lead.business_name);
   check = check || callabilityForLead({ lead, disclosureText });
   if (!check.ok) {
@@ -528,7 +584,13 @@ async function runLeadOutreach(lead, explanation, { check = null, job = null } =
     emit('outreach.running', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
     emit('outreach.calling', { leadId: lead.id, businessName: lead.business_name, agentId: activeJobs.get(lead.id)?.agentId || null, active: activeJobs.size, concurrency: outreachConcurrency(), phoneClassification: check.phoneClassification });
 
-    const callResult = await runCaller({ leadId: lead.id, toPhone: check.phone });
+    if (job?.signal?.aborted) throw job.signal.reason || new Error('outreach job canceled');
+    const callResult = await runCaller({
+      leadId: lead.id,
+      toPhone: check.phone,
+      jobContext: job?.durableJob || null,
+      signal: job?.signal || null
+    });
 
     const latest = leads.get(lead.id);
     if (latest && (BLOCKED_STATES.has(latest.outreach_status) || latest.risk_status === 'opt-out')) {

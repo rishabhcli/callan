@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { env } from '../env.js';
-import { emit } from '../sse.js';
+import { assertMockProvenanceAllowed, emit } from '../sse.js';
 import { log } from '../logger.js';
 import { scoreOnlinePresence } from '../presenceScorer.js';
 import { enrichBusinessProfile } from '../profileEnrichment.js';
@@ -177,6 +177,7 @@ export async function runBrowserUseResearchJob({ jobId }) {
   const job = getResearchJob(jobId);
   if (!job) throw new Error(`research job ${jobId} not found`);
   if (JOB_TERMINAL.has(job.status)) return getBrowserResearchStatus({ jobId });
+  if (job.mode === 'mock') assertMockProvenanceAllowed('research.mock_job', { mode: 'mock' });
 
   const active = {
     controller: new AbortController(),
@@ -1431,6 +1432,12 @@ function normalizeJobInput(input, now) {
   const city = cleanText(input.city) || 'San Francisco, CA';
   const niche = cleanText(input.niche) || 'barber';
   const requestedMode = input.mode === 'live' || input.mode === 'mock' ? input.mode : (browserResearchLiveEnabled() ? 'live' : 'mock');
+  if (requestedMode === 'mock') assertMockProvenanceAllowed('research.mock_job', { mode: 'mock' });
+  if (requestedMode === 'live' && !browserResearchLiveEnabled()) {
+    const error = new Error(`live Browser Use research is unavailable: ${browserResearchLiveBlockers().join('; ')}`);
+    error.code = 'LIVE_RESEARCH_PATH_DISABLED';
+    throw error;
+  }
   const maxLeads = clampInt(input.maxLeads ?? input.max_leads ?? input.count, 1, 25, DEFAULT_MAX_LEADS);
   const concurrency = clampInt(input.concurrency, 1, 5, DEFAULT_CONCURRENCY);
   const maxCostUsd = costText(input.maxCostUsd ?? input.max_cost_usd, DEFAULT_SESSION_MAX_COST_USD);
@@ -1446,7 +1453,7 @@ function normalizeJobInput(input, now) {
     maxLeads,
     concurrency,
     maxCostUsd,
-    mode: requestedMode === 'live' && browserResearchLiveEnabled() ? 'live' : 'mock',
+    mode: requestedMode,
     requestedAt: now,
     detailJson: jsonText(detail),
     idempotencyKey: input.idempotencyKey || input.idempotency_key || null

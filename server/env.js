@@ -22,6 +22,21 @@ function parseEmailPhoneMap(raw) {
   }
   return out;
 }
+
+function parseOperatorTokens(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(String(raw));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((row) => ({
+      id: String(row?.id || '').trim(),
+      role: ['viewer', 'operator', 'admin'].includes(String(row?.role || '').toLowerCase()) ? String(row.role).toLowerCase() : 'viewer',
+      token: String(row?.token || '')
+    })).filter((row) => row.id && row.token);
+  } catch {
+    return [];
+  }
+}
 const num = (v, fallback) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -89,7 +104,37 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
   trustProxyHops: Math.max(0, Math.floor(num(process.env.TRUST_PROXY_HOPS, 0))),
   admin: {
-    apiToken: process.env.ADMIN_API_TOKEN || ''
+    apiToken: process.env.ADMIN_API_TOKEN || '',
+    operatorTokens: parseOperatorTokens(process.env.ADMIN_API_TOKENS_JSON),
+    mfaEnforced: bool(process.env.ADMIN_MFA_ENFORCED)
+  },
+  portal: {
+    tokenSecret: process.env.PORTAL_TOKEN_SECRET || '',
+    tokenTtlHours: Math.max(1, Math.floor(num(process.env.PORTAL_TOKEN_TTL_HOURS, 168)))
+  },
+  safety: {
+    interlockSecret: process.env.SAFETY_INTERLOCK_SECRET || ''
+  },
+  privacy: {
+    retentionEnabled: process.env.DATA_RETENTION_ENABLED !== 'false',
+    retentionIntervalMs: num(process.env.DATA_RETENTION_INTERVAL_MS, 24 * 60 * 60 * 1000),
+    callTranscriptRetentionDays: Math.max(1, Math.floor(num(process.env.CALL_TRANSCRIPT_RETENTION_DAYS, 30))),
+    reasoningTraceRetentionDays: Math.max(1, Math.floor(num(process.env.REASONING_TRACE_RETENTION_DAYS, 30))),
+    contactBodyRetentionDays: Math.max(1, Math.floor(num(process.env.CONTACT_BODY_RETENTION_DAYS, 90))),
+    webhookPayloadRetentionDays: Math.max(1, Math.floor(num(process.env.WEBHOOK_PAYLOAD_RETENTION_DAYS, 30))),
+    jobPayloadRetentionDays: Math.max(1, Math.floor(num(process.env.JOB_PAYLOAD_RETENTION_DAYS, 30))),
+    expiredPortalTokenRetentionDays: Math.max(1, Math.floor(num(process.env.EXPIRED_PORTAL_TOKEN_RETENTION_DAYS, 30))),
+    dataAtRestEncrypted: bool(process.env.DATA_AT_REST_ENCRYPTED),
+    backupsEncrypted: bool(process.env.BACKUPS_ENCRYPTED)
+  },
+  deployment: {
+    replicaCount: Math.max(1, Math.floor(num(process.env.APP_REPLICA_COUNT, 1))),
+    singleNodePilotAck: process.env.SINGLE_NODE_PILOT_ACK || '',
+    providerCertificationFile: process.env.PROVIDER_CERTIFICATION_FILE || ''
+  },
+  security: {
+    previewFrameSources: list(process.env.PREVIEW_FRAME_SOURCES),
+    previewImageSources: list(process.env.PREVIEW_IMAGE_SOURCES)
   },
 
   runMode: process.env.RUN_MODE || 'mock',
@@ -163,6 +208,7 @@ export const env = {
     recoveryMaxBuildAgeMs: num(process.env.OPS_RECOVERY_MAX_BUILD_AGE_MS, 10 * 60 * 1000),
     economicsMaxDailyCostUsd: num(process.env.OPS_MAX_DAILY_COST_USD, 25),
     economicsMaxDailyLossUsd: num(process.env.OPS_MAX_DAILY_LOSS_USD, 25),
+    economicsMaxCostPerLeadUsd: num(process.env.OPS_MAX_COST_PER_LEAD_USD, 5),
     economicsMinMarginPct: num(process.env.OPS_MIN_MARGIN_PCT, 20),
     providerMaxIssueRatePct: num(process.env.OPS_PROVIDER_MAX_ISSUE_RATE_PCT, 20),
     providerMinEventsForIssueRate: num(process.env.OPS_PROVIDER_MIN_EVENTS_FOR_ISSUE_RATE, 3),
