@@ -857,14 +857,35 @@ function applyIntakeReplyToClassification(classification, intake) {
   if (!classification || !intake?.replyText) return classification;
   if (classification.kind === 'opt_out' || classification.operatorFlag) return classification;
   const wantsSchedule = intake.intent === 'callback' || intake.nextAction === 'schedule_callback';
+  const preservesCommerceScope = classification.scope === 'commerce setup';
   classification.replyText = intake.replyText;
-  classification.scope = wantsSchedule ? 'scheduling' : intake.readyForQuote ? 'invoice' : 'brief';
+  classification.scope = preservesCommerceScope
+    ? 'commerce setup'
+    : wantsSchedule
+      ? 'scheduling'
+      : intake.readyForQuote
+        ? 'invoice'
+        : 'brief';
   classification.scopes = unique([
     ...(classification.scopes || []),
     classification.scope,
-    wantsSchedule ? 'scheduling' : intake.readyForQuote ? 'pricing' : 'brief'
+    preservesCommerceScope
+      ? 'commerce setup'
+      : wantsSchedule
+        ? 'scheduling'
+        : intake.readyForQuote
+          ? 'pricing'
+          : 'brief'
   ]);
-  classification.reason = `${classification.reason || 'supported'}; inbound intake ${wantsSchedule ? 'callback requested' : intake.readyForQuote ? 'quote ready' : 'needs missing info'}`;
+  classification.reason = `${classification.reason || 'supported'}; inbound intake ${
+    preservesCommerceScope
+      ? 'commerce details captured'
+      : wantsSchedule
+        ? 'callback requested'
+        : intake.readyForQuote
+          ? 'quote ready'
+          : 'needs missing info'
+  }`;
   classification.intake = {
     sessionId: intake.sessionId,
     nextAction: intake.nextAction,

@@ -3631,8 +3631,11 @@ try {
     assert.equal(isOperatorProtectedRequest({ method: 'GET', path: '/api/ops/observability' }), true);
     assert.equal(isOperatorProtectedRequest({ method: 'POST', path: '/api/leads/discover' }), true);
     assert.equal(extractAdminToken({
-      get: (name) => name === 'cookie' ? 'callan_admin_token=ops-admin-token-0123456789' : ''
+      get: (name) => name === 'authorization' ? `Bearer ${token}` : ''
     }), token);
+    assert.equal(extractAdminToken({
+      get: (name) => name === 'cookie' ? 'callan_admin_token=must-not-authenticate' : ''
+    }), '');
   });
 
   await check('readiness.production_review_gate_allows_dry_run_only_posture', async () => {

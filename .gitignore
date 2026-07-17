@@ -34,4 +34,7 @@ Thumbs.db
 
 # test artifacts
 .playwright-mcp/
+output/
+playwright-report/
+test-results/
 callan-step*.png

@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Agentic cold-calling web agency: discover leads, call them, sell websites, build them live.",
+  "engines": {
+    "node": ">=22.12 <23"
+  },
+  "packageManager": "npm@10.9.4",
   "scripts": {
     "dev": "node scripts/dev.js",
     "server": "node server/index.js",
@@ -35,10 +39,13 @@
     "check:portal": "node scripts/portal-check.js",
     "check:browser-console": "node scripts/browser-console-check.js",
     "check:portfolio-readiness-browser": "node scripts/portfolio-readiness-browser-check.js",
+    "check:ui-flows": "node scripts/ui-flow-check.js",
     "check:evals": "node scripts/eval-check.js",
     "check:eval-adapter-contract": "node scripts/generated-evals/operator_handoff_customer_success.check.js",
     "check:maygoals": "node scripts/maygoals-check.js",
-    "check:ci": "npm run check && npm run check:evals && npm run check:handoff && npm run check:eval-adapter-contract && npm run check:maygoals",
+    "check:core": "npm run check && npm run build && npm run check:safety && npm run check:revenue && npm run check:sponsors && npm run check:browser-research && npm run check:dedupe && npm run check:autonomy && npm run check:reasoning && npm run check:fulfillment && npm run check:inbound-anything && npm run check:builder-hooks && npm run check:growth && npm run check:commerce && npm run check:handoff && npm run check:aftercare && npm run check:portal && npm run check:browser-console && npm run check:evals && npm run check:eval-adapter-contract && npm run check:ops && npm run check:maygoals",
+    "check:ci": "npm run check:core",
+    "check:deploy": "node scripts/deploy-check.js",
     "check:ops": "node scripts/ops-check.js",
     "safe-to-sell": "node scripts/safe-to-sell.js",
     "safe-to-renew": "node scripts/safe-to-renew.js",
@@ -51,22 +58,31 @@
     "@moss-dev/moss": "^1.0.2",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.1",
-    "@stripe/agent-toolkit": "^0.7.0",
-    "@vitejs/plugin-react": "^4.3.4",
     "agentmail": "^0.0.51",
     "agentphone": "^1.0.10",
     "better-sqlite3": "^11.7.0",
     "browser-use-sdk": "^3.5.0",
-    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "stripe": "^17.5.0",
     "supermemory": "^3.0.0",
     "svix": "^1.93.0",
     "three": "^0.170.0",
-    "vite": "^6.0.7",
     "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "playwright": "^1.61.1",
+    "vite": "^6.4.3"
+  },
+  "overrides": {
+    "@babel/core": "^7.29.7",
+    "hono": "^4.12.30",
+    "protobufjs": "^7.6.5",
+    "ws": "^8.21.1"
   }
 }

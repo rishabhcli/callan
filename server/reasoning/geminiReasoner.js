@@ -577,15 +577,81 @@ function mockOutputForKind(kind, evidence) {
   }
 
   if (kind === 'websiteBrief') {
+    const phone = source.phone || null;
+    const contactMethods = phone
+      ? [
+          { type: 'phone', label: 'Call', value: phone, href: `tel:${String(phone).replace(/[^\d+]/g, '')}` },
+          { type: 'form', label: 'Send an inquiry', value: '#contact-form', href: '#contact-form' }
+        ]
+      : [
+          { type: 'form', label: 'Send an inquiry', value: '#contact-form', href: '#contact-form' }
+        ];
     return {
+      schemaVersion: 2,
       brief: `Build a concise, polished one-page website for ${businessName}, a ${niche} business in ${city}. Use only confirmed facts from the brief. Feature services, trust proof, and a clear contact path. Avoid unsupported guarantees, invented staff names, or fake reviews.`,
       businessName,
-      targetCustomer: `Local customers looking for ${niche}.`,
+      targetCustomer: `Local customers looking for ${niche} in ${city}.`,
+      pages: [
+        {
+          name: 'Home',
+          path: '/',
+          goal: 'Explain the business clearly and turn local interest into a qualified inquiry.',
+          sections: ['hero', 'services', 'proof', 'contact']
+        }
+      ],
+      hero: {
+        headline: businessName,
+        subheadline: `${niche} for customers in ${city}.`,
+        primaryCta: phone ? 'Call now' : 'Send an inquiry',
+        secondaryCta: phone ? 'Send an inquiry' : null,
+        proofLine: 'Only supplied business facts are used.'
+      },
       sections: [
         { name: 'Hero', goal: 'State what the business does and how to contact it.', content: [businessName, niche, city] },
         { name: 'Services', goal: 'Explain the core offer clearly.', content: [niche] },
-        { name: 'Contact', goal: 'Make the next step obvious.', content: ['tap-to-call', 'simple inquiry form'] }
+        { name: 'Contact', goal: 'Make the next step obvious.', content: phone ? ['tap-to-call', 'simple inquiry form'] : ['simple inquiry form'] }
       ],
+      services: [
+        {
+          name: niche,
+          description: `${businessName} provides ${niche} for customers in ${city}.`,
+          cta: phone ? 'Call now' : 'Send an inquiry'
+        }
+      ],
+      reviewProof: {
+        status: 'limited',
+        items: [businessName, niche, city],
+        disclaimer: 'Do not invent reviews, awards, guarantees, licenses, or staff names.'
+      },
+      location: {
+        city,
+        address: source.address || null,
+        serviceArea: city,
+        hours: source.hours || null
+      },
+      cta: {
+        primaryLabel: phone ? 'Call now' : 'Send an inquiry',
+        primaryHref: phone ? `tel:${String(phone).replace(/[^\d+]/g, '')}` : '#contact-form',
+        secondaryLabel: phone ? 'Send an inquiry' : null,
+        secondaryHref: phone ? '#contact-form' : null
+      },
+      contactMethods,
+      commerceNeeds: [
+        {
+          key: 'customer_payment',
+          status: 'not_configured',
+          detail: 'Do not publish a checkout or payment claim without customer-approved commerce setup.'
+        }
+      ],
+      assets: [
+        {
+          type: 'placeholder',
+          alt: `${businessName} business image placeholder`,
+          url: null,
+          caption: 'Replace with an approved business image before launch.'
+        }
+      ],
+      disclaimers: ['Do not invent reviews, awards, guarantees, licenses, staff names, or online payment claims.'],
       style: { tone: 'clean and professional', palette: 'neutral with one accent', layout: 'clear hero, service sections, sticky mobile CTA' },
       factualClaims: [businessName, niche, city],
       omittedClaims: ['reviews', 'guarantees', 'unconfirmed staff names'],
@@ -609,6 +675,10 @@ function mockOutputForKind(kind, evidence) {
       confidence: 0.64,
       sourceEvidence: evidenceItem
     };
+  }
+
+  if (kind === 'scheduleCallDecision') {
+    return mockScheduleCallDecision(source, evidenceItem);
   }
 
   return {
@@ -638,6 +708,91 @@ function fallbackEmailReplyText(scope) {
   if (scope === 'pricing') return 'Thanks for asking. I can help with pricing and package questions right here in this thread. Tell me what scope you have in mind and I will keep the answer concrete.';
   if (scope === 'build progress') return 'Thanks for checking in. I can help with build progress, preview links, and launch status here. I will keep the next update focused on where the site stands.';
   return 'Thanks for the details. Send the services, photos, colors, or copy you want reflected on the site and I will fold them into the brief.';
+}
+
+function mockScheduleCallDecision(source, sourceEvidence) {
+  const text = String(source.text || source.replyText || '');
+  const timezone = source.timezone || 'America/Los_Angeles';
+  const now = new Date(source.nowIso || Date.now());
+  const isCancel = /\b(cancel|abort|never\s*mind|nevermind|forget it)\b.*\b(call|callback)\b/i.test(text)
+    || /\bcancel the (call|callback)\b/i.test(text);
+  const wantsCall = /\b(call me|schedule a call|give me a (?:call|ring)|hop on a call|let'?s (?:get on|hop on) a call)\b/i.test(text);
+  const explicitTime = text.match(/\b(today|tomorrow|tonight)\b[^.]{0,40}?\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const plainTime = explicitTime ? null : text.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const match = explicitTime || plainTime;
+
+  let scheduledAtIso = null;
+  let scheduledAtRaw = '';
+  if (wantsCall && match) {
+    const dayWord = explicitTime ? explicitTime[1].toLowerCase() : 'today';
+    let hour = Number(explicitTime ? explicitTime[2] : plainTime[1]);
+    const minute = Number((explicitTime ? explicitTime[3] : plainTime[2]) || 0);
+    const meridiem = String(explicitTime ? explicitTime[4] : plainTime[3]).toLowerCase();
+    if (meridiem === 'pm' && hour < 12) hour += 12;
+    if (meridiem === 'am' && hour === 12) hour = 0;
+    const deltaDays = dayWord === 'tomorrow' ? 1 : 0;
+    const target = zonedDateTimeFromNow({ now, timezone, deltaDays, hour, minute });
+    if (target) scheduledAtIso = target.toISOString();
+    scheduledAtRaw = match[0];
+  }
+
+  return {
+    wantsCall,
+    isCancel,
+    scheduledAtIso,
+    scheduledAtRaw,
+    ask: wantsCall ? 'Customer requested a follow-up callback.' : '',
+    reason: isCancel
+      ? 'Customer asked to cancel a callback.'
+      : wantsCall
+        ? 'Customer explicitly asked for a callback.'
+        : 'No explicit callback request was found.',
+    confidence: wantsCall && scheduledAtIso ? 0.82 : wantsCall ? 0.64 : 0.75,
+    sourceEvidence
+  };
+}
+
+function zonedDateTimeFromNow({ now, timezone, deltaDays, hour, minute }) {
+  try {
+    const parts = zonedParts(now, timezone);
+    const wallClockMs = Date.UTC(parts.year, parts.month - 1, parts.day + deltaDays, hour, minute, 0, 0);
+    const approximate = new Date(wallClockMs);
+    const firstOffset = timezoneOffsetMs(approximate, timezone);
+    const candidate = new Date(wallClockMs - firstOffset);
+    const correctedOffset = timezoneOffsetMs(candidate, timezone);
+    return new Date(wallClockMs - correctedOffset);
+  } catch {
+    const fallback = new Date(now);
+    fallback.setUTCDate(fallback.getUTCDate() + deltaDays);
+    fallback.setUTCHours(hour + 8, minute, 0, 0);
+    return fallback;
+  }
+}
+
+function timezoneOffsetMs(date, timezone) {
+  const parts = zonedParts(date, timezone);
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
+  return asUtc - date.getTime();
+}
+
+function zonedParts(date, timezone) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  const values = Object.fromEntries(
+    formatter.formatToParts(date)
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, Number(part.value)])
+  );
+  if (values.hour === 24) values.hour = 0;
+  return values;
 }
 
 function safeId() {

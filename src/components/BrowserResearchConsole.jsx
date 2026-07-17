@@ -364,7 +364,7 @@ export default function BrowserResearchConsole() {
                   title={`browser-use ${focused.sourceLabel || focused.sourceType}`}
                   src={focused.liveUrl}
                   className="brc-window-frame"
-                  sandbox="allow-scripts allow-same-origin"
+                  sandbox={String(focused.liveUrl).startsWith('/api/') ? 'allow-same-origin' : 'allow-scripts allow-same-origin'}
                 />
               ) : (
                 <div className="brc-window-frame brc-window-empty mono">

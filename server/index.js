@@ -1,7 +1,8 @@
 import express from 'express';
-import cors from 'cors';
-import { createHash } from 'node:crypto';
-import { env } from './env.js';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
+import { createHash, randomBytes } from 'node:crypto';
+import { env, isValidRunMode } from './env.js';
 import { log } from './logger.js';
 import { attachStream, emit } from './sse.js';
 import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, accountManagerPlans, accountTasks, handoffCases, portfolioOperatingModel, portfolioOperatorInbox } from './db.js';
@@ -41,7 +42,7 @@ import {
   startOutreachLoop,
   stopOutreachLoop
 } from './outreach.js';
-import { reputationStatus, startReputationLoop } from './reputation.js';
+import { reputationStatus, startReputationLoop, stopReputationLoop } from './reputation.js';
 import { topPriorityLeads, nicheWinRateMap } from './leadPriority.js';
 import { LEAD_PRIORITY_SCORE_JOB_TYPE, handleLeadPriorityScoreJob } from './leadPriorityQueue.js';
 import { runScraper } from './workers/scraper.js';
@@ -57,6 +58,7 @@ import {
   SCHEDULED_CALL_JOB_TYPE,
   handleScheduledCallPlacementJob,
   startScheduledCallLoop,
+  stopScheduledCallLoop,
   cancelScheduledCall,
   fireScheduledCallNow
 } from './scheduledCalls.js';
@@ -89,7 +91,8 @@ import {
   pauseAccountTask,
   readAccountManagerState,
   reassignAccountTask,
-  startAccountManagerLoop
+  startAccountManagerLoop,
+  stopAccountManagerLoop
 } from './accountManager/index.js';
 import { commerceStatus, planCommerceForLead, readCommerceState, submitPortalCommerceIntake } from './commerce/index.js';
 import { mossStatusForLead } from './moss/hotIndex.js';
@@ -121,7 +124,7 @@ import {
 	  updateIntake as portalUpdateIntake
 	} from './customerPortal.js';
 import { customerTrustSummaryForLead, trustSummaryForLead } from './trust.js';
-import { enqueueJob, jobQueueHealth, startDurableJobLoop } from './jobs.js';
+import { enqueueJob, jobQueueHealth, startDurableJobLoop, stopDurableJobLoop } from './jobs.js';
 import { EMAIL_CALLBACK_JOB_TYPE, handleEmailCallbackJob } from './emailCallback.js';
 import { CALL_ANALYSIS_JOB_TYPE } from './analysisQueue.js';
 import { MAIL_REPLY_JOB_TYPE, enqueueMailReplyJob } from './mailReplyQueue.js';
@@ -129,23 +132,92 @@ import { INBOUND_VOICE_FOLLOWUP_JOB_TYPE, handleInboundVoiceFollowupJob } from '
 import { INBOUND_MEMORY_HYDRATE_JOB_TYPE, handleInboundMemoryHydrationJob } from './inboundMemoryQueue.js';
 import { OPERATOR_TRANSFER_JOB_TYPE, handleOperatorTransferJob } from './operatorTransferQueue.js';
 import { runProductionEvals } from './evals.js';
-import { OPS_BACKUP_JOB_TYPE, OPS_PROVIDER_POSTURE_JOB_TYPE, OPS_RECOVER_STUCK_JOB_TYPE, OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE, backupFreshness, backupSqliteDataDir, enqueueRetentionCommandLeaseMaintenance, exportOperationsData, latestBackupManifest, opsObservability, recoverStuckOperations, runOpsBackupJob, runOpsRecoveryJob, runProviderPostureJob, runRetentionCommandLeaseMaintenanceJob, resetMockData, startOpsBackupScheduler, startOpsRecoveryScheduler, startProviderPostureScheduler, startRetentionCommandLeaseMaintenanceScheduler } from './ops.js';
-import { SAFE_TO_SELL_JOB_TYPE, buildProviderProofMatrix, buildSafeToSellDecisionReceipt, buildSafeToSellNextActions, compactSafeToSellReceiptHistory, enqueueSafeToSellSelfCheck, runSafeToSellSelfCheck, safeToSellSnapshotStatus, startSafeToSellSelfCheckScheduler } from './safeToSell.js';
-import { SAFE_TO_RENEW_JOB_TYPE, buildSafeToRenewStatus, compactSafeToRenewReceiptHistory, enqueueSafeToRenewSelfCheck, runSafeToRenewSelfCheck, safeToRenewSnapshotStatus, startSafeToRenewSelfCheckScheduler } from './safeToRenew.js';
-import { isOperatorProtectedRequest, requireAdmin } from './adminAuth.js';
+import { OPS_BACKUP_JOB_TYPE, OPS_PROVIDER_POSTURE_JOB_TYPE, OPS_RECOVER_STUCK_JOB_TYPE, OPS_RETENTION_COMMAND_LEASE_MAINTENANCE_JOB_TYPE, backupFreshness, backupSqliteDataDir, enqueueRetentionCommandLeaseMaintenance, exportOperationsData, latestBackupManifest, opsObservability, recoverStuckOperations, runOpsBackupJob, runOpsRecoveryJob, runProviderPostureJob, runRetentionCommandLeaseMaintenanceJob, resetMockData, startOpsBackupScheduler, startOpsRecoveryScheduler, startProviderPostureScheduler, startRetentionCommandLeaseMaintenanceScheduler, stopOpsBackupScheduler, stopOpsRecoveryScheduler, stopProviderPostureScheduler, stopRetentionCommandLeaseMaintenanceScheduler } from './ops.js';
+import { SAFE_TO_SELL_JOB_TYPE, buildProviderProofMatrix, buildSafeToSellDecisionReceipt, buildSafeToSellNextActions, compactSafeToSellReceiptHistory, enqueueSafeToSellSelfCheck, runSafeToSellSelfCheck, safeToSellSnapshotStatus, startSafeToSellSelfCheckScheduler, stopSafeToSellSelfCheckScheduler } from './safeToSell.js';
+import { SAFE_TO_RENEW_JOB_TYPE, buildSafeToRenewStatus, compactSafeToRenewReceiptHistory, enqueueSafeToRenewSelfCheck, runSafeToRenewSelfCheck, safeToRenewSnapshotStatus, startSafeToRenewSelfCheckScheduler, stopSafeToRenewSelfCheckScheduler } from './safeToRenew.js';
+import { adminAuthPosture, isOperatorProtectedRequest, requireAdmin } from './adminAuth.js';
+import { startAgentMailPoller, stopAgentMailPoller } from './agentmailPoller.js';
 import { aggregateLeadMarketOpportunities, planLaunchFromMarketOpportunity, recordMarketRecommendationOutcome } from './portfolio.js';
 
 const app = express();
-app.use(cors());
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { ok: false, code: 'ADMIN_RATE_LIMITED', error: 'too many failed admin authentication attempts' }
+});
+const publicIntakeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { ok: false, code: 'PUBLIC_INTAKE_RATE_LIMITED', error: 'too many requests; try again later' }
+});
+const scopedLinkLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { ok: false, code: 'SCOPED_LINK_RATE_LIMITED', error: 'too many requests; try again later' }
+});
+
+if (!isValidRunMode(env.runMode)) {
+  throw new Error(`invalid RUN_MODE: ${env.runMode}`);
+}
+const startupAdminPosture = adminAuthPosture();
+if (!startupAdminPosture.ok) {
+  throw new Error(`production admin authentication is not ready: ${startupAdminPosture.blockers.join('; ')}`);
+}
+
+app.disable('x-powered-by');
+app.set('trust proxy', env.trustProxyHops > 0 ? env.trustProxyHops : false);
+app.use((req, res, next) => {
+  res.locals.cspNonce = randomBytes(18).toString('base64');
+  next();
+});
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      baseUri: ["'self'"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+      frameSrc: [
+        "'self'",
+        'https:',
+        ...(env.nodeEnv === 'production' ? [] : ['http://localhost:*', 'http://127.0.0.1:*'])
+      ],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      objectSrc: ["'none'"],
+      scriptSrc: ["'self'", (_req, res) => `'nonce-${res.locals.cspNonce}'`],
+      scriptSrcAttr: ["'none'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      upgradeInsecureRequests: env.nodeEnv === 'production' ? [] : null
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+}));
 
 // Raw body for webhook signature checks
 const rawBodySaver = (req, _res, buf) => { req.rawBody = buf; };
-app.use('/api/webhooks', express.json({ verify: rawBodySaver }));
+app.use('/api/webhooks', express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.json({ limit: '1mb' }));
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+app.use('/api/referrals/leads', publicIntakeLimiter);
+app.use('/api/hosting/accept', publicIntakeLimiter);
+app.use('/api/share/build', scopedLinkLimiter);
 
 app.use((req, res, next) => {
   if (!isOperatorProtectedRequest(req)) return next();
-  return requireAdmin(req, res, next);
+  return adminLimiter(req, res, () => requireAdmin(req, res, next));
 });
 
 const fire = (worker, args, _fn, options = {}) => {
@@ -4831,6 +4903,28 @@ app.post('/api/leads/discover', (req, res) => {
   res.status(202).json({ accepted: true, jobId: job?.id, jobStatus: job?.status });
 });
 
+app.post('/api/referrals/leads', (req, res) => {
+  const parsed = DiscoverRequest.safeParse({
+    niche: req.body?.niche,
+    city: req.body?.city,
+    count: 1
+  });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const job = fire('scraper', parsed.data, runScraper, {
+    type: 'research.discover',
+    idempotencyKey: `referral_discover:${createHash('sha256')
+      .update(`${parsed.data.niche}|${parsed.data.city}`.toLowerCase())
+      .digest('hex')
+      .slice(0, 24)}`
+  });
+  res.status(202).json({
+    accepted: true,
+    source: 'referral_landing',
+    jobId: job?.id,
+    jobStatus: job?.status
+  });
+});
+
 app.post('/api/research/start', (req, res) => {
   const parsed = researchStartBody(req.body || {});
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
@@ -5272,6 +5366,20 @@ app.get('/api/preview-build/:buildId/screenshot.png', async (req, res) => {
 });
 
 app.get('/api/leads/:id/build-preview', (req, res) => {
+  res.set({
+    'Content-Security-Policy': [
+      "default-src 'none'",
+      "style-src 'unsafe-inline'",
+      "img-src data: https:",
+      "font-src data: https:",
+      "script-src 'none'",
+      "connect-src 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'self'"
+    ].join('; '),
+    'X-Frame-Options': 'SAMEORIGIN'
+  });
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).send('<!doctype html><html><body>Lead not found.</body></html>');
   const latest = builds.listByLead(lead.id)[0] || {};
@@ -5756,9 +5864,20 @@ app.get('/api/referrals/rollup', (req, res) => {
 
 // /api/referrals/landing-html — utility preview that mimics the page a referral
 // visitor will land on. Lets the operator eyeball the funnel without leaving
-// the dashboard. The form POSTs niche+city to /api/leads/discover.
+// the dashboard. The form POSTs niche+city to the public, rate-limited
+// referral intake endpoint rather than the operator-only discovery route.
 app.get('/api/referrals/landing-html', (_req, res) => {
-  res.type('html').send(renderReferralLandingHtml());
+  res.type('html').send(renderReferralLandingHtml(res.locals.cspNonce));
+});
+
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    ok: false,
+    code: 'API_NOT_FOUND',
+    error: 'API route not found',
+    method: req.method,
+    path: req.path
+  });
 });
 
 app.use(express.static('dist'));
@@ -5768,7 +5887,25 @@ app.get('*', (_req, res) => {
   });
 });
 
-app.listen(env.port, () => {
+app.use((err, req, res, _next) => {
+  const status = err?.type === 'entity.too.large' ? 413 : Number(err?.status || err?.statusCode || 500);
+  const safeStatus = status >= 400 && status < 600 ? status : 500;
+  log.error('http.request_failed', {
+    method: req.method,
+    path: req.path,
+    status: safeStatus,
+    error: err?.message || String(err)
+  });
+  if (res.headersSent) return;
+  const exposeDetails = env.nodeEnv !== 'production';
+  res.status(safeStatus).json({
+    ok: false,
+    code: safeStatus === 413 ? 'REQUEST_TOO_LARGE' : 'INTERNAL_ERROR',
+    error: safeStatus >= 500 && !exposeDetails ? 'internal server error' : (err?.message || 'request failed')
+  });
+});
+
+const httpServer = app.listen(env.port, () => {
   log.info(`callmemaybe server listening`, { port: env.port, mode: env.runMode });
   startDurableJobLoop(durableJobHandlers);
   try {
@@ -5827,9 +5964,11 @@ app.listen(env.port, () => {
 
   // Inbound email poller — picks up "call me" emails even when the AgentMail
   // webhook isn't pointed at the local tunnel. Bootstraps on first tick.
-  import('./agentmailPoller.js').then(({ startAgentMailPoller }) => {
+  try {
     startAgentMailPoller();
-  }).catch((err) => log.warn('agentmail.poll.start_failed', { error: err?.message || String(err) }));
+  } catch (err) {
+    log.warn('agentmail.poll.start_failed', { error: err?.message || String(err) });
+  }
 
   // One-shot: PATCH the AgentPhone agent record with the operator's transfer
   // number so the platform can warm-transfer any time our server requests it.
@@ -5838,6 +5977,51 @@ app.listen(env.port, () => {
     error: err?.message || String(err)
   }));
 });
+
+let shutdownStarted = false;
+function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  log.info('server.shutdown_started', { signal });
+
+  const stoppers = [
+    () => stopAgentMailPoller(),
+    () => stopReputationLoop(),
+    () => stopAccountManagerLoop(),
+    () => stopScheduledCallLoop(),
+    () => stopOutreachLoop({ reason: `process_${String(signal).toLowerCase()}` }),
+    () => stopDurableJobLoop(),
+    () => stopOpsBackupScheduler(),
+    () => stopProviderPostureScheduler(),
+    () => stopOpsRecoveryScheduler(),
+    () => stopRetentionCommandLeaseMaintenanceScheduler(),
+    () => stopSafeToSellSelfCheckScheduler(),
+    () => stopSafeToRenewSelfCheckScheduler()
+  ];
+  for (const stop of stoppers) {
+    try { stop(); } catch (err) {
+      log.warn('server.shutdown_component_failed', { signal, error: err?.message || String(err) });
+    }
+  }
+
+  const forceTimer = setTimeout(() => {
+    log.error('server.shutdown_forced', { signal });
+    process.exit(1);
+  }, 10_000);
+  forceTimer.unref?.();
+
+  httpServer.close(() => {
+    clearTimeout(forceTimer);
+    try { db.close?.(); } catch (err) {
+      log.warn('server.shutdown_db_close_failed', { error: err?.message || String(err) });
+    }
+    log.info('server.shutdown_complete', { signal });
+    process.exit(0);
+  });
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
 
 function rowToScheduledCallDTO(row) {
   if (!row) return null;
@@ -7912,7 +8096,7 @@ function renderPortfolioLaunchSurfaceHtml({ surface, serviceBusiness }) {
 // Minimal, server-rendered landing page used by /api/referrals/landing-html.
 // Keep this string self-contained — the goal is for the operator to preview
 // what a referred visitor sees without any frontend build step.
-function renderReferralLandingHtml() {
+function renderReferralLandingHtml(nonce = '') {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -7954,7 +8138,7 @@ function renderReferralLandingHtml() {
     </form>
     <footer>Referred by a site we built. callmemaybe ships small business websites same-day.</footer>
   </main>
-  <script>
+  <script nonce="${escapeHtml(nonce)}">
     (function () {
       var form = document.getElementById('discover-form');
       var status = document.getElementById('status');
@@ -7968,7 +8152,7 @@ function renderReferralLandingHtml() {
           city: form.city.value.trim(),
           count: 1
         };
-        fetch('/api/leads/discover', {
+        fetch('/api/referrals/leads', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload)

@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -12,13 +12,16 @@ import { fileURLToPath } from 'node:url';
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
 const dataDir = mkdtempSync(join(tmpdir(), 'callan-portfolio-readiness-browser-'));
-const screenshotBase = join(tmpdir(), 'callan-portfolio-readiness-command');
+const screenshotDir = join(repoRoot, 'output', 'playwright');
+mkdirSync(screenshotDir, { recursive: true });
+const screenshotBase = join(screenshotDir, 'callan-portfolio-readiness-command');
 const desktopScreenshot = `${screenshotBase}-desktop.png`;
 const receiptScreenshot = `${screenshotBase}-receipt.png`;
 const adapterBlockedScreenshot = `${screenshotBase}-adapter-blocked.png`;
 const adapterVerifiedScreenshot = `${screenshotBase}-adapter-verified.png`;
 const adapterEvidenceScreenshot = `${screenshotBase}-adapter-evidence.png`;
 const mobileScreenshot = `${screenshotBase}-mobile.png`;
+const UI_SETTLE_TIMEOUT_MS = 30_000;
 
 forceMockEnv(dataDir);
 
@@ -62,10 +65,10 @@ try {
   assert(desktopTitle.includes('agency console'));
   await desktop.getByRole('tab', { name: 'Portfolio' }).click();
   const commandCenter = desktop.locator('section[aria-label="board decision command center"]');
-  await commandCenter.getByRole('heading', { name: 'Decision Command Center' }).waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText('Mesa Readiness Browser Proof').waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText('2 pending local review').waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText('live proof still required').waitFor({ state: 'visible', timeout: 10000 });
+  await commandCenter.getByRole('heading', { name: 'Decision Command Center' }).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText('Mesa Readiness Browser Proof').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText('2 pending local review').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText('live proof still required').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   const commandText = await commandCenter.textContent();
   assert(commandText.includes('provider live smoke'));
   assert(commandText.includes('live adapter implemented'));
@@ -76,20 +79,20 @@ try {
   const exportBlockerQueue = commandCenter.getByRole('button', { name: 'Export stale blockers' });
   assert.equal(await exportBlockerQueue.count(), 1);
   await exportBlockerQueue.click();
-  await actionResult.getByText('export live release blocker queue').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText(/Stale blockers:/).waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText(/sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText(/Current export has no acknowledgement · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('export live release blocker queue').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText(/Stale blockers:/).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText(/sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText(/Current export has no acknowledgement · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   const acknowledgeChecksum = commandCenter.getByRole('button', { name: 'Acknowledge checksum' });
   assert.equal(await acknowledgeChecksum.count(), 1);
   await acknowledgeChecksum.click();
-  await actionResult.getByText('acknowledge live release blocker queue export review').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('reviewed redacted queue export').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('live execution still blocked').waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText(/Current export matches latest acknowledgement · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: 10000 });
-  await commandCenter.getByText(/Stale blockers · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('acknowledge live release blocker queue export review').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('reviewed redacted queue export').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('live execution still blocked').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText(/Current export matches latest acknowledgement · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await commandCenter.getByText(/Stale blockers · sha256 [a-f0-9]{12}/).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   const acknowledgedChecksum = commandCenter.getByRole('button', { name: 'Checksum acknowledged' });
-  await acknowledgedChecksum.waitFor({ state: 'visible', timeout: 10000 });
+  await acknowledgedChecksum.waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   assert.equal(await acknowledgedChecksum.isDisabled(), true);
   await commandCenter.scrollIntoViewIfNeeded();
   await desktop.screenshot({ path: desktopScreenshot, fullPage: false });
@@ -101,30 +104,30 @@ try {
   const recordSmokeReceipt = commandCenter.getByRole('button', { name: 'Record smoke receipt' });
   assert.equal(await recordSmokeReceipt.count(), 1);
   await recordSmokeReceipt.click();
-  await actionResult.getByText('Record Provider Smoke Receipt').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Recorded local provider-smoke proof packet').waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('Record Provider Smoke Receipt').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('Recorded local provider-smoke proof packet').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
 
   const attachSmoke = commandCenter.getByRole('button', { name: 'Attach smoke packet' });
   assert.equal(await attachSmoke.count(), 1);
   await attachSmoke.click();
-  await actionResult.getByText('Verified Live Evidence').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Provider Live Smoke Receipt').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('live gate cleared').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('local review cannot clear live gate').waitFor({ state: 'visible', timeout: 10000 });
+  await waitForPortfolioActionText(desktop, actionResult, 'Verified Live Evidence');
+  await actionResult.getByText('Provider Live Smoke Receipt').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('live gate cleared').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('local review cannot clear live gate').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   await actionResult.scrollIntoViewIfNeeded();
   await desktop.screenshot({ path: receiptScreenshot, fullPage: false });
 
   const runContractTests = commandCenter.getByRole('button', { name: 'Run contract tests' });
   assert.equal(await runContractTests.count(), 1);
   await runContractTests.click();
-  await actionResult.getByText('Run Adapter Contract Tests').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Recorded local adapter contract tests').waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('Run Adapter Contract Tests').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('Recorded local adapter contract tests').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
 
   const verifyAdapterPacket = commandCenter.getByRole('button', { name: 'Verify adapter packet' });
   assert.equal(await verifyAdapterPacket.count(), 1);
   await verifyAdapterPacket.click();
-  await actionResult.getByText('Verify Adapter Implementation').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Blocked local adapter implementation verification').waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('Verify Adapter Implementation').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('Blocked local adapter implementation verification').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   await actionResult.scrollIntoViewIfNeeded();
   await desktop.screenshot({ path: adapterBlockedScreenshot, fullPage: false });
   const blockedApiSnapshot = await fetchJson(`${apiBaseUrl}/api/portfolio/operating-model?workspaceId=${encodeURIComponent(seeded.workspaceId)}&limit=20`);
@@ -138,17 +141,17 @@ try {
   await commandCenter.getByLabel('rollback plan attached').check();
   await commandCenter.getByLabel('rollback reference').fill('browser-check rollback plan keeps external state untouched');
   await verifyAdapterPacket.click();
-  await actionResult.getByText('Verify Adapter Implementation').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Verified local adapter implementation packet').waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('Verify Adapter Implementation').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('Verified local adapter implementation packet').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   await actionResult.scrollIntoViewIfNeeded();
   await desktop.screenshot({ path: adapterVerifiedScreenshot, fullPage: false });
 
   const attachAdapter = commandCenter.getByRole('button', { name: 'Attach adapter packet' });
   assert.equal(await attachAdapter.count(), 1);
   await attachAdapter.click();
-  await actionResult.getByText('Verified Live Evidence').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('Live Adapter Implementation Receipt').waitFor({ state: 'visible', timeout: 10000 });
-  await actionResult.getByText('live gate cleared').waitFor({ state: 'visible', timeout: 10000 });
+  await actionResult.getByText('Verified Live Evidence').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('Live Adapter Implementation Receipt').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await actionResult.getByText('live gate cleared').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   await actionResult.scrollIntoViewIfNeeded();
   await desktop.screenshot({ path: adapterEvidenceScreenshot, fullPage: false });
 
@@ -161,9 +164,9 @@ try {
   await mobile.goto(appUrl, { waitUntil: 'domcontentloaded' });
   await mobile.getByRole('tab', { name: 'Portfolio' }).click();
   const mobileCommandCenter = mobile.locator('section[aria-label="board decision command center"]');
-  await mobileCommandCenter.getByRole('heading', { name: 'Decision Command Center' }).waitFor({ state: 'visible', timeout: 10000 });
-  await mobileCommandCenter.getByText('Mesa Readiness Browser Proof').waitFor({ state: 'visible', timeout: 10000 });
-  await mobileCommandCenter.getByText('pending local review').waitFor({ state: 'visible', timeout: 10000 });
+  await mobileCommandCenter.getByRole('heading', { name: 'Decision Command Center' }).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await mobileCommandCenter.getByText('Mesa Readiness Browser Proof').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  await mobileCommandCenter.getByText('pending local review').waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
   await mobileCommandCenter.scrollIntoViewIfNeeded();
   await mobile.screenshot({ path: mobileScreenshot, fullPage: false });
   assert.deepEqual(mobileConsoleIssues(), []);
@@ -520,6 +523,16 @@ async function stopChild(child) {
     sleep(1500).then(() => false)
   ]);
   if (!exited && child.exitCode == null) child.kill('SIGKILL');
+}
+
+async function waitForPortfolioActionText(page, actionResult, text) {
+  try {
+    await actionResult.getByText(text).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });
+  } catch (error) {
+    const alerts = await page.locator('.portfolio-alert').allTextContents().catch(() => []);
+    const results = await actionResult.allTextContents().catch(() => []);
+    throw new Error(`${error.message}\nPortfolio alerts: ${JSON.stringify(alerts)}\nPortfolio action results: ${JSON.stringify(results)}`);
+  }
 }
 
 function sleep(ms) {

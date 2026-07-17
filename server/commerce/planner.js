@@ -163,8 +163,14 @@ export function classifyCommerceRequest(input = {}) {
   const unsupported = type === 'handoff_only';
   const text = normalized.rawText || '';
   const commerceContext = /\b(products?|catalog|menu|prices?|packages?|services?|deposit|booking|appointment|membership|subscription|delivery|pickup|fulfillment|quote|estimate)\b/i.test(text);
-  const setupSignals = normalized.productsServicesPackages.length > 0 ||
-    Object.values(TYPE_PATTERNS).some((re) => re.test(text)) ||
+  const explicitSetup = (
+    /\b(set\s*up|setup|enable|sell|list|publish|accept|collect)\b.{0,100}\b(products?|catalog|menu|deposit|booking|appointments?|membership|subscription|checkout|payments?)\b/i.test(text) ||
+    /\b(products?|catalog|menu|deposit|booking|appointments?|membership|subscription|checkout|payments?)\b.{0,100}\b(set\s*up|setup|enable|sell|list|publish|accept|collect)\b/i.test(text)
+  );
+  const fulfillmentSetup = normalized.productsServicesPackages.length > 0 &&
+    /\b(delivery|pickup|pick\s+up|fulfillment|shipping)\s*(notes?|details?|instructions?)?\s*[:\-]/i.test(text);
+  const setupSignals = explicitSetup ||
+    fulfillmentSetup ||
     (normalized.paymentInterest && commerceContext);
 
   if (unsupported) {

@@ -476,7 +476,7 @@ export default function ShareView({ token }) {
             <iframe
               title="your build in progress"
               src={live}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox={String(live).startsWith('/api/') ? 'allow-same-origin' : 'allow-scripts allow-same-origin'}
               referrerPolicy="no-referrer"
             />
           ) : (

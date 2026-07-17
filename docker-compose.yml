@@ -1,8 +1,14 @@
 services:
   callmemaybe:
     build: .
+    init: true
+    restart: unless-stopped
     env_file: .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /app/.data
     ports:
       - "8787:8787"
     volumes:
       - ./.data:/app/.data
+    stop_grace_period: 15s

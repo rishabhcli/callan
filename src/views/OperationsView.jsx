@@ -115,6 +115,7 @@ function ProductionCommandCenter() {
   const [actionResult, setActionResult] = useState('');
   const [resetReady, setResetReady] = useState(false);
   const [adminToken, setAdminToken] = useState(() => api.getAdminToken());
+  const [expanded, setExpanded] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -224,20 +225,47 @@ function ProductionCommandCenter() {
   }, [adminToken, load]);
 
   return (
-    <section className="prod-command-center" aria-label="production command center">
+    <section
+      className={`prod-command-center ${expanded ? 'is-expanded' : 'is-compact'}`}
+      aria-label="production command center"
+    >
       <div className="prod-command-head">
         <div>
           <div className="prod-command-kicker">safe to sell today</div>
-          <div className={`prod-command-status ${safe?.ok ? 'is-good' : 'is-blocked'}`}>
-            {safe?.ok ? 'yes' : 'no'}
+          <div className={`prod-command-status ${safe ? (safe.ok ? 'is-good' : 'is-blocked') : 'is-pending'}`}>
+            {safe ? (safe.ok ? 'yes' : 'no') : '—'}
           </div>
         </div>
-        <div className="prod-command-mode">
-          <span>{data?.mode || 'checking'}</span>
-          <strong>{loading ? 'syncing' : 'live view'}</strong>
+        <div className="prod-command-head-actions">
+          <div className="prod-command-mode">
+            <span>{data?.mode || 'checking'}</span>
+            <strong>{loading ? 'syncing' : 'live view'}</strong>
+          </div>
+          <button
+            type="button"
+            className="prod-command-toggle"
+            onClick={() => setExpanded((value) => !value)}
+            aria-expanded={expanded}
+            aria-controls="prod-command-details"
+          >
+            {expanded ? 'collapse' : 'details'}
+          </button>
         </div>
       </div>
 
+      <div className="prod-command-glance" aria-label="readiness summary">
+        <Metric label="evals" value={formatEvalSummary(evalSummary)} tone={data?.evals?.ok ? 'good' : 'warm'} />
+        <Metric label="backup" value={backup ? (backup.ok ? 'fresh' : 'blocked') : 'pending'} tone={backup ? (backup.ok ? 'good' : 'bad') : 'muted'} />
+        <Metric label="queue" value={data ? `${queue.due || 0}/${queue.staleRunning || 0}` : 'pending'} tone={data ? (queue.staleRunning ? 'bad' : 'good') : 'muted'} />
+        <Metric label="margin" value={data ? formatUsd(economics.marginUsd) : 'pending'} tone={data ? ((economics.marginUsd || 0) >= 0 ? 'good' : 'warm') : 'muted'} />
+      </div>
+
+      <div className={`prod-command-summary ${blockers.length ? 'is-blocked' : 'is-clear'}`}>
+        <span>{data ? (blockers.length ? `${blockers.length} release blocker${blockers.length === 1 ? '' : 's'}` : 'No production blockers') : 'Checking release posture…'}</span>
+        <strong>{data ? `${formatReceiptProviders(decisionReceipt)} providers verified` : 'provider proof pending'}</strong>
+      </div>
+
+      <div id="prod-command-details" className="prod-command-details" hidden={!expanded}>
       <div className="prod-command-grid">
         <Metric label="evals" value={formatEvalSummary(evalSummary)} tone={data?.evals?.ok ? 'good' : 'warm'} />
         <Metric label="backup" value={backup?.ok ? 'fresh' : 'blocked'} tone={backup?.ok ? 'good' : 'bad'} />
@@ -433,6 +461,7 @@ function ProductionCommandCenter() {
         <button type="button" onClick={saveAdminToken} disabled={loading || !!action}>
           {adminToken ? 'save' : 'clear'}
         </button>
+      </div>
       </div>
     </section>
   );

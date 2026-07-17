@@ -3648,7 +3648,7 @@ try {
     );
     assert.equal(
       packageJson.scripts['check:ci'],
-      'npm run check && npm run check:evals && npm run check:handoff && npm run check:eval-adapter-contract && npm run check:maygoals'
+      'npm run check:core'
     );
     const generatedEvalPath = join(process.cwd(), 'scripts/generated-evals/operator_handoff_customer_success.check.js');
     const generatedEvalSource = readFileSync(generatedEvalPath, 'utf8');
@@ -3664,11 +3664,8 @@ try {
       'pull_request:',
       'workflow_dispatch:',
       'npm ci',
-      'npm run check',
-      'npm run check:evals',
-      'npm run check:handoff',
-      'npm run check:eval-adapter-contract',
-      'npm run check:maygoals',
+      'npx playwright install --with-deps chromium',
+      'npm run check:deploy',
       'LIVE_CALLS: "false"',
       'LIVE_EMAILS: "false"',
       'LIVE_PAYMENTS: "false"',

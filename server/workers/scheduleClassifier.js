@@ -116,15 +116,17 @@ function fallbackHeuristic(text, { timezone }) {
 
   const wantsCall = /\b(call me|schedule a call|give me a (?:call|ring)|hop on a call|let'?s (?:get on|hop on) a call)\b/i.test(text);
 
-  const timeMatch = text.match(/\b(today|tomorrow|tonight)?\b[^.]{0,30}?\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const explicitTimeMatch = text.match(/\b(today|tomorrow|tonight)\b[^.]{0,40}?\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const plainTimeMatch = explicitTimeMatch ? null : text.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const timeMatch = explicitTimeMatch || plainTimeMatch;
 
   let scheduledAtIso = null;
   let scheduledAtRaw = '';
   if (timeMatch && wantsCall) {
-    const dayWord = (timeMatch[1] || 'today').toLowerCase();
-    let hour = Number(timeMatch[2]);
-    const min = Number(timeMatch[3] || '0');
-    const mer = (timeMatch[4] || '').toLowerCase();
+    const dayWord = explicitTimeMatch ? explicitTimeMatch[1].toLowerCase() : 'today';
+    let hour = Number(explicitTimeMatch ? explicitTimeMatch[2] : plainTimeMatch[1]);
+    const min = Number((explicitTimeMatch ? explicitTimeMatch[3] : plainTimeMatch[2]) || '0');
+    const mer = String(explicitTimeMatch ? explicitTimeMatch[4] : plainTimeMatch[3]).toLowerCase();
     if (mer === 'pm' && hour < 12) hour += 12;
     if (mer === 'am' && hour === 12) hour = 0;
 

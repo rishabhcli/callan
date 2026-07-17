@@ -870,6 +870,24 @@ export function classifyMessage(input = '') {
     });
   }
 
+  if (commerceRequest.kind === 'supported') {
+    return classificationResult({
+      kind: 'supported',
+      scope: 'commerce setup',
+      scopes: unique(['commerce setup', commerceRequest.type]),
+      supported: true,
+      operatorFlag: false,
+      replyMode: 'autonomous_reply',
+      reason: commerceRequest.reason,
+      matches: {
+        supported: unique(['commerce setup', commerceRequest.type]),
+        unsupported: []
+      },
+      growthReply,
+      commerceRequest
+    });
+  }
+
   const nonCommerceSupportedMatches = supportedMatches.filter((m) => m.scope !== 'commerce setup');
   if (nonCommerceSupportedMatches.length) {
     const scope = nonCommerceSupportedMatches[0].scope;
@@ -884,24 +902,6 @@ export function classifyMessage(input = '') {
       reason: `supported scope: ${scope}`,
       matches: {
         supported: scopes,
-        unsupported: []
-      },
-      growthReply,
-      commerceRequest
-    });
-  }
-
-  if (commerceRequest.kind === 'supported') {
-    return classificationResult({
-      kind: 'supported',
-      scope: 'commerce setup',
-      scopes: unique(['commerce setup', commerceRequest.type]),
-      supported: true,
-      operatorFlag: false,
-      replyMode: 'autonomous_reply',
-      reason: commerceRequest.reason,
-      matches: {
-        supported: unique(['commerce setup', commerceRequest.type]),
         unsupported: []
       },
       growthReply,

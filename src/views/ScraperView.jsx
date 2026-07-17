@@ -139,7 +139,7 @@ function SessionCard({ session }) {
           <iframe
             title={`browser-use ${session.sessionId}`}
             src={liveUrl}
-            sandbox="allow-scripts allow-same-origin"
+            sandbox={String(liveUrl).startsWith('/api/') ? 'allow-same-origin' : 'allow-scripts allow-same-origin'}
             referrerPolicy="no-referrer"
           />
         ) : session.screenshotUrl ? (

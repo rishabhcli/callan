@@ -1,18 +1,38 @@
-FROM node:22-slim
+FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 build-essential \
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
+RUN npm run build \
+  && npm prune --omit=dev \
+  && npm cache clean --force
 
-RUN npm run build
+FROM node:22-bookworm-slim AS runtime
+
+ENV NODE_ENV=production \
+    PORT=8787 \
+    DATA_DIR=/app/.data
+
+WORKDIR /app
+
+COPY --from=build --chown=node:node /app /app
+
+RUN mkdir -p /app/.data \
+  && chown -R node:node /app/.data
+
+USER node
 
 EXPOSE 8787
+STOPSIGNAL SIGTERM
 
-CMD ["npm", "start"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8787) + '/api/ping').then((r) => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))"
+
+CMD ["node", "server/index.js"]

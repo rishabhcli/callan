@@ -186,7 +186,7 @@ Live-adapter readiness is now durable instead of guessed. `portfolio_eval_live_a
 
 Live-adapter contract tests now convert that readiness review into local implementation proof without touching CI or providers. `portfolio_eval_live_adapter_contract_test_receipts` consumes a readiness receipt and a passing in-process `operator_handoff_eval_live_adapter` contract result from `server/handoff.js` fixtures, records legal/refund/consent/provider/payment handoff assertions, marks the adapter as locally implemented/test-backed, and still blocks executable publication on real CI write access while proving no live adapter invocation, provider mutation, customer message, eval/test file write, runner command, workflow mutation, or external side effect occurred.
 
-The same contract now has a repo-native executable path. `npm run check:eval-adapter-contract` runs `scripts/generated-evals/operator_handoff_customer_success.check.js`, which executes the in-process contract runner and fails if any golden handoff fixture, non-mutating proof, or no-external-provider assertion regresses. `npm run check:ci` mirrors the CI gate locally, and `.github/workflows/callan-evals.yml` wires that contract into GitHub Actions alongside syntax checks, production evals, handoff checks, and the May Goals ledger.
+The same contract now has a repo-native executable path. `npm run check:eval-adapter-contract` runs `scripts/generated-evals/operator_handoff_customer_success.check.js`, which executes the in-process contract runner and fails if any golden handoff fixture, non-mutating proof, or no-external-provider assertion regresses. `npm run check:ci` runs the deterministic core suite, while `npm run check:deploy` adds the real-browser portfolio and end-to-end UI proofs, complete mock lifecycle, production dependency audit, production-mode HTTP smoke, security-header assertions, and graceful-shutdown proof. `.github/workflows/callan-evals.yml` installs Chromium and runs that deployment gate on pushes and pull requests.
 
 CI workflow publication now has its own receipt instead of living only in repo files. `portfolio_eval_ci_workflow_publication_receipts` consumes a passing live-adapter contract-test receipt, verifies the local GitHub Actions workflow, generated eval artifact, package script, and local CI mirror command, records file hashes/evidence, and keeps external CI execution unobserved and blocked while proving no runner command, live adapter invocation, provider mutation, customer message, workflow mutation, or live side effect occurred.
 
@@ -514,6 +514,10 @@ npm run check:aftercare  # deterministic account-manager plan, scheduler, portal
 npm run check:production # read-only production readiness report
 npm run check:safety     # local safety, HMAC/replay, and idempotency checks
 npm run check:browser-console # seeds Browser Use session rows and verifies status API + UI build
+npm run check:portfolio-readiness-browser # desktop/mobile Playwright proof of the portfolio command center
+npm run check:ui-flows   # desktop/mobile shell, tabs, embedded preview, and customer portal flows
+npm run check:ci       # deterministic core build and application suites
+npm run check:deploy   # complete local/CI deployment gate, including browser and production-mode smoke
 npm run check:maygoals  # portfolio operating-model proof for the impossible May Goals substrate
 npm run drill:reliability # isolated reliability/backpressure drill plus auto-started route proof
 npm run smoke:providers  # provider readiness and optional live smoke checks
@@ -644,16 +648,21 @@ SMOKE_LIVE_CALL=true SMOKE_TEST_PHONE=+15555550100 npm run smoke:providers -- --
 ## Production Readiness
 
 ```sh
+npm run check:deploy
 npm run check:production
 npm run check:safety
 npm run drill:reliability
 ```
 
+`check:deploy` is the release gate for the repository itself. It builds the frontend, runs the deterministic application suites, launches the portfolio and end-to-end UI Playwright proofs, completes the mocked lead-to-launch lifecycle, rejects high-severity production dependency advisories, then boots the production server with an isolated SQLite directory and verifies liveness, authenticated health, public referral intake, API 404 behavior, security headers, and graceful `SIGTERM` shutdown.
+
 `check:production` is read-only. It reports provider configured status, webhook status, smoke status, last error, quota/cost status, blocker reasons, and the next action for every provider. It exits report-only by default unless the app is already in `production_live`; use `npm run check:production -- --strict` to make production blockers fail locally.
 
 The readiness payload also exposes separate promotion gates for `production_review` and `production_live`. Review mode requires production credentials, a strong `ADMIN_API_TOKEN`, webhook secrets, fresh dry-run/config smoke, healthy jobs, and no live side-effect flags. Live mode requires the explicit production ack, production `NODE_ENV`, public HTTPS URL, fresh webhooks, fresh live smoke for every required provider, enabled side-effect flags, and healthy compliance/reputation/job gates.
 
-Operator API reads and mutations accept `Authorization: Bearer $ADMIN_API_TOKEN`, `X-Admin-Token: $ADMIN_API_TOKEN`, or the console-managed same-origin admin cookie. Local mock/dev runs remain usable without a token unless `ADMIN_API_TOKEN` is set; `production_review`, `production_live`, and `NODE_ENV=production` require one before health/readiness internals, leads, jobs, ops dashboards, discovery, calls, builds, outreach controls, aftercare actions, backup, reset, export, self-check, or stuck-job recovery controls can be used. `/api/ping` is the intentionally public liveness probe; provider webhooks keep their provider signatures, customer share-link actions stay scoped to the portal token, and hosting accept/preview image routes remain scoped public links instead of operator-token routes.
+Operator API reads and mutations accept `Authorization: Bearer $ADMIN_API_TOKEN` or `X-Admin-Token: $ADMIN_API_TOKEN`. The console keeps the token only in page memory—it is not bundled into the frontend, written to browser storage, or copied into a cookie—so a full refresh requires re-entering it. Local mock/dev runs remain usable without a token unless `ADMIN_API_TOKEN` is set; `production_review`, `production_live`, and `NODE_ENV=production` require a strong token at process startup before health/readiness internals, leads, jobs, ops dashboards, discovery, calls, builds, outreach controls, aftercare actions, backup, reset, export, self-check, or stuck-job recovery controls can be used. `/api/ping` is the intentionally public liveness probe; the referral form uses a dedicated rate-limited public intake route; provider webhooks keep their provider signatures; customer share-link actions stay scoped to the portal token; and hosting accept/preview image routes remain scoped public links instead of operator-token routes.
+
+Container deployment, persistent-volume requirements, webhook registration, promotion order, health checks, rollback, and the single-replica SQLite constraint are documented in [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 Safe-to-sell also enforces economics, provider-health, and worker-health guards over the last 24h of SQLite history. Tune `OPS_MAX_DAILY_COST_USD`, `OPS_MAX_DAILY_LOSS_USD`, and `OPS_MIN_MARGIN_PCT` to set the spend ceiling, loss ceiling, and paid-work margin floor; tune `OPS_PROVIDER_MAX_ISSUE_RATE_PCT`, `OPS_PROVIDER_MIN_EVENTS_FOR_ISSUE_RATE`, and `OPS_PROVIDER_MAX_AVG_LATENCY_MS` to block launch on flaky or slow providers even when the latest row looks superficially okay. Worker/job failure budgets are controlled by `OPS_WORKER_MAX_FAILURES_24H`, `OPS_WORKER_MAX_FAILURE_RATE_PCT`, `OPS_WORKER_MIN_RUNS_FOR_FAILURE_RATE`, and `OPS_JOB_MAX_ISSUES_24H`.
 

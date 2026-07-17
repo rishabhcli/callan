@@ -87,6 +87,7 @@ export const env = {
   publicUrl: process.env.APP_PUBLIC_URL || 'http://localhost:8787',
   dataDir: process.env.DATA_DIR || '.data',
   nodeEnv: process.env.NODE_ENV || 'development',
+  trustProxyHops: Math.max(0, Math.floor(num(process.env.TRUST_PROXY_HOPS, 0))),
   admin: {
     apiToken: process.env.ADMIN_API_TOKEN || ''
   },

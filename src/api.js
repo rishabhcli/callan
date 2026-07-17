@@ -4,23 +4,15 @@ async function jsonOr(res) {
   try { return JSON.parse(text); } catch { return { error: text }; }
 }
 
-const ADMIN_TOKEN_KEY = 'callan.adminToken';
-const ADMIN_COOKIE_NAME = 'callan_admin_token';
 const ADMIN_TOKEN_EVENT = 'callan-admin-token-changed';
-
-function bundledAdminToken() {
-  return import.meta.env?.VITE_ADMIN_API_TOKEN || '';
-}
+let inMemoryAdminToken = '';
 
 function adminToken() {
-  if (typeof window === 'undefined') return bundledAdminToken();
-  const token = window.localStorage.getItem(ADMIN_TOKEN_KEY) || bundledAdminToken();
-  syncAdminCookie(token);
-  return token;
+  return inMemoryAdminToken;
 }
 
 async function call(method, path, body) {
-  const opts = { method, headers: {}, credentials: 'same-origin' };
+  const opts = { method, headers: {} };
   const token = adminToken();
   if (token) opts.headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) {
@@ -39,12 +31,11 @@ async function call(method, path, body) {
 export const api = {
   getAdminToken: adminToken,
   setAdminToken: (token = '') => {
-    if (typeof window === 'undefined') return;
     const value = String(token || '').trim();
-    if (value) window.localStorage.setItem(ADMIN_TOKEN_KEY, value);
-    else window.localStorage.removeItem(ADMIN_TOKEN_KEY);
-    syncAdminCookie(value);
-    window.dispatchEvent(new CustomEvent(ADMIN_TOKEN_EVENT, { detail: { configured: Boolean(value) } }));
+    inMemoryAdminToken = value;
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent(ADMIN_TOKEN_EVENT, { detail: { configured: Boolean(value) } }));
+    }
   },
   health: () => call('GET', '/api/health'),
   listLeads: () => call('GET', '/api/leads'),
@@ -238,13 +229,3 @@ export const api = {
   referralsRollup: () => call('GET', '/api/referrals/rollup'),
   leadPriorities: () => call('GET', '/api/leads/priorities')
 };
-
-function syncAdminCookie(token = '') {
-  if (typeof document === 'undefined') return;
-  const secure = window.location?.protocol === 'https:' ? '; Secure' : '';
-  if (!token) {
-    document.cookie = `${ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax${secure}`;
-    return;
-  }
-  document.cookie = `${ADMIN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=2592000; SameSite=Lax${secure}`;
-}

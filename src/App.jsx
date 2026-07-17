@@ -1,15 +1,15 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RightRail from './components/RightRail.jsx';
-import LiveInboundPanel from './components/LiveInboundPanel.jsx';
 import OperationsView from './views/OperationsView.jsx';
-import PortfolioView from './views/PortfolioView.jsx';
-import ScraperView from './views/ScraperView.jsx';
-import MemoryView from './views/MemoryView.jsx';
-import AgentsView from './views/AgentsView.jsx';
-import SettingsView from './views/SettingsView.jsx';
-import ShareView from './views/ShareView.jsx';
 import { useSSE } from './useSSE.js';
 import { api } from './api.js';
+
+const PortfolioView = lazy(() => import('./views/PortfolioView.jsx'));
+const ScraperView = lazy(() => import('./views/ScraperView.jsx'));
+const MemoryView = lazy(() => import('./views/MemoryView.jsx'));
+const AgentsView = lazy(() => import('./views/AgentsView.jsx'));
+const SettingsView = lazy(() => import('./views/SettingsView.jsx'));
+const ShareView = lazy(() => import('./views/ShareView.jsx'));
 
 const RESEARCH_LANE_LABELS = {
   'reverse-phone': 'Reverse phone lookup',
@@ -285,7 +285,13 @@ function getShareToken() {
 
 export default function App() {
   const shareToken = useMemo(getShareToken, []);
-  if (shareToken) return <ShareView token={shareToken} />;
+  if (shareToken) {
+    return (
+      <Suspense fallback={<ViewFallback label="Loading customer portal" />}>
+        <ShareView token={shareToken} />
+      </Suspense>
+    );
+  }
   return <Console />;
 }
 
@@ -652,6 +658,7 @@ function Console() {
 
   return (
     <div className="nyna-shell">
+      <a className="skip-link" href="#main-content">Skip to workspace</a>
       <Topbar
         activeTab={activeTab}
         onTabChange={(id) => { setActiveTab(id); setFocusedNodeId(null); }}
@@ -667,62 +674,72 @@ function Console() {
           health={health}
           outreach={outreach}
           running={running}
+          selectedNodeId={focusedNodeId}
+          onSelectNode={handleNodeSelect}
           onStartAutonomy={running ? pauseAutonomy : startAutonomy}
           onEmergencyStop={emergencyStop}
         />
 
-        <div className="nyna-stage-wrap">
-          {activeTab === 'operations' ? (
-            <OperationsView
-              nodeStates={nodeStates}
-              counters={counters}
-              selectedNodeId={focusedNodeId}
-              onSelectNode={handleNodeSelect}
-              focusedLeadId={focusedLeadId}
-              leadDetail={leadDetail}
-              liveTranscript={liveTranscript}
-              liveCallId={liveCallId}
-              liveCallActive={liveCallActive}
-              builderInfo={builderInfo}
-              builderAction={builderAction}
-              health={health}
-              onRetryBuild={retryBuild}
-              outreach={outreach}
-              onStartAutonomy={startAutonomy}
-              onStopAutonomy={stopAutonomy}
-              onLeadChanged={handleLeadChanged}
-              handoffCases={handoffCases}
-              onFocusLead={handleLeadFocus}
-              inbound={inbound}
-              onDismissInbound={() => setInbound(EMPTY_INBOUND)}
-            />
-          ) : activeTab === 'portfolio' ? (
-            <PortfolioView />
-          ) : activeTab === 'agents' ? (
-            <AgentsView
-              nodeStates={nodeStates}
-              counters={counters}
-              leads={leads}
-              outreach={outreach}
-              onFocusLead={handleLeadFocus}
-            />
-          ) : activeTab === 'scraper' ? (
-            <ScraperView
-              focusedLeadId={focusedLeadId}
-              leadDetail={leadDetail}
-              onLeadChanged={handleLeadChanged}
-            />
-          ) : activeTab === 'memory' ? (
-            <MemoryView focusedLeadId={focusedLeadId} />
-          ) : activeTab === 'settings' ? (
-            <SettingsView
-              health={health}
-              outreach={outreach}
-              onStartAutonomy={startAutonomy}
-              onStopAutonomy={stopAutonomy}
-              onEmergencyStop={emergencyStop}
-            />
-          ) : null}
+        <div
+          id="main-content"
+          className="nyna-stage-wrap"
+          role="tabpanel"
+          aria-labelledby={`tab-${activeTab}`}
+          tabIndex="-1"
+        >
+          <Suspense fallback={<ViewFallback label={`Loading ${activeTab}`} />}>
+            {activeTab === 'operations' ? (
+              <OperationsView
+                nodeStates={nodeStates}
+                counters={counters}
+                selectedNodeId={focusedNodeId}
+                onSelectNode={handleNodeSelect}
+                focusedLeadId={focusedLeadId}
+                leadDetail={leadDetail}
+                liveTranscript={liveTranscript}
+                liveCallId={liveCallId}
+                liveCallActive={liveCallActive}
+                builderInfo={builderInfo}
+                builderAction={builderAction}
+                health={health}
+                onRetryBuild={retryBuild}
+                outreach={outreach}
+                onStartAutonomy={startAutonomy}
+                onStopAutonomy={stopAutonomy}
+                onLeadChanged={handleLeadChanged}
+                handoffCases={handoffCases}
+                onFocusLead={handleLeadFocus}
+                inbound={inbound}
+                onDismissInbound={() => setInbound(EMPTY_INBOUND)}
+              />
+            ) : activeTab === 'portfolio' ? (
+              <PortfolioView />
+            ) : activeTab === 'agents' ? (
+              <AgentsView
+                nodeStates={nodeStates}
+                counters={counters}
+                leads={leads}
+                outreach={outreach}
+                onFocusLead={handleLeadFocus}
+              />
+            ) : activeTab === 'scraper' ? (
+              <ScraperView
+                focusedLeadId={focusedLeadId}
+                leadDetail={leadDetail}
+                onLeadChanged={handleLeadChanged}
+              />
+            ) : activeTab === 'memory' ? (
+              <MemoryView focusedLeadId={focusedLeadId} />
+            ) : activeTab === 'settings' ? (
+              <SettingsView
+                health={health}
+                outreach={outreach}
+                onStartAutonomy={startAutonomy}
+                onStopAutonomy={stopAutonomy}
+                onEmergencyStop={emergencyStop}
+              />
+            ) : null}
+          </Suspense>
         </div>
 
         <RightRail
@@ -759,6 +776,20 @@ function Sparkle({ size = 16, color = '#640D14' }) {
 }
 
 function Topbar({ activeTab, onTabChange, queueCounts }) {
+  const onTabKeyDown = (event, currentId) => {
+    const currentIndex = TABS.findIndex((tab) => tab.id === currentId);
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % TABS.length;
+    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + TABS.length) % TABS.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = TABS.length - 1;
+    else return;
+    event.preventDefault();
+    const next = TABS[nextIndex];
+    onTabChange(next.id);
+    requestAnimationFrame(() => document.getElementById(`tab-${next.id}`)?.focus());
+  };
+
   return (
     <header className="nyna-topbar">
       <div className="nyna-brand">
@@ -778,10 +809,15 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
           return (
             <button
               key={tab.id}
+              id={`tab-${tab.id}`}
+              type="button"
               className={`nyna-tab ${isActive ? 'nyna-tab-active' : ''}`}
               onClick={() => onTabChange(tab.id)}
+              onKeyDown={(event) => onTabKeyDown(event, tab.id)}
               role="tab"
               aria-selected={isActive}
+              aria-controls="main-content"
+              tabIndex={isActive ? 0 : -1}
             >
               <span>{tab.label}</span>
               {badge ? <span className="nyna-tab-badge">{badge}</span> : null}
@@ -799,23 +835,53 @@ function badgeFor(tabId, queue = {}) {
   return null;
 }
 
-function SideNav({ activeTab, counters, queueCounts, mode, health, outreach, running, onStartAutonomy, onEmergencyStop }) {
+function SideNav({
+  activeTab,
+  counters,
+  queueCounts,
+  mode,
+  health,
+  outreach,
+  running,
+  selectedNodeId,
+  onSelectNode,
+  onStartAutonomy,
+  onEmergencyStop
+}) {
   const agents = outreach?.agents;
   const agentText = agents ? `${agents.active || 0}/${agents.concurrency || 1}` : '—';
   const providersText = countProviders(health);
+  const items = sectionItemsForTab(activeTab, counters, queueCounts, selectedNodeId);
   return (
     <aside className="nyna-side">
       <div className="nyna-side-section">
         <div className="nyna-side-title">{activeTab}</div>
-        {sectionItemsForTab(activeTab, counters, queueCounts).map((item) => (
-          <button key={item.label} className={`nyna-side-item ${item.active ? 'nyna-side-item-active' : ''}`}>
-            <span className="nyna-side-item-left">
-              <span className={`nyna-side-spark${item.tone ? ` nyna-side-spark-${item.tone}` : ''}`} />
-              <span className="nyna-side-item-label">{item.label}</span>
-            </span>
-            <span className="nyna-side-item-count">{item.count ?? ''}</span>
-          </button>
-        ))}
+        {items.map((item) => {
+          const content = (
+            <>
+              <span className="nyna-side-item-left">
+                <span className={`nyna-side-spark${item.tone ? ` nyna-side-spark-${item.tone}` : ''}`} />
+                <span className="nyna-side-item-label">{item.label}</span>
+              </span>
+              <span className="nyna-side-item-count">{item.count ?? ''}</span>
+            </>
+          );
+          return item.nodeId ? (
+            <button
+              key={item.label}
+              type="button"
+              className={`nyna-side-item ${item.active ? 'nyna-side-item-active' : ''}`}
+              onClick={() => onSelectNode?.(item.nodeId)}
+              aria-pressed={item.active}
+            >
+              {content}
+            </button>
+          ) : (
+            <div key={item.label} className={`nyna-side-item nyna-side-item-static ${item.active ? 'nyna-side-item-active' : ''}`}>
+              {content}
+            </div>
+          );
+        })}
       </div>
 
       <div className="nyna-side-status-panel" aria-label="status">
@@ -836,12 +902,12 @@ function SideNav({ activeTab, counters, queueCounts, mode, health, outreach, run
       </div>
 
       <div className="nyna-side-controls">
-        <div className="nyna-side-controls-kicker">AI Cold-Calling</div>
+        <div className="nyna-side-controls-kicker">Autonomy</div>
         <div className="nyna-side-controls-row">
-          <button className="nyna-side-action nyna-side-action-primary" onClick={onStartAutonomy}>
+          <button type="button" className="nyna-side-action nyna-side-action-primary" onClick={onStartAutonomy}>
             {running ? 'pause' : 'start'}
           </button>
-          <button className="nyna-side-action nyna-side-action-danger" onClick={onEmergencyStop}>
+          <button type="button" className="nyna-side-action nyna-side-action-danger" onClick={onEmergencyStop}>
             stop
           </button>
         </div>
@@ -857,14 +923,14 @@ function countProviders(health) {
   return `${on}/${total}`;
 }
 
-function sectionItemsForTab(tab, counters = {}, queue = {}) {
+function sectionItemsForTab(tab, counters = {}, queue = {}, selectedNodeId = null) {
   if (tab === 'operations') {
     return [
-      { label: 'supermemory',  count: counters.memory || 0, tone: counters.memory ? 'live' : null, active: true },
-      { label: 'agent phone',  count: counters.caller || 0, tone: counters.caller ? 'live' : null },
-      { label: 'browser use',  count: (counters.scraper || 0) + (counters.analyst || 0), tone: (counters.scraper || counters.analyst) ? 'live' : null },
-      { label: 'agent mail',   count: counters.mailer || 0 },
-      { label: 'lovable',      count: counters.builder || 0, tone: counters.builder ? 'live' : null }
+      { label: 'supermemory', nodeId: 'memory', count: counters.memory || 0, tone: counters.memory ? 'live' : null, active: selectedNodeId === 'memory' },
+      { label: 'agent phone', nodeId: 'caller', count: counters.caller || 0, tone: counters.caller ? 'live' : null, active: selectedNodeId === 'caller' },
+      { label: 'browser use', nodeId: 'scraper', count: (counters.scraper || 0) + (counters.analyst || 0), tone: (counters.scraper || counters.analyst) ? 'live' : null, active: selectedNodeId === 'scraper' },
+      { label: 'agent mail', nodeId: 'mailer', count: counters.mailer || 0, active: selectedNodeId === 'mailer' },
+      { label: 'lovable', nodeId: 'builder', count: counters.builder || 0, tone: counters.builder ? 'live' : null, active: selectedNodeId === 'builder' }
     ];
   }
   if (tab === 'agents') {
@@ -907,4 +973,13 @@ function sectionItemsForTab(tab, counters = {}, queue = {}) {
     ];
   }
   return [];
+}
+
+function ViewFallback({ label }) {
+  return (
+    <div className="nyna-view-fallback" role="status" aria-live="polite">
+      <span className="nyna-view-fallback-dot" />
+      {label}
+    </div>
+  );
 }
