@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -781,7 +781,7 @@ try {
           sent: true,
           messageId: 'msg_ops_hosting_upsell',
           threadId: 'thread_ops_hosting_upsell',
-          acceptUrl: 'https://callan.example.test/api/hosting/accept/ops_hosting_upsell_lead'
+          acceptLinkIssued: true
         })
       })
     }, { workerId: 'ops-hosting-upsell-success-check', concurrency: 1, maxJobs: 1 });
@@ -790,6 +790,7 @@ try {
     assert.equal(completed.status, 'completed');
     assert.equal(completed.result?.sent, true);
     assert.equal(completed.result?.messageId, 'msg_ops_hosting_upsell');
+    assert.equal(completed.result?.acceptLinkIssued, true);
     assert.equal(completed.attempts, 2);
   });
 
@@ -3592,21 +3593,26 @@ try {
   });
 
 	  await check('admin_auth.production_modes_require_strong_operator_token', async () => {
-    const missing = adminAuthPosture({ mode: 'production_live', nodeEnv: 'production', token: '' });
+    const missing = adminAuthPosture({ mode: 'production_live', nodeEnv: 'production', token: '', operators: [] });
     assert.equal(missing.ok, false);
-    assert(missing.blockers.some((blocker) => blocker.includes('ADMIN_API_TOKEN is required')), missing.blockers.join('\n'));
-    const weak = adminAuthPosture({ mode: 'production_review', nodeEnv: 'test', token: 'short' });
+    assert(missing.blockers.some((blocker) => /ADMIN_API_TOKEN|ADMIN_API_TOKENS_JSON/.test(blocker)), missing.blockers.join('\n'));
+    const weak = adminAuthPosture({ mode: 'production_review', nodeEnv: 'test', token: 'short', operators: [] });
     assert.equal(weak.ok, false);
     assert(weak.blockers.some((blocker) => blocker.includes('at least 24 characters')), weak.blockers.join('\n'));
-    assert.equal(adminAuthStatus({ providedToken: 'short', configuredToken: 'short', mode: 'production_review', nodeEnv: 'test' }).code, 'ADMIN_AUTH_WEAK_TOKEN');
+    assert.equal(adminAuthStatus({ providedToken: 'short', configuredToken: 'short', operators: [], mode: 'production_review', nodeEnv: 'test' }).code, 'ADMIN_AUTH_WEAK_TOKEN');
     const token = 'ops-admin-token-0123456789';
-    const ready = adminAuthPosture({ mode: 'production_live', nodeEnv: 'production', token });
+    const ready = adminAuthPosture({ mode: 'production_live', nodeEnv: 'production', token, operators: [] });
     assert.equal(ready.ok, true);
-    assert.equal(adminAuthStatus({ providedToken: token, configuredToken: token, mode: 'production_live', nodeEnv: 'production' }).ok, true);
-    const wrong = adminAuthStatus({ providedToken: 'wrong', configuredToken: token, mode: 'production_live', nodeEnv: 'production' });
+    assert.equal(adminAuthStatus({ providedToken: token, configuredToken: token, operators: [], mode: 'production_live', nodeEnv: 'production' }).ok, true);
+    const named = [{ id: 'viewer@example.com', role: 'viewer', token: 'named-viewer-token-0123456789' }];
+    const namedStatus = adminAuthStatus({ providedToken: named[0].token, configuredToken: '', operators: named, mode: 'production_live', nodeEnv: 'production' });
+    assert.equal(namedStatus.ok, true);
+    assert.equal(namedStatus.operator.id, 'viewer@example.com');
+    assert.equal(namedStatus.operator.role, 'viewer');
+    const wrong = adminAuthStatus({ providedToken: 'wrong', configuredToken: token, operators: [], mode: 'production_live', nodeEnv: 'production' });
     assert.equal(wrong.ok, false);
     assert.equal(wrong.code, 'ADMIN_AUTH_REQUIRED');
-    const local = adminAuthStatus({ providedToken: '', configuredToken: '', mode: 'mock', nodeEnv: 'test' });
+    const local = adminAuthStatus({ providedToken: '', configuredToken: '', operators: [], mode: 'mock', nodeEnv: 'test' });
     assert.equal(local.ok, true);
     assert.equal(local.enforced, false);
     assert.equal(isOperatorControlMutation({ method: 'POST', path: '/api/leads/lead_123/call' }), true);
@@ -4865,7 +4871,49 @@ function configureProductionReadyPosture(env) {
   env.nodeEnv = 'production';
   env.publicUrl = 'https://callan.example.com';
   env.productionLiveAck = 'I_UNDERSTAND_LIVE_OUTREACH';
-  env.admin.apiToken = 'ops-admin-token-0123456789';
+  env.admin.apiToken = '';
+  env.admin.operatorTokens = [{ id: 'ops-check@example.com', role: 'admin', token: 'ops-admin-token-0123456789' }];
+  env.admin.mfaEnforced = true;
+  env.portal.tokenSecret = 'ops-check-portal-secret-0123456789abcdef';
+  env.safety.interlockSecret = 'ops-check-interlock-secret-0123456789abcdef';
+  env.privacy.retentionEnabled = true;
+  env.privacy.dataAtRestEncrypted = true;
+  env.privacy.backupsEncrypted = true;
+  env.legal.privacyPolicyUrl = 'https://callan.example.com/privacy';
+  env.legal.termsOfServiceUrl = 'https://callan.example.com/terms';
+  env.legal.reviewAck = 'I_CONFIRM_COUNSEL_REVIEWED_OUTREACH_AND_PRIVACY';
+  env.deployment.replicaCount = 1;
+  env.deployment.singleNodePilotAck = 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS';
+  const certificationFile = join(dataDir, 'provider-certification.json');
+  writeFileSync(certificationFile, JSON.stringify({
+    version: 1,
+    environment: 'staging',
+    loadTest: {
+      completedAt: new Date().toISOString(),
+      forecastConcurrentWorkflows: 10,
+      testedConcurrentWorkflows: 30,
+      durationMinutes: 60,
+      sqliteBusyErrors: 0,
+      webhookBurstVerified: true,
+      sseFanoutVerified: true,
+      slowProviderVerified: true
+    },
+    providers: productionSmokeProviders.map((provider) => ({
+      provider,
+      certifiedAt: new Date().toISOString(),
+      ownedTarget: 'ops-check-owned-target',
+      requestSchema: 'ops-check-request-schema',
+      responseSchema: 'ops-check-response-schema',
+      quotaVerified: 'ops-check-quota',
+      retryPolicyVerified: 'ops-check-retry',
+      idempotencyBehavior: 'ops-check-observed',
+      webhookOrderingVerified: 'ops-check-ordering',
+      outageBehaviorVerified: 'ops-check-outage',
+      credentialScopeVerified: 'ops-check-scope'
+    }))
+  }));
+  env.deployment.providerCertificationFile = certificationFile;
+  env.security.previewFrameSources = ['https://*.lovable.app'];
   env.outreach.enabled = true;
   Object.assign(env.live, {
     calls: true,
@@ -4886,6 +4934,8 @@ function configureProductionReadyPosture(env) {
   env.agentmail.inboxId = 'ops_inbox';
   env.agentmail.webhookSecret = 'ops_agentmail_secret';
   env.browserUse.apiKey = 'ops_browser_use_key';
+  env.browserUse.profileId = 'ops_browser_use_profile';
+  env.lovable.workspaceName = 'Ops Customer Workspace';
   env.stripe.secretKey = ['rk_', 'live_', 'ops_check'].join('');
   env.stripe.webhookSecret = ['whsec_', 'ops'].join('');
 }

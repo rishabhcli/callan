@@ -233,7 +233,7 @@ function Stat({ k, v, tone = 'muted' }) {
 
 function ExperimentTable({ experimentKey, rows }) {
   if (!rows?.length) return null;
-  const best = rows.reduce((acc, r) => (r.revenuePerAssignment > (acc?.revenuePerAssignment || -Infinity) ? r : acc), null);
+  const best = rows.reduce((acc, r) => (r.adaptiveScore > (acc?.adaptiveScore ?? -Infinity) ? r : acc), null);
   return (
     <div className="nyna-experiment-block">
       <div className="nyna-experiment-key">{experimentKey}</div>
@@ -242,8 +242,10 @@ function ExperimentTable({ experimentKey, rows }) {
           <tr>
             <th>arm</th>
             <th>assignments</th>
-            <th>conversions</th>
-            <th>rate</th>
+            <th>connected</th>
+            <th>won</th>
+            <th>paid</th>
+            <th>learned score</th>
             <th>$/assign</th>
           </tr>
         </thead>
@@ -252,8 +254,10 @@ function ExperimentTable({ experimentKey, rows }) {
             <tr key={r.arm} className={best && r.arm === best.arm ? 'is-winner' : ''}>
               <td>{r.arm}</td>
               <td>{r.assignments}</td>
-              <td>{r.conversions}</td>
-              <td>{(r.conversionRate * 100).toFixed(1)}%</td>
+              <td>{r.connections || 0}</td>
+              <td>{r.wins || 0}</td>
+              <td>{r.conversions || 0}</td>
+              <td>{((r.adaptiveScore || 0) * 100).toFixed(1)}%</td>
               <td>${(r.revenuePerAssignment / 100).toFixed(2)}</td>
             </tr>
           ))}

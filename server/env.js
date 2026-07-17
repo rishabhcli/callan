@@ -22,6 +22,21 @@ function parseEmailPhoneMap(raw) {
   }
   return out;
 }
+
+function parseOperatorTokens(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(String(raw));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((row) => ({
+      id: String(row?.id || '').trim(),
+      role: ['viewer', 'operator', 'admin'].includes(String(row?.role || '').toLowerCase()) ? String(row.role).toLowerCase() : 'viewer',
+      token: String(row?.token || '')
+    })).filter((row) => row.id && row.token);
+  } catch {
+    return [];
+  }
+}
 const num = (v, fallback) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -85,11 +100,47 @@ const MODE_POLICIES = Object.freeze({
 export const env = {
   port: Number(process.env.PORT || 8787),
   publicUrl: process.env.APP_PUBLIC_URL || 'http://localhost:8787',
+  staticDir: process.env.STATIC_DIR || 'dist',
   dataDir: process.env.DATA_DIR || '.data',
   nodeEnv: process.env.NODE_ENV || 'development',
   trustProxyHops: Math.max(0, Math.floor(num(process.env.TRUST_PROXY_HOPS, 0))),
   admin: {
-    apiToken: process.env.ADMIN_API_TOKEN || ''
+    apiToken: process.env.ADMIN_API_TOKEN || '',
+    operatorTokens: parseOperatorTokens(process.env.ADMIN_API_TOKENS_JSON),
+    mfaEnforced: bool(process.env.ADMIN_MFA_ENFORCED)
+  },
+  portal: {
+    tokenSecret: process.env.PORTAL_TOKEN_SECRET || '',
+    tokenTtlHours: Math.max(1, Math.floor(num(process.env.PORTAL_TOKEN_TTL_HOURS, 168)))
+  },
+  safety: {
+    interlockSecret: process.env.SAFETY_INTERLOCK_SECRET || ''
+  },
+  privacy: {
+    retentionEnabled: process.env.DATA_RETENTION_ENABLED !== 'false',
+    retentionIntervalMs: num(process.env.DATA_RETENTION_INTERVAL_MS, 24 * 60 * 60 * 1000),
+    callTranscriptRetentionDays: Math.max(1, Math.floor(num(process.env.CALL_TRANSCRIPT_RETENTION_DAYS, 30))),
+    reasoningTraceRetentionDays: Math.max(1, Math.floor(num(process.env.REASONING_TRACE_RETENTION_DAYS, 30))),
+    contactBodyRetentionDays: Math.max(1, Math.floor(num(process.env.CONTACT_BODY_RETENTION_DAYS, 90))),
+    webhookPayloadRetentionDays: Math.max(1, Math.floor(num(process.env.WEBHOOK_PAYLOAD_RETENTION_DAYS, 30))),
+    jobPayloadRetentionDays: Math.max(1, Math.floor(num(process.env.JOB_PAYLOAD_RETENTION_DAYS, 30))),
+    expiredPortalTokenRetentionDays: Math.max(1, Math.floor(num(process.env.EXPIRED_PORTAL_TOKEN_RETENTION_DAYS, 30))),
+    dataAtRestEncrypted: bool(process.env.DATA_AT_REST_ENCRYPTED),
+    backupsEncrypted: bool(process.env.BACKUPS_ENCRYPTED)
+  },
+  legal: {
+    privacyPolicyUrl: process.env.PRIVACY_POLICY_URL || '',
+    termsOfServiceUrl: process.env.TERMS_OF_SERVICE_URL || '',
+    reviewAck: process.env.LEGAL_REVIEW_ACK || ''
+  },
+  deployment: {
+    replicaCount: Math.max(1, Math.floor(num(process.env.APP_REPLICA_COUNT, 1))),
+    singleNodePilotAck: process.env.SINGLE_NODE_PILOT_ACK || '',
+    providerCertificationFile: process.env.PROVIDER_CERTIFICATION_FILE || ''
+  },
+  security: {
+    previewFrameSources: list(process.env.PREVIEW_FRAME_SOURCES),
+    previewImageSources: list(process.env.PREVIEW_IMAGE_SOURCES)
   },
 
   runMode: process.env.RUN_MODE || 'mock',
@@ -145,6 +196,12 @@ export const env = {
     timezone: process.env.ACCOUNT_MANAGER_TIMEZONE || process.env.OUTREACH_TIMEZONE || 'America/Los_Angeles'
   },
 
+  memory: {
+    retryEnabled: process.env.MEMORY_RETRY_ENABLED !== 'false',
+    retryIntervalMs: num(process.env.MEMORY_RETRY_INTERVAL_MS, 60_000),
+    retryBatchSize: Math.max(1, Math.floor(num(process.env.MEMORY_RETRY_BATCH_SIZE, 25)))
+  },
+
   ops: {
     safeToSellCheckEnabled: process.env.SAFE_TO_SELL_SELF_CHECK_ENABLED !== 'false',
     safeToSellCheckIntervalMs: num(process.env.SAFE_TO_SELL_SELF_CHECK_INTERVAL_MS, 24 * 60 * 60 * 1000),
@@ -163,6 +220,7 @@ export const env = {
     recoveryMaxBuildAgeMs: num(process.env.OPS_RECOVERY_MAX_BUILD_AGE_MS, 10 * 60 * 1000),
     economicsMaxDailyCostUsd: num(process.env.OPS_MAX_DAILY_COST_USD, 25),
     economicsMaxDailyLossUsd: num(process.env.OPS_MAX_DAILY_LOSS_USD, 25),
+    economicsMaxCostPerLeadUsd: num(process.env.OPS_MAX_COST_PER_LEAD_USD, 5),
     economicsMinMarginPct: num(process.env.OPS_MIN_MARGIN_PCT, 20),
     providerMaxIssueRatePct: num(process.env.OPS_PROVIDER_MAX_ISSUE_RATE_PCT, 20),
     providerMinEventsForIssueRate: num(process.env.OPS_PROVIDER_MIN_EVENTS_FOR_ISSUE_RATE, 3),
@@ -210,7 +268,13 @@ export const env = {
 
   browserUse: {
     apiKey: process.env.BROWSER_USE_API_KEY || '',
-    baseUrl: process.env.BROWSER_USE_BASE_URL || 'https://api.browser-use.com/api/v3'
+    baseUrl: process.env.BROWSER_USE_BASE_URL || 'https://api.browser-use.com/api/v3',
+    profileId: process.env.BROWSER_USE_PROFILE_ID || '',
+    workspaceId: process.env.BROWSER_USE_WORKSPACE_ID || ''
+  },
+
+  lovable: {
+    workspaceName: process.env.LOVABLE_WORKSPACE_NAME || ''
   },
 
   agentmail: {

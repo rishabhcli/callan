@@ -39,6 +39,7 @@ import { enqueueOperatorTransferJob } from '../operatorTransferQueue.js';
 import { applyPackToPitch, pickPack } from '../verticalPacks/index.js';
 import { applyPitchExperiment } from '../experimentArms.js';
 import { recordOutcome as recordExperimentOutcome } from '../experiments.js';
+import { priorCallLearningFromMemory, priorCallLearningPrompt } from '../pitchLearning.js';
 import { recordAgentPhoneCallCost } from '../costs.js';
 import { enqueueCallAnalysis } from '../analysisQueue.js';
 import {
@@ -48,6 +49,7 @@ import {
   persistCallbackPromise,
   terminalCallState
 } from '../callState.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 
 const PITCH_SYSTEM = `You are a sales strategist for callmemaybe, a service that builds and hosts small-business websites for $500 flat. Generate a tight, conversational cold-call pitch tailored to ONE specific business. Anchor the pitch in the business's online-presence audit, what the business actually does, and the concrete things customers need to know. The owner is busy, suspicious of robocalls, and probably doing something else. Be respectful, specific, and human. Output only JSON that matches the supplied schema exactly.`;
 
@@ -95,6 +97,7 @@ function pitchToSystemPrompt(pitch, lead, hotContext = null) {
     `Close: ${pitch.close}`,
     `If they give positive intent, ask for the best invoice email exactly like this: ${pitch.emailAsk}`,
     `Email readback rule: ${pitch.emailReadbackInstruction}`,
+    pitch.priorCallLearning ? `Prior-call learning: ${priorCallLearningPrompt(pitch.priorCallLearning)}` : null,
     `Do not say the invoice is coming until the owner confirms the read-back email. If the readback is wrong, ask them to repeat the address and read it back again.`,
     `State discipline: follow opener -> permission_check -> discovery -> value_pitch -> objection/pricing -> close -> email_capture -> readback_confirm. If they ask whether this is AI, disclose plainly and continue only if useful. If they ask where the number came from, say it came from public business listing/research evidence and offer opt-out.`,
     `Invoice handoff: ${pitch.invoiceClose || 'The invoice will come from AgentMail, and you can reply there with questions.'}`,
@@ -178,7 +181,7 @@ async function loadProfile(leadId, lead) {
   };
 }
 
-async function generatePitch({ profile, lead, disclosure }) {
+async function generatePitch({ profile, lead, disclosure, priorCallLearning = null }) {
   const researchContext = buildPitchResearchContext({ profile, lead });
   const prompt = [
     `Lead and research context. Use only this data; do not invent owner names, services, locations, or website facts:\n${JSON.stringify(researchContext, null, 2)}`,
@@ -188,6 +191,7 @@ async function generatePitch({ profile, lead, disclosure }) {
     `Tone: warm, specific, never pushy. Use at least one concrete signal from the research in the opening line and one online-presence gap in the value proposition.`,
     `Discovery questions: produce exactly 3 natural questions about customer needs, current acquisition channels, and what the owner most wants customers to notice.`,
     `Objection handling: include practical responses for at least price, already-has-website, send-info, busy, and not-interested if possible.`,
+    `Prior-call learning for this same lead: ${priorCallLearningPrompt(priorCallLearning)}`,
     `Email flow: if the owner agrees, the agent must ask for the best invoice email, read it back exactly, ask for confirmation, then say an AgentMail invoice is coming and replies to that email go back to the agent for questions.`,
     `Schema: return every required field and no extra fields. The emailReadbackInstruction field must explicitly require reading the email back and confirming it.`,
     `IMPORTANT — beginMessage MUST start with EXACTLY this recording disclosure (verbatim, no edits), then a single space, then a one-sentence personal greeting:`,
@@ -202,6 +206,7 @@ async function generatePitch({ profile, lead, disclosure }) {
         lead,
         profile,
         researchContext,
+        priorCallLearning,
         disclosure
       },
       prompt,
@@ -335,7 +340,13 @@ async function runMock({ leadId, lead, pitch, profile, runId, disclosureText, ho
   });
   if (experimentAssignment) {
     try {
-      recordExperimentOutcome({ assignment: experimentAssignment, outcome: 'connected', valueCents: null });
+      recordExperimentOutcome({
+        assignment: experimentAssignment,
+        outcome: 'connected',
+        valueCents: null,
+        metadata: { callId, mock: true },
+        idempotencyKey: `call:${callId}:connected`
+      });
     } catch (err) {
       log.warn('experiment.outcome.mock_failed', { leadId, callId, error: err?.message || String(err) });
     }
@@ -447,7 +458,7 @@ function computeCallDurationSeconds(callRow) {
   return Math.round((ended - started) / 1000);
 }
 
-async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, verticalPack = null, experimentAssignment = null }) {
+async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, runId, hotContext, verticalPack = null, experimentAssignment = null, jobContext = null, signal = null }) {
   const dnc = dncCheck(toPhone || lead.phone, { lead, profile, disclosureText, skipAttemptLimit: true });
   if (!dnc.ok) throw new Error(`DNC: ${dnc.reason}`);
   const normalized = dnc.phone;
@@ -532,6 +543,8 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
   };
 
   try {
+    if (signal?.aborted) throw signal.reason || new Error('caller canceled before provider request');
+    const authorization = requireLiveSideEffectAuthorization({ action: 'call', leadId, job: jobContext });
     const voice = await verifyAgentPhoneVoice(env.agentphone.defaultVoice);
     const agent = await ensureAgentPhoneAgent({
       voice: voice.id,
@@ -589,7 +602,8 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
       toNumber: normalized,
       systemPrompt,
       initialGreeting: pitch.beginMessage,
-      voice: voice.id
+      voice: voice.id,
+      authorization: { decision: authorization, leadId, job: jobContext, signal }
     });
     providerCallId = placed.id;
     callId = `call_${Date.now().toString(36)}`;
@@ -697,7 +711,13 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
     if (experimentAssignment && !optedOut) {
       // Non-failure terminal outcome = the live call connected and ran to a normal end.
       try {
-        recordExperimentOutcome({ assignment: experimentAssignment, outcome: 'connected', valueCents: null });
+        recordExperimentOutcome({
+          assignment: experimentAssignment,
+          outcome: 'connected',
+          valueCents: null,
+          metadata: { callId, providerCallId, mock: false },
+          idempotencyKey: `call:${callId}:connected`
+        });
       } catch (err) {
         log.warn('experiment.outcome.live_failed', { leadId, callId, error: err?.message || String(err) });
       }
@@ -766,7 +786,7 @@ async function runLive({ leadId, lead, toPhone, pitch, profile, disclosureText, 
   }
 }
 
-export async function runCaller({ leadId, toPhone, pitchOverride = null, source = null, scheduledCallId = null }) {
+export async function runCaller({ leadId, toPhone, pitchOverride = null, source = null, scheduledCallId = null, jobContext = null, signal = null }) {
   const runId = `run_${Date.now().toString(36)}`;
   runs.start({ id: runId, lead_id: leadId, worker: 'caller' });
   emit('caller.start', { worker: 'caller', leadId, runId, toPhone: mask(toPhone), source: source || 'manual', scheduledCallId });
@@ -775,9 +795,16 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
     const lead = leads.get(leadId);
     if (!lead) throw new Error(`lead not found: ${leadId}`);
 
-    const profile = await loadProfile(leadId, lead);
+    const [profile, priorAnalysisDoc] = await Promise.all([
+      loadProfile(leadId, lead),
+      getLatest(containerTagFor(leadId), 'post_mortem').catch((err) => {
+        log.warn('pitch.prior_analysis_load_failed', { leadId, error: err?.message || String(err) });
+        return null;
+      })
+    ]);
+    const priorCallLearning = priorCallLearningFromMemory(priorAnalysisDoc);
     const disclosure = recordingDisclosure(lead.business_name);
-    const generatedPitch = pitchOverride || await generatePitch({ profile, lead, disclosure });
+    const generatedPitch = pitchOverride || await generatePitch({ profile, lead, disclosure, priorCallLearning });
 
     let pack = null;
     let pitch = generatedPitch;
@@ -800,7 +827,7 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
 
     // Layer in the active pitch_v2 experiment arm AFTER the vertical pack
     // applies so arm rewrites win over the pack tone and the assignment is
-    // sticky on lead.id (assignArm is idempotent by bucket key).
+    // sticky on lead.id. New leads are assigned by the learned policy.
     let experimentAssignment = null;
     try {
       const armed = applyPitchExperiment({ lead, pitch, profile, disclosure });
@@ -810,11 +837,18 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
       log.warn('experiment.apply_failed', { leadId, error: err?.message || String(err) });
     }
 
+    if (priorCallLearning) {
+      pitch = { ...pitch, priorCallLearning };
+    }
+
     if (!pitchOverride) {
       await safeAddMemory(containerTagFor(leadId), 'pitch', pitch, {
+        sourceId: runId,
         generatedFor: leadId,
         verticalPack: pack?.key || null,
-        experimentArm: experimentAssignment?.arm || null
+        experimentArm: experimentAssignment?.arm || null,
+        priorCallId: priorCallLearning?.sourceCallId || null,
+        learningApplied: !!priorCallLearning
       });
     }
     emit('pitch.created', {
@@ -826,12 +860,19 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
       objectionCount: (pitch.objections || []).length,
       source: source || (pitchOverride ? 'override' : 'generated'),
       verticalPack: pack?.key || null,
-      experimentArm: experimentAssignment?.arm || null
+      experimentArm: experimentAssignment?.arm || null,
+      learningApplied: !!priorCallLearning,
+      priorCallId: priorCallLearning?.sourceCallId || null
     });
 
     const hotContext = await buildMossHotContext({ leadId, lead, profile, pitch, runId });
 
     const live = modeAllowsSideEffect('calls') && env.live.calls;
+    if (!live && env.runMode !== 'mock') {
+      const error = new Error(`live call refused: ${env.runMode} does not have an enabled call path`);
+      error.code = 'LIVE_CALL_PATH_DISABLED';
+      throw error;
+    }
     if (live) {
       const allowed = callabilityForLead({ lead, profile, disclosureText: disclosure, phone: toPhone || lead.phone });
       recordCallDecision({
@@ -858,7 +899,7 @@ export async function runCaller({ leadId, toPhone, pitchOverride = null, source 
       });
     }
     const result = live
-      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment })
+      ? await runLive({ leadId, lead, toPhone, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment, jobContext, signal })
       : await runMock({ leadId, lead, pitch, profile, disclosureText: disclosure, runId, hotContext, verticalPack: pack, experimentAssignment });
 
     runs.finish(runId, { state: 'completed', detail: { ...result, mock: !live } });

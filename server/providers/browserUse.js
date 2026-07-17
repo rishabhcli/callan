@@ -1,7 +1,12 @@
 import { BrowserUse } from 'browser-use-sdk/v3';
+import { lookup as dnsLookup } from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
+import { isIP } from 'node:net';
 import { env } from '../env.js';
-import { emit } from '../sse.js';
+import { assertMockProvenanceAllowed, emit } from '../sse.js';
 import { normalizeProviderError, providerConfigured, sideEffectGate, smokeDetail } from './core.js';
+import { requireLiveSideEffectAuthorization } from '../liveSideEffectPolicy.js';
 import {
   buildLovableSubmissionTask as buildLovableTargetSubmissionTask,
   createLovablePromptUrl as createLovableTargetPromptUrl,
@@ -29,6 +34,15 @@ const BROWSER_USE_MODELS = new Set([
   'gpt-5.4-mini'
 ]);
 const TERMINAL_STATUSES = new Set(['stopped', 'timed_out', 'error']);
+const MAX_INSPECTION_BYTES = 5 * 1024 * 1024;
+const MAX_INSPECTION_REDIRECTS = 5;
+const BLOCKED_DESTINATION_HOSTS = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'metadata',
+  'metadata.google.internal',
+  'metadata.aws.internal'
+]);
 
 const LOVABLE_PROJECT_RE = /\bhttps:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.lovable\.app(?:\/[^\s"'<>]*)?/ig;
 const AUTH_WALL_RE = /\b(BLOCKED_AUTH|auth(?:entication)? (?:needed|required)|login required|log in|login|sign in|sign-in|signin|continue with (?:google|github|email)|create an account|session expired)\b/i;
@@ -61,9 +75,13 @@ export function browserUseReadinessDetails(config = env.browserUse) {
     lovable: {
       buildWithUrl: 'https://lovable.dev/?autosubmit=true#prompt=<encoded>',
       authWall: 'blocked_auth_event',
-      projectUrlExtraction: '.lovable.app'
+      projectUrlExtraction: 'temporary shared preview on .lovable.app',
+      persistentProfile: config.profileId ? 'configured' : 'missing_BROWSER_USE_PROFILE_ID',
+      workspaceName: env.lovable.workspaceName ? 'configured' : 'missing_LOVABLE_WORKSPACE_NAME',
+      releaseBoundary: 'preview only; final publish, security review, domain, source portability, and ownership are separately gated'
     },
-    profileId: process.env.BROWSER_USE_PROFILE_ID ? 'configured' : 'default',
+    profileId: config.profileId ? 'configured' : 'missing',
+    workspaceId: config.workspaceId ? 'configured' : 'default',
     sessionPolicy: env.smoke.browserUse ? 'smoke_can_create_stop_session' : 'no_session_side_effects_without_SMOKE_BROWSER_USE',
     navigationSmoke: browserUseLovableNavigationSmokeEnabled() ? 'enabled' : 'disabled_by_default'
   };
@@ -174,11 +192,17 @@ export async function inspectGeneratedSite({ url, html, brief, lead, mock = fals
   const startedAt = Date.now();
   let sourceHtml = html || null;
   let fetchError = null;
-  const inspectedUrl = absolutizeUrl(url);
+  let inspectedUrl = null;
 
-  if (!sourceHtml && inspectedUrl) {
+  try {
+    inspectedUrl = absolutizeUrl(url);
+  } catch (err) {
+    fetchError = err?.message || String(err);
+  }
+
+  if (!sourceHtml && inspectedUrl && !fetchError) {
     try {
-      sourceHtml = await fetchText(inspectedUrl, timeoutMs);
+      sourceHtml = await fetchSafePublicText(inspectedUrl, timeoutMs);
     } catch (err) {
       fetchError = err?.message || String(err);
     }
@@ -327,8 +351,8 @@ export class BrowserUseCloudAdapter {
   constructor({
     apiKey = env.browserUse.apiKey,
     baseUrl = env.browserUse.baseUrl,
-    profileId = process.env.BROWSER_USE_PROFILE_ID || undefined,
-    workspaceId = process.env.BROWSER_USE_WORKSPACE_ID || undefined,
+    profileId = env.browserUse.profileId || undefined,
+    workspaceId = env.browserUse.workspaceId || undefined,
     proxyCountryCode = process.env.BROWSER_USE_PROXY_COUNTRY || undefined,
     useOwnKey = bool(process.env.BROWSER_USE_USE_OWN_KEY),
     enableRecording = bool(process.env.BROWSER_USE_ENABLE_RECORDING),
@@ -336,7 +360,8 @@ export class BrowserUseCloudAdapter {
     getTimeoutMs = numberEnv('BROWSER_USE_GET_TIMEOUT_MS', DEFAULT_GET_TIMEOUT_MS),
     stopTimeoutMs = numberEnv('BROWSER_USE_STOP_TIMEOUT_MS', DEFAULT_STOP_TIMEOUT_MS),
     retries = numberEnv('BROWSER_USE_RETRIES', DEFAULT_RETRIES),
-    eventWorker = 'browser_research'
+    eventWorker = 'browser_research',
+    authorizationContext = {}
   } = {}) {
     this.client = new BrowserUse({
       apiKey,
@@ -354,6 +379,7 @@ export class BrowserUseCloudAdapter {
     this.stopTimeoutMs = stopTimeoutMs;
     this.retries = retries;
     this.eventWorker = eventWorker;
+    this.authorizationContext = authorizationContext;
   }
 
   async createSessionAndRunTask({
@@ -387,7 +413,10 @@ export class BrowserUseCloudAdapter {
     });
     this.emitProviderAction('create_session_and_run_task', { sourceType, model: selectedModel, keepAlive, maxCostUsd });
     const session = await retry(
-      () => withTimeout(this.client.sessions.create(body), this.createTimeoutMs, 'browser-use session task create timed out'),
+      () => {
+        requireLiveSideEffectAuthorization({ action: 'browser_session', ...this.authorizationContext });
+        return withTimeout(this.client.sessions.create(body), this.createTimeoutMs, 'browser-use session task create timed out');
+      },
       { label: 'browser-use session task create', retries: this.retries }
     );
     return this.normalizeSession(session, { sourceType, model: selectedModel });
@@ -420,7 +449,10 @@ export class BrowserUseCloudAdapter {
     });
     this.emitProviderAction('dispatch_task_to_existing_session', { sessionId, sourceType, model: selectedModel, keepAlive, maxCostUsd });
     const session = await retry(
-      () => withTimeout(this.client.sessions.create(body), this.createTimeoutMs, 'browser-use existing session dispatch timed out'),
+      () => {
+        requireLiveSideEffectAuthorization({ action: 'browser_session', ...this.authorizationContext });
+        return withTimeout(this.client.sessions.create(body), this.createTimeoutMs, 'browser-use existing session dispatch timed out');
+      },
       { label: 'browser-use existing session dispatch', retries: this.retries }
     );
     return this.normalizeSession(session, { sourceType, model: selectedModel });
@@ -516,7 +548,8 @@ export class BrowserUseLovableAdapter {
     apiKey = env.browserUse.apiKey,
     baseUrl = env.browserUse.baseUrl,
     model = process.env.BROWSER_USE_MODEL || undefined,
-    profileId = process.env.BROWSER_USE_PROFILE_ID || undefined,
+    profileId = env.browserUse.profileId || undefined,
+    workspaceId = env.browserUse.workspaceId || undefined,
     maxCostUsd = process.env.BROWSER_USE_MAX_COST_USD || undefined,
     proxyCountryCode = process.env.BROWSER_USE_PROXY_COUNTRY || undefined,
     useOwnKey = bool(process.env.BROWSER_USE_USE_OWN_KEY),
@@ -526,7 +559,8 @@ export class BrowserUseLovableAdapter {
     runTimeoutMs = numberEnv('BROWSER_USE_RUN_TIMEOUT_MS', DEFAULT_RUN_TIMEOUT_MS),
     smokeTimeoutMs = numberEnv('BROWSER_USE_SMOKE_TIMEOUT_MS', DEFAULT_SMOKE_TIMEOUT_MS),
     pollIntervalMs = numberEnv('BROWSER_USE_POLL_INTERVAL_MS', DEFAULT_POLL_INTERVAL_MS),
-    retries = numberEnv('BROWSER_USE_RETRIES', DEFAULT_RETRIES)
+    retries = numberEnv('BROWSER_USE_RETRIES', DEFAULT_RETRIES),
+    authorizationContext = {}
   } = {}) {
     this.client = new BrowserUse({
       apiKey,
@@ -537,6 +571,7 @@ export class BrowserUseLovableAdapter {
     });
     this.model = model;
     this.profileId = profileId;
+    this.workspaceId = workspaceId;
     this.maxCostUsd = maxCostUsd;
     this.proxyCountryCode = proxyCountryCode ? proxyCountryCode.toLowerCase() : undefined;
     this.enableRecording = enableRecording;
@@ -546,13 +581,16 @@ export class BrowserUseLovableAdapter {
     this.smokeTimeoutMs = smokeTimeoutMs;
     this.pollIntervalMs = pollIntervalMs;
     this.retries = retries;
+    this.authorizationContext = authorizationContext;
   }
 
   async createSession({ keepAlive = true } = {}) {
+    requireLiveSideEffectAuthorization({ action: 'browser_session', ...this.authorizationContext });
     const body = compact({
       keepAlive,
       model: this.model,
       profileId: this.profileId,
+      workspaceId: this.workspaceId,
       maxCostUsd: this.maxCostUsd,
       proxyCountryCode: this.proxyCountryCode,
       enableRecording: this.enableRecording,
@@ -751,6 +789,7 @@ export class BrowserUseLovableAdapter {
   }
 
   runTask({ sessionId, task, timeoutMs }) {
+    requireLiveSideEffectAuthorization({ action: 'build', ...this.authorizationContext });
     return this.client.run(
       task,
       this.runOptions({ sessionId, timeoutMs: timeoutMs || this.runTimeoutMs })
@@ -800,6 +839,7 @@ export class MockBrowserUseAdapter {
     sessionId = `mock_bu_${Date.now().toString(36)}`,
     delayMs = Number(process.env.FULFILLMENT_MOCK_DELAY_MS || 5)
   } = {}) {
+    assertMockProvenanceAllowed('browser_use.mock_adapter', { mock: true });
     this.liveUrl = liveUrl;
     this.projectUrl = projectUrl;
     this.sessionId = sessionId;
@@ -852,7 +892,8 @@ export async function smokeBrowserUseSession({ config = env.browserUse } = {}) {
 
   const adapter = new BrowserUseLovableAdapter({
     apiKey: config.apiKey,
-    baseUrl: config.baseUrl
+    baseUrl: config.baseUrl,
+    authorizationContext: { smoke: true }
   });
   const session = await adapter.createSession({ keepAlive: false });
   if (!session.sessionId) throw new Error('Browser Use session create returned no id');
@@ -877,10 +918,10 @@ function buildLovableSubmissionTask({ lovableUrl, brief }) {
 function buildLovableRevisionTask({ projectUrl, revisionPrompt }) {
   return [
     'You are revising a generated Lovable customer website after QA.',
-    projectUrl ? `Open the existing project/site URL: ${projectUrl}` : 'Stay in the current Lovable project.',
+    projectUrl ? `The current public preview is: ${projectUrl}. Stay in the existing Lovable editor project in this session.` : 'Stay in the current Lovable project.',
     'Submit only the targeted revision prompt below. Do not create a new unrelated app.',
     'If Lovable shows any login, sign-in, account, Google/GitHub OAuth, or authentication wall, stop immediately and answer exactly BLOCKED_AUTH.',
-    'When the revised published .lovable.app URL is visible, copy it exactly.',
+    'Do not publish or update a permanent production deployment. Create or refresh a temporary Share preview link after the revision.',
     'Your final answer must include either "PROJECT_URL: https://...lovable.app" or "BLOCKED_AUTH".',
     '',
     'Revision prompt:',
@@ -902,24 +943,169 @@ function buildSiteInspectionTask({ url, brief }) {
   ].join('\n');
 }
 
-async function fetchText(url, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
-    if (!res.ok) throw new Error(`fetch ${res.status} ${res.statusText}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
+export async function fetchSafePublicText(url, timeoutMs, redirectCount = 0) {
+  if (redirectCount > MAX_INSPECTION_REDIRECTS) throw unsafeUrlError('too many redirects');
+  const destination = await assertSafePublicHttpUrl(url);
+  const response = await requestPinnedDestination(destination, timeoutMs);
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.location;
+    if (!location) throw new Error(`fetch ${response.status} without Location header`);
+    const redirected = new URL(location, destination.url).href;
+    return fetchSafePublicText(redirected, timeoutMs, redirectCount + 1);
   }
+  if (response.status < 200 || response.status >= 300) throw new Error(`fetch ${response.status}`);
+  return response.body.toString('utf8');
+}
+
+export async function fetchSafePublicBuffer(url, timeoutMs, redirectCount = 0) {
+  if (redirectCount > MAX_INSPECTION_REDIRECTS) throw unsafeUrlError('too many redirects');
+  const destination = await assertSafePublicHttpUrl(url);
+  const response = await requestPinnedDestination(destination, timeoutMs, {
+    accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8'
+  });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.location;
+    if (!location) throw new Error(`fetch ${response.status} without Location header`);
+    return fetchSafePublicBuffer(new URL(location, destination.url).href, timeoutMs, redirectCount + 1);
+  }
+  if (response.status < 200 || response.status >= 300) throw new Error(`fetch ${response.status}`);
+  const contentType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!contentType.startsWith('image/')) throw unsafeUrlError('destination did not return an image');
+  return { body: response.body, contentType };
 }
 
 function absolutizeUrl(url) {
   if (!url) return null;
-  const text = String(url);
-  if (/^https?:\/\//i.test(text)) return text;
-  if (text.startsWith('/')) return new URL(text, env.publicUrl).href;
-  return text;
+  const text = String(url).trim();
+  let parsed;
+  try {
+    parsed = text.startsWith('/') ? new URL(text, env.publicUrl) : new URL(text);
+  } catch {
+    throw unsafeUrlError('destination must be an absolute HTTP(S) URL');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw unsafeUrlError('only HTTP(S) destinations are allowed');
+  return parsed.href;
+}
+
+export async function assertSafePublicHttpUrl(value, { resolver = resolveHostAddresses } = {}) {
+  let url;
+  try {
+    url = new URL(String(value || ''));
+  } catch {
+    throw unsafeUrlError('invalid destination URL');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) throw unsafeUrlError('only HTTP(S) destinations are allowed');
+  if (url.username || url.password) throw unsafeUrlError('destination credentials are not allowed');
+  const expectedPort = url.protocol === 'https:' ? '443' : '80';
+  if (url.port && url.port !== expectedPort) throw unsafeUrlError('nonstandard destination ports are not allowed');
+
+  const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (!hostname || BLOCKED_DESTINATION_HOSTS.has(hostname) || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
+    throw unsafeUrlError('local or metadata destinations are not allowed');
+  }
+
+  const literalFamily = isIP(hostname);
+  const addresses = literalFamily
+    ? [{ address: hostname, family: literalFamily }]
+    : await resolver(hostname);
+  if (!Array.isArray(addresses) || addresses.length === 0) throw unsafeUrlError('destination did not resolve');
+  for (const record of addresses) {
+    if (!record?.address || !isPublicAddress(record.address)) {
+      throw unsafeUrlError('private, reserved, or link-local destinations are not allowed');
+    }
+  }
+  return {
+    url: url.href,
+    parsed: url,
+    addresses: addresses.map((record) => ({ address: record.address, family: Number(record.family) || isIP(record.address) }))
+  };
+}
+
+async function resolveHostAddresses(hostname) {
+  return dnsLookup(hostname, { all: true, verbatim: true });
+}
+
+function isPublicAddress(address) {
+  const family = isIP(address);
+  if (family === 4) return isPublicIpv4(address);
+  if (family !== 6) return false;
+  const normalized = String(address).toLowerCase().split('%')[0];
+  const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPublicIpv4(mapped[1]);
+  if (normalized === '::' || normalized === '::1') return false;
+  if (/^f[cd]/.test(normalized)) return false;
+  if (/^fe[89ab]/.test(normalized)) return false;
+  if (/^ff/.test(normalized)) return false;
+  if (/^2001:db8(?:\:|$)/.test(normalized)) return false;
+  if (/^2001:(?:0|10)(?:\:|$)/.test(normalized)) return false;
+  if (/^64:ff9b:1(?:\:|$)/.test(normalized)) return false;
+  return true;
+}
+
+function isPublicIpv4(address) {
+  const octets = String(address).split('.').map(Number);
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b, c] = octets;
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 192 && b === 0 && c === 0) return false;
+  if (a === 192 && b === 0 && c === 2) return false;
+  if (a === 198 && (b === 18 || b === 19)) return false;
+  if (a === 198 && b === 51 && c === 100) return false;
+  if (a === 203 && b === 0 && c === 113) return false;
+  return true;
+}
+
+function requestPinnedDestination(destination, timeoutMs, { accept = 'text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8' } = {}) {
+  const target = destination.parsed;
+  const chosen = destination.addresses[0];
+  const transport = target.protocol === 'https:' ? https : http;
+  return new Promise((resolve, reject) => {
+    const request = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || undefined,
+      method: 'GET',
+      path: `${target.pathname}${target.search}`,
+      headers: {
+        Accept: accept,
+        'Accept-Encoding': 'identity',
+        'User-Agent': 'Callan-Site-QA/1.0'
+      },
+      lookup: (_hostname, _options, callback) => callback(null, chosen.address, chosen.family),
+      servername: target.hostname,
+      timeout: Math.max(250, Number(timeoutMs) || 10_000)
+    }, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      response.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > MAX_INSPECTION_BYTES) {
+          response.destroy(unsafeUrlError('destination response exceeded the size limit'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => resolve({
+        status: Number(response.statusCode || 0),
+        headers: response.headers,
+        body: Buffer.concat(chunks)
+      }));
+    });
+    request.once('timeout', () => request.destroy(new Error('destination request timed out')));
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+function unsafeUrlError(detail) {
+  const err = new Error(`unsafe site inspection URL: ${detail}`);
+  err.code = 'UNSAFE_INSPECTION_URL';
+  err.retryable = false;
+  return err;
 }
 
 function visibleTextFromHtml(html) {
@@ -1235,8 +1421,8 @@ async function maybePlaywrightScreenshots({ url, html, mock }) {
     const { chromium } = await import('playwright');
     const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
-    if (url && /^https?:\/\//i.test(url)) await page.goto(url, { waitUntil: 'networkidle', timeout: 15_000 });
-    else await page.setContent(html || '<!doctype html><html><body></body></html>', { waitUntil: 'networkidle' });
+    await page.route('**/*', (route) => route.abort());
+    await page.setContent(html || '<!doctype html><html><body></body></html>', { waitUntil: 'domcontentloaded' });
     const title = await page.title().catch(() => '');
     await browser.close();
     return {

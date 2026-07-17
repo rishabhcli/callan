@@ -26,6 +26,7 @@ Object.assign(process.env, {
 try {
   const dbApi = await import('../server/db.js');
   const portal = await import('../server/customerPortal.js');
+  const customerLinks = await import('../server/customerLinks.js');
 
   const {
     leads,
@@ -118,6 +119,12 @@ try {
   assert.notEqual(token.token, leadId, 'portal token must not be the lead id');
   assert.equal(portal.resolvePortalAccess(token.token).leadId, leadId, 'active token should resolve');
   assert.equal(portal.resolvePortalAccess(leadId).leadId, leadId, 'mock legacy lead-id link should still resolve');
+  const previewLink = customerLinks.previewAssetLink({ leadId, buildId });
+  const previewToken = new URL(previewLink.url).pathname.split('/')[3];
+  assert.equal(portal.resolvePortalAccess(previewToken).ok, false, 'preview asset token must not authorize the customer portal');
+  const hostingLink = customerLinks.hostingAcceptLink(leadId);
+  const hostingToken = new URL(hostingLink.url).pathname.split('/').pop();
+  assert.equal(portal.resolvePortalAccess(hostingToken).ok, false, 'hosting token must not authorize the customer portal');
 
   const rotated = portalTokens.rotate({ lead_id: leadId, reason: 'portal_check_rotation' });
   assert.match(rotated.token, /^pt_/, 'rotated token should be opaque');
@@ -173,6 +180,9 @@ try {
 
   const launch = await portal.approveLaunch({ leadId, tokenId: rotated.row.id, notes: 'Ready to launch.' });
   assert.equal(launch.ok, true, 'launch approval should succeed');
+  assert.equal(leads.get(leadId).website, null, 'customer approval must not replace the canonical website with a preview');
+  const approvedState = portal.portalState({ leadId, access: portal.resolvePortalAccess(rotated.token) });
+  assert.equal(approvedState.nextAction.id, 'release_pending', 'approved preview should wait for explicit final release');
 
   const subscription = subscriptions.upsert({
     id: `sub_${leadId}`,
@@ -301,6 +311,9 @@ try {
   assert.equal(Object.prototype.hasOwnProperty.call(state.actions[0] || {}, 'body_json'), false, 'portal state actions should not leak raw body_json');
   assert.equal(Object.prototype.hasOwnProperty.call(state.approvals.launch || {}, 'metadata_json'), false, 'portal approvals should be customer-shaped');
   assert.equal(Object.prototype.hasOwnProperty.call(state.build || {}, 'browser_session_id'), false, 'portal build should not leak provider session internals');
+  assert.equal(state.build.liveUrl, `/api/leads/${encodeURIComponent(leadId)}/build-preview`, 'mock portal should use the safe local generated-site preview');
+  assert.equal(state.build.liveUrl, state.build.projectUrl, 'portal preview aliases must never expose the Browser Use session');
+  assert.equal(state.build.finalSiteUrl, null, 'portal must not claim an unreleased preview is the final site');
   assert.equal(state.subscriptionManagement.activeCount, 1, 'portal state should include active renewal subscription');
   assert.equal(state.subscriptionManagement.atRiskCount, 1, 'portal state should expose at-risk renewal plan count');
   assert.equal(state.subscriptionManagement.customerReviewedCount, 1, 'portal state should show reviewed renewal plan');

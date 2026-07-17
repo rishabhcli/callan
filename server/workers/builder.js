@@ -16,38 +16,13 @@ import {
   renderMockGeneratedSite,
   runBuildQaGate
 } from '../fulfillment/hooks/index.js';
-import { enqueueHostingUpsell } from '../hostingUpsellQueue.js';
 import { recordBrowserUseSteps } from '../costs.js';
+import { env } from '../env.js';
 import {
   createHandoffCaseFromBuilderAuthWall,
   createHandoffCaseFromProviderFailure,
   createHandoffCaseFromQaFailure
 } from '../handoff.js';
-
-// builder.done -> durable $29/mo hosting + edits upsell. The actual AgentMail
-// send is retried by the jobs table so builder completion does not hide outages.
-function queueHostingUpsell({ lead, leadId, buildId, runId, projectUrl, target, mock = false }) {
-  try {
-    if (!lead) return;
-    if (lead.subscription_id) {
-      log.info('builder.hosting_upsell_skipped', { leadId, buildId, reason: 'already_subscribed' });
-      return;
-    }
-    const result = enqueueHostingUpsell({ leadId, buildId, runId, projectUrl, target, mock });
-    log.info(result.inserted ? 'builder.hosting_upsell_queued' : 'builder.hosting_upsell_duplicate', {
-      leadId,
-      buildId,
-      jobId: result.row?.id || null,
-      duplicate: !result.inserted
-    });
-  } catch (err) {
-    log.warn('builder.hosting_upsell_enqueue_failed', {
-      leadId,
-      buildId,
-      error: err?.message || String(err)
-    });
-  }
-}
 
 export async function runBuilder({ leadId, buildId, target, images = [], onLiveUrl } = {}) {
   const claimedBuildId = buildId || `bld_${Date.now().toString(36)}`;
@@ -94,6 +69,11 @@ export async function runBuilder({ leadId, buildId, target, images = [], onLiveU
     const buildTarget = assertBuildTarget(createBuildTarget(target));
     const submission = buildTarget.createSubmission({ brief, images, lead, buildId });
     const gate = canRunLiveBuildTarget(buildTarget.name);
+    if (!gate.ok && env.runMode !== 'mock') {
+      const error = new Error(`live build refused: ${gate.reason || 'provider gate is closed'}`);
+      error.code = 'LIVE_BUILD_GATE_CLOSED';
+      throw error;
+    }
     let websiteBriefJson = null;
     try { websiteBriefJson = JSON.stringify(prepared.websiteBrief); }
     catch (err) { log.warn('builder.website_brief_serialize_failed', { buildId, err: err?.message }); }
@@ -214,7 +194,12 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     provider_deployment_id: providerDeploymentId,
     status: 'qa_review'
   });
-  const initialMockHtml = renderMockGeneratedSite({ brief: websiteBrief });
+  // The full mock demo deliberately starts with a fixable defect so the
+  // inspect → revise → re-inspect loop is visible instead of merely claimed.
+  const initialMockHtml = renderMockGeneratedSite({
+    brief: websiteBrief,
+    flawed: process.env.DEMO_FORCE_QA_REVISION === 'true'
+  });
   builds.update(buildId, { preview_html: initialMockHtml });
   const qaGate = await runBuildQaGate({
     lead,
@@ -254,11 +239,13 @@ async function runMock({ lead, leadId, runId, buildId, brief, websiteBrief, subm
     operator_approved_at: Date.now(),
     finished_at: Date.now()
   });
-  leads.update(leadId, { website: projectUrl, status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
+  // projectUrl is a QA/customer-preview artifact. It must not replace the
+  // business's canonical website until release evidence proves publication,
+  // ownership handoff, source portability, and the customer domain decision.
+  leads.update(leadId, { status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
   safeRecordBuilderSteps({ leadId, sessionId, steps: estimateMockBuilderSteps(buildTarget?.name || target) });
   runs.finish(runId, { state: 'completed', detail: { mock: true, target, liveUrl, projectUrl, providerProjectId, providerDeploymentId, qa: qaGate.qa } });
   emit('builder.done', { worker: 'builder', leadId, runId, buildId, target, liveUrl, projectUrl, providerProjectId, providerDeploymentId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null, launchStatus: 'ready_for_customer', mock: true });
-  queueHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target, mock: true });
   return { liveUrl, projectUrl, brief, target, qa: qaGate.qa, mock: true };
 }
 
@@ -403,11 +390,12 @@ async function runLive({ lead, leadId, runId, buildId, brief, websiteBrief, subm
       operator_approved_at: Date.now(),
       finished_at: Date.now()
     });
-    leads.update(leadId, { website: projectUrl, status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
+    // Keep the generated URL as a preview until the explicit release gate
+    // records the final published URL and customer ownership evidence.
+    leads.update(leadId, { status: 'awaiting_launch_approval', next_action: 'customer_launch_approval' });
     await recordLiveBuilderSteps({ leadId, sessionId, adapter });
     runs.finish(runId, { state: 'completed', detail: { liveUrl, projectUrl, providerProjectId, providerDeploymentId, sessionId, target: buildTarget.name, qa: qaGate.qa } });
     emit('builder.done', { worker: 'builder', leadId, runId, buildId, target: buildTarget.name, liveUrl, projectUrl, providerProjectId, providerDeploymentId, sessionId, qaResultId: qaGate.qa?.id || null, qaScore: qaGate.qa?.score || null, launchStatus: 'ready_for_customer' });
-    queueHostingUpsell({ lead: leads.get(leadId), leadId, buildId, runId, projectUrl, target: buildTarget.name, mock: false });
     return { liveUrl, projectUrl, brief, sessionId, target: buildTarget.name, qa: qaGate.qa };
   } finally {
     try { await buildTarget.cleanup(); } catch (err) {

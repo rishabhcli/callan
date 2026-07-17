@@ -6,7 +6,7 @@ import {
   RUN_MODES,
   sideEffectMatrix
 } from './env.js';
-import { callAttempts, contactEvents, doNotCall, leads, providerSmoke, durableJobs, webhookEvents } from './db.js';
+import { callAttempts, contactEvents, doNotCall, leads, providerSmoke, durableJobs, webhookEvents, memoryFailures, memoryWriteQueue } from './db.js';
 import { complianceGateReport } from './compliance.js';
 import { fulfillmentReadiness } from './fulfillment/targets.js';
 import { v0ReadinessDetails } from './providers/v0.js';
@@ -14,12 +14,14 @@ import { reputationReadinessReport } from './reputation.js';
 import { adminAuthPosture } from './adminAuth.js';
 import { providerRuntimeIncident } from './providerIncidents.js';
 import { operationalErrorSummary } from './operationalErrors.js';
+import { existsSync, readFileSync } from 'node:fs';
 
 export const PROVIDER_ORDER = ['gemini', 'supermemory', 'moss', 'agentphone', 'browserUse', 'lovable', 'v0', 'agentmail', 'stripe'];
 const LIVE_PROVIDER_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
 export const PRODUCTION_REQUIRED_PROVIDERS = new Set(PROVIDER_ORDER.filter((name) => name !== 'v0'));
 const REQUIRED_WEBHOOK_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
 const PRODUCTION_LIVE_ACK_VALUE = 'I_UNDERSTAND_LIVE_OUTREACH';
+const LEGAL_REVIEW_ACK_VALUE = 'I_CONFIRM_COUNSEL_REVIEWED_OUTREACH_AND_PRIVACY';
 const PROVIDER_SMOKE_FRESH_MS = 24 * 60 * 60 * 1000;
 const WEBHOOK_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const PRODUCTION_REVIEW_MODE = 'production_review';
@@ -33,7 +35,7 @@ export const PROVIDER_DOCS = Object.freeze({
   stripeInvoices: 'https://docs.stripe.com/invoicing/integration',
   browserUseSessions: 'https://docs.browser-use.com/guides/sessions',
   browserUseStatus: 'https://docs.browser-use.com/cloud/api-v2/tasks/get-task-status',
-  lovableBuildWithUrl: 'https://lovable-f9060f1e.mintlify.app/integrations/build-with-url',
+  lovableBuildWithUrl: 'https://docs.lovable.dev/integrations/build-with-url',
   v0Platform: 'https://v0.app/docs/api/platform/overview',
   v0Deployments: 'https://v0.app/docs/api/platform/reference/deployments/create',
   supermemoryContainers: 'https://docs.supermemory.ai/memory-api/features/filtering',
@@ -50,10 +52,12 @@ export function liveReadiness() {
   const compliance = complianceGateReport({ mode });
   const reputation = reputationReadinessReport();
   const jobs = durableJobs.summary();
+  const memory = memoryDurabilityReadiness();
   const admin = adminAuthPosture({ mode });
-  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin });
-  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs });
-  const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs });
+  const providerCertification = providerCertificationStatus();
+  const blockers = currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, memory, admin, providerCertification });
+  const productionBlockers = productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification });
+  const promotionGates = promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs, memory });
   const nextActions = nextActionsFor([...blockers, ...productionBlockers]);
 
   return {
@@ -68,6 +72,7 @@ export function liveReadiness() {
     promotionGates,
     nextActions,
     providers,
+    providerCertification,
     webhooks,
     fulfillment: fulfillmentReadiness(),
     sideEffects,
@@ -75,6 +80,7 @@ export function liveReadiness() {
     reputation,
     admin,
     jobs,
+    memory,
     smoke,
     smokeToggles: {
       gemini: env.smoke.gemini,
@@ -171,7 +177,11 @@ export function providerConfigured(name) {
   if (name === 'moss') return requiredEnv({ MOSS_PROJECT_ID: env.moss.projectId, MOSS_PROJECT_KEY: env.moss.projectKey });
   if (name === 'agentphone') return requiredEnv({ AGENTPHONE_API_KEY: env.agentphone.apiKey });
   if (name === 'browserUse') return requiredEnv({ BROWSER_USE_API_KEY: env.browserUse.apiKey });
-  if (name === 'lovable') return requiredEnv({ BROWSER_USE_API_KEY: env.browserUse.apiKey });
+  if (name === 'lovable') return requiredEnv({
+    BROWSER_USE_API_KEY: env.browserUse.apiKey,
+    BROWSER_USE_PROFILE_ID: env.browserUse.profileId,
+    LOVABLE_WORKSPACE_NAME: env.lovable.workspaceName
+  });
   if (name === 'v0') return requiredEnv({ V0_API_KEY: process.env.V0_API_KEY });
   if (name === 'agentmail') return requiredEnv({ AGENTMAIL_API_KEY: env.agentmail.apiKey, AGENTMAIL_INBOX_ID: env.agentmail.inboxId });
   if (name === 'stripe') return requiredEnv({ STRIPE_SECRET_KEY: env.stripe.secretKey });
@@ -349,7 +359,10 @@ function providerDetail(name) {
       execution: 'Browser Use cloud session',
       buildWithUrl: 'https://lovable.dev/?autosubmit=true#prompt=<encoded>',
       authWall: 'blocked_auth_event',
-      projectUrlExtraction: '.lovable.app',
+      projectUrlExtraction: 'temporary shared preview on .lovable.app',
+      persistentProfile: env.browserUse.profileId ? 'configured' : 'missing',
+      workspaceName: env.lovable.workspaceName ? 'configured' : 'missing',
+      releaseBoundary: 'explicit publish/security/domain/source/ownership evidence after customer approval',
       docs: PROVIDER_DOCS.lovableBuildWithUrl,
       sideEffects: {
         navigationSmoke: env.smoke.lovableNavigation ? 'enabled_by_SMOKE_LOVABLE_NAVIGATION' : 'disabled_by_default',
@@ -398,7 +411,33 @@ function quotaCostStatus(name, smokeRow) {
   return detail.quota || detail.usage || 'not reported';
 }
 
-function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, admin }) {
+export function memoryDurabilityReadiness() {
+  const queue = Object.fromEntries(memoryWriteQueue.counts().map((row) => [row.status, Number(row.n) || 0]));
+  const failures = memoryFailures.counts();
+  const unresolvedFailures = Number(failures.unresolved) || 0;
+  const pendingWrites = (queue.queued || 0) + (queue.retrying || 0) + (queue.failed || 0);
+  const deadWrites = queue.dead || 0;
+  const blockers = [
+    !env.memory?.retryEnabled ? 'MEMORY_RETRY_ENABLED must be true for production memory durability' : null,
+    pendingWrites ? `${pendingWrites} Supermemory write(s) are pending or failed` : null,
+    deadWrites ? `${deadWrites} Supermemory write(s) are dead and require operator repair` : null,
+    unresolvedFailures ? `${unresolvedFailures} unresolved memory failure(s) remain` : null
+  ].filter(Boolean);
+  return {
+    ok: blockers.length === 0,
+    retryEnabled: env.memory?.retryEnabled === true,
+    retryIntervalMs: env.memory?.retryIntervalMs || null,
+    retryBatchSize: env.memory?.retryBatchSize || null,
+    pendingWrites,
+    deadWrites,
+    unresolvedFailures,
+    retryableFailures: Number(failures.retryable) || 0,
+    queue,
+    blockers
+  };
+}
+
+function currentModeBlockers({ mode, providers, webhooks, sideEffects, compliance, reputation, jobs, memory, admin, providerCertification }) {
   const blockers = [];
   if (!isValidRunMode(mode)) blockers.push(`invalid RUN_MODE: ${mode}; expected one of ${RUN_MODES.join(', ')}`);
 
@@ -413,7 +452,7 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (mode === 'production_live') {
-    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }));
+    blockers.push(...productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification }));
   }
   if (admin?.required && !admin.ok) blockers.push(...admin.blockers);
 
@@ -432,18 +471,34 @@ function currentModeBlockers({ mode, providers, webhooks, sideEffects, complianc
     }
   }
   if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
+  if (['production_review', 'production_live'].includes(mode) && memory?.ok === false) blockers.push(...memory.blockers);
 
   return unique(blockers);
 }
 
-function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs }) {
+function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, reputation, jobs, memory, providerCertification = providerCertificationStatus() }) {
   const blockers = [];
   const admin = adminAuthPosture({ mode: PRODUCTION_LIVE_MODE });
   if (env.runMode !== 'production_live') blockers.push('RUN_MODE is not production_live');
   if (!isProductionAcked()) blockers.push(`PRODUCTION_LIVE_ACK must equal ${PRODUCTION_LIVE_ACK_VALUE}`);
   if (env.nodeEnv !== 'production') blockers.push('NODE_ENV must be production for production_live');
   if (!isHttpsPublicUrl(env.publicUrl)) blockers.push('APP_PUBLIC_URL must be a public https URL for production webhooks');
+  if (!lovablePreviewFrameConfigured()) blockers.push('PREVIEW_FRAME_SOURCES must allow https://*.lovable.app for customer review previews');
   if (!env.outreach.enabled) blockers.push('AUTONOMOUS_OUTREACH_ENABLED must be true for production_live');
+  if (String(env.portal?.tokenSecret || '').length < 32) blockers.push('PORTAL_TOKEN_SECRET must be at least 32 characters for production_live');
+  if (String(env.safety?.interlockSecret || '').length < 32) blockers.push('SAFETY_INTERLOCK_SECRET must be at least 32 characters for production_live');
+  if (!(env.admin?.operatorTokens || []).length) blockers.push('ADMIN_API_TOKENS_JSON must define named operator identities for production_live');
+  if (!env.admin?.mfaEnforced) blockers.push('ADMIN_MFA_ENFORCED must be true for production_live');
+  if (env.admin?.apiToken) blockers.push('ADMIN_API_TOKEN must be unset when production_live uses named operator identities');
+  if (!env.privacy?.retentionEnabled) blockers.push('DATA_RETENTION_ENABLED must be true for production_live');
+  if (!env.privacy?.dataAtRestEncrypted) blockers.push('DATA_AT_REST_ENCRYPTED must attest encrypted production storage');
+  if (!env.privacy?.backupsEncrypted) blockers.push('BACKUPS_ENCRYPTED must attest encrypted backup storage');
+  if (!isHttpsPublicUrl(env.legal?.privacyPolicyUrl)) blockers.push('PRIVACY_POLICY_URL must be a public https URL for production_live');
+  if (!isHttpsPublicUrl(env.legal?.termsOfServiceUrl)) blockers.push('TERMS_OF_SERVICE_URL must be a public https URL for production_live');
+  if (env.legal?.reviewAck !== LEGAL_REVIEW_ACK_VALUE) blockers.push(`LEGAL_REVIEW_ACK must equal ${LEGAL_REVIEW_ACK_VALUE}`);
+  if (env.deployment?.replicaCount !== 1) blockers.push('SQLite deployment requires APP_REPLICA_COUNT=1');
+  if (env.deployment?.singleNodePilotAck !== 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS') blockers.push('SINGLE_NODE_PILOT_ACK must equal I_ACCEPT_SINGLE_NODE_PILOT_LIMITS');
+  blockers.push(...(providerCertification.blockers || []));
   blockers.push(...admin.blockers);
 
   for (const [name, row] of Object.entries(providers || {})) {
@@ -470,11 +525,12 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, 
     if (!gate.ok) blockers.push(`reputation gate ${gate.name} failed: ${gate.detail}`);
   }
   if (jobs?.staleRunning) blockers.push(`${jobs.staleRunning} durable job(s) have stale leases`);
+  if (memory?.ok === false) blockers.push(...memory.blockers);
   if (stripeKeyMode(env.stripe.secretKey) === 'secret_live') blockers.push('STRIPE_SECRET_KEY is sk_live_; use a restricted rk_live_ key for production');
   return unique(blockers);
 }
 
-function promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs }) {
+function promotionGateReport({ mode, providers, webhooks, compliance, reputation, jobs, memory }) {
   const productionReview = stageReport(PRODUCTION_REVIEW_MODE, [
     gate({
       name: 'target_mode',
@@ -499,6 +555,7 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
     dryRunSmokeGate(providers),
     complianceGate(compliance),
     reputationGate(reputation),
+    memoryDurabilityGate(memory),
     durableJobsGate(jobs)
   ]);
 
@@ -537,12 +594,85 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
       detail: { current: env.publicUrl }
     }),
     gate({
+      name: 'lovable_preview_csp',
+      label: 'Lovable preview CSP',
+      ok: lovablePreviewFrameConfigured(),
+      blockers: lovablePreviewFrameConfigured() ? [] : ['PREVIEW_FRAME_SOURCES must allow https://*.lovable.app for customer review previews'],
+      nextAction: 'set PREVIEW_FRAME_SOURCES=https://*.lovable.app before customer review',
+      detail: { configured: env.security?.previewFrameSources || [] }
+    }),
+    gate({
       name: 'autonomous_outreach',
       label: 'Autonomous outreach enabled',
       ok: env.outreach.enabled,
       blockers: env.outreach.enabled ? [] : ['AUTONOMOUS_OUTREACH_ENABLED must be true for production_live'],
       nextAction: 'set AUTONOMOUS_OUTREACH_ENABLED=true after review gates are green'
     }),
+    gate({
+      name: 'portal_token_secret',
+      label: 'Portal token signing secret',
+      ok: String(env.portal?.tokenSecret || '').length >= 32,
+      blockers: String(env.portal?.tokenSecret || '').length >= 32 ? [] : ['PORTAL_TOKEN_SECRET must be at least 32 characters for production_live'],
+      nextAction: 'set a random PORTAL_TOKEN_SECRET of at least 32 characters and rotate existing portal links'
+    }),
+    gate({
+      name: 'safety_interlock_secret',
+      label: 'Signed safety interlock',
+      ok: String(env.safety?.interlockSecret || '').length >= 32,
+      blockers: String(env.safety?.interlockSecret || '').length >= 32 ? [] : ['SAFETY_INTERLOCK_SECRET must be at least 32 characters for production_live'],
+      nextAction: 'set a random SAFETY_INTERLOCK_SECRET of at least 32 characters, then generate a fresh safe-to-sell snapshot'
+    }),
+    gate({
+      name: 'operator_identity',
+      label: 'Named operator identity and MFA',
+      ok: (env.admin?.operatorTokens || []).length > 0 && env.admin?.mfaEnforced === true && !env.admin?.apiToken,
+      blockers: [
+        ...((env.admin?.operatorTokens || []).length ? [] : ['ADMIN_API_TOKENS_JSON must define named operator identities for production_live']),
+        ...(env.admin?.mfaEnforced ? [] : ['ADMIN_MFA_ENFORCED must be true for production_live']),
+        ...(env.admin?.apiToken ? ['ADMIN_API_TOKEN must be unset when production_live uses named operator identities'] : [])
+      ],
+      nextAction: 'configure named viewer/operator/admin credentials behind an MFA-enforced operator login and remove ADMIN_API_TOKEN'
+    }),
+    gate({
+      name: 'sensitive_data_lifecycle',
+      label: 'Sensitive data lifecycle',
+      ok: env.privacy?.retentionEnabled === true && env.privacy?.dataAtRestEncrypted === true && env.privacy?.backupsEncrypted === true,
+      blockers: [
+        ...(env.privacy?.retentionEnabled ? [] : ['DATA_RETENTION_ENABLED must be true for production_live']),
+        ...(env.privacy?.dataAtRestEncrypted ? [] : ['DATA_AT_REST_ENCRYPTED must attest encrypted production storage']),
+        ...(env.privacy?.backupsEncrypted ? [] : ['BACKUPS_ENCRYPTED must attest encrypted backup storage'])
+      ],
+      nextAction: 'enable the retention scheduler and deploy the database and backups on encrypted storage'
+    }),
+    gate({
+      name: 'legal_review',
+      label: 'Customer policies and legal review',
+      ok: isHttpsPublicUrl(env.legal?.privacyPolicyUrl)
+        && isHttpsPublicUrl(env.legal?.termsOfServiceUrl)
+        && env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE,
+      blockers: [
+        ...(isHttpsPublicUrl(env.legal?.privacyPolicyUrl) ? [] : ['PRIVACY_POLICY_URL must be a public https URL for production_live']),
+        ...(isHttpsPublicUrl(env.legal?.termsOfServiceUrl) ? [] : ['TERMS_OF_SERVICE_URL must be a public https URL for production_live']),
+        ...(env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE ? [] : [`LEGAL_REVIEW_ACK must equal ${LEGAL_REVIEW_ACK_VALUE}`])
+      ],
+      nextAction: 'have qualified counsel review outreach, privacy, and customer terms; publish both policies; then record the explicit legal review acknowledgement',
+      detail: {
+        privacyPolicyConfigured: isHttpsPublicUrl(env.legal?.privacyPolicyUrl),
+        termsConfigured: isHttpsPublicUrl(env.legal?.termsOfServiceUrl),
+        reviewed: env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE
+      }
+    }),
+    gate({
+      name: 'single_node_pilot',
+      label: 'Single-node pilot scope',
+      ok: env.deployment?.replicaCount === 1 && env.deployment?.singleNodePilotAck === 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS',
+      blockers: [
+        ...(env.deployment?.replicaCount === 1 ? [] : ['SQLite deployment requires APP_REPLICA_COUNT=1']),
+        ...(env.deployment?.singleNodePilotAck === 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS' ? [] : ['SINGLE_NODE_PILOT_ACK must equal I_ACCEPT_SINGLE_NODE_PILOT_LIMITS'])
+      ],
+      nextAction: 'limit this release to one controlled replica and explicitly accept the single-node availability boundary'
+    }),
+    providerCertificationGate(),
     gate({
       name: 'live_side_effect_flags',
       label: 'Live side-effect flags',
@@ -558,6 +688,7 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
     webhookFreshnessGate(webhooks),
     complianceGate(compliance),
     reputationGate(reputation),
+    memoryDurabilityGate(memory),
     durableJobsGate(jobs),
     gate({
       name: 'stripe_key_scope',
@@ -615,6 +746,17 @@ function providerCredentialGate(providers) {
   });
 }
 
+function memoryDurabilityGate(memory) {
+  return gate({
+    name: 'persistent_memory',
+    label: 'Persistent memory durability',
+    ok: memory?.ok === true,
+    blockers: memory?.blockers || ['persistent memory status is unavailable'],
+    nextAction: 'enable durable memory retries and clear unresolved Supermemory writes before promotion',
+    detail: memory || null
+  });
+}
+
 function providerIncidentGate(providers) {
   const blockers = [];
   const detail = {};
@@ -643,9 +785,88 @@ function adminAuthGate(admin) {
     detail: {
       required: !!admin?.required,
       configured: !!admin?.configured,
-      strong: !!admin?.strong
+      strong: !!admin?.strong,
+      namedOperatorCount: Number(admin?.namedOperatorCount || 0),
+      identityBacked: !!admin?.identityBacked
     }
   });
+}
+
+function providerCertificationGate() {
+  const status = providerCertificationStatus();
+  return gate({
+    name: 'provider_certification',
+    label: 'Staging provider and capacity certification',
+    ok: status.ok,
+    blockers: status.blockers,
+    nextAction: 'run owned-target provider certification plus the one-hour 3x-capacity soak, then set PROVIDER_CERTIFICATION_FILE',
+    detail: { file: status.file || null, certifiedProviders: status.certifiedProviders || [], loadTest: status.loadTest || null }
+  });
+}
+
+export function providerCertificationStatus({ now = Date.now(), file = env.deployment?.providerCertificationFile } = {}) {
+  if (!file) return { ok: false, file: null, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE is required for production_live'] };
+  if (!existsSync(file)) return { ok: false, file, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE does not exist'] };
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return { ok: false, file, certifiedProviders: [], blockers: ['PROVIDER_CERTIFICATION_FILE is not valid JSON'] };
+  }
+  const rows = Array.isArray(manifest?.providers) ? manifest.providers : [];
+  const blockers = [];
+  const certifiedProviders = [];
+  if (manifest?.version !== 1) blockers.push('provider certification version must be 1');
+  if (manifest?.environment !== 'staging') blockers.push('provider certification environment must be staging');
+  for (const provider of PRODUCTION_REQUIRED_PROVIDERS) {
+    const row = rows.find((item) => item?.provider === provider);
+    if (!row) {
+      blockers.push(`${provider} staging certification is missing`);
+      continue;
+    }
+    const certifiedAt = Date.parse(row.certifiedAt);
+    if (!Number.isFinite(certifiedAt) || now - certifiedAt > 90 * 24 * 60 * 60 * 1000) blockers.push(`${provider} staging certification is missing or stale`);
+    for (const field of ['ownedTarget', 'requestSchema', 'responseSchema', 'quotaVerified', 'retryPolicyVerified', 'webhookOrderingVerified', 'outageBehaviorVerified', 'credentialScopeVerified']) {
+      if (!certificationEvidencePresent(row[field])) blockers.push(`${provider} certification missing ${field}`);
+    }
+    if (provider !== 'gemini' && !certificationEvidencePresent(row.idempotencyBehavior)) blockers.push(`${provider} certification missing idempotencyBehavior`);
+    if (!blockers.some((blocker) => blocker.startsWith(`${provider} `))) certifiedProviders.push(provider);
+  }
+  const loadTest = manifest?.loadTest && typeof manifest.loadTest === 'object' ? manifest.loadTest : {};
+  const loadCompletedAt = Date.parse(loadTest.completedAt);
+  const forecastConcurrency = Number(loadTest.forecastConcurrentWorkflows);
+  const testedConcurrency = Number(loadTest.testedConcurrentWorkflows);
+  const durationMinutes = Number(loadTest.durationMinutes);
+  const sqliteBusyErrors = Number(loadTest.sqliteBusyErrors);
+  if (!Number.isFinite(loadCompletedAt) || now - loadCompletedAt > 90 * 24 * 60 * 60 * 1000) blockers.push('load/soak certification is missing or stale');
+  if (!(forecastConcurrency > 0)) blockers.push('load/soak certification missing forecastConcurrentWorkflows');
+  if (!(testedConcurrency >= forecastConcurrency * 3)) blockers.push('load/soak certification must exercise at least 3x forecast concurrency');
+  if (!(durationMinutes >= 60)) blockers.push('load/soak certification must run for at least 60 minutes');
+  if (sqliteBusyErrors !== 0) blockers.push('load/soak certification recorded SQLite busy errors');
+  for (const field of ['webhookBurstVerified', 'sseFanoutVerified', 'slowProviderVerified']) {
+    if (loadTest[field] !== true) blockers.push(`load/soak certification missing ${field}`);
+  }
+  return {
+    ok: blockers.length === 0,
+    file,
+    certifiedProviders,
+    blockers,
+    loadTest: {
+      completedAt: loadTest.completedAt || null,
+      forecastConcurrentWorkflows: Number.isFinite(forecastConcurrency) ? forecastConcurrency : null,
+      testedConcurrentWorkflows: Number.isFinite(testedConcurrency) ? testedConcurrency : null,
+      durationMinutes: Number.isFinite(durationMinutes) ? durationMinutes : null,
+      sqliteBusyErrors: Number.isFinite(sqliteBusyErrors) ? sqliteBusyErrors : null,
+      webhookBurstVerified: loadTest.webhookBurstVerified === true,
+      sseFanoutVerified: loadTest.sseFanoutVerified === true,
+      slowProviderVerified: loadTest.slowProviderVerified === true
+    }
+  };
+}
+
+function certificationEvidencePresent(value) {
+  const text = String(value || '').trim();
+  return text.length >= 8 && !/replace[-_ ]?with|placeholder|todo/i.test(text);
 }
 
 function dryRunSmokeGate(providers) {
@@ -840,6 +1061,8 @@ function nextActionsFor(blockers) {
     if (/PRODUCTION_LIVE_ACK/.test(blocker)) return `set PRODUCTION_LIVE_ACK=${PRODUCTION_LIVE_ACK_VALUE} when intentionally launching`;
     if (/ADMIN_API_TOKEN/.test(blocker)) return 'set a strong ADMIN_API_TOKEN before production review/live';
     if (/APP_PUBLIC_URL/.test(blocker)) return 'set APP_PUBLIC_URL to the deployed https origin and register webhooks';
+    if (/PREVIEW_FRAME_SOURCES/.test(blocker)) return 'set PREVIEW_FRAME_SOURCES=https://*.lovable.app for customer review previews';
+    if (/PRIVACY_POLICY_URL|TERMS_OF_SERVICE_URL|LEGAL_REVIEW_ACK/.test(blocker)) return 'publish counsel-reviewed privacy and terms pages, then set the legal review acknowledgement';
     if (/WEBHOOK_SECRET|webhook/.test(blocker)) return 'configure provider webhook secret and endpoint';
     if (/dry-run\/config smoke/.test(blocker)) return 'run npm run smoke:providers without live toggles';
     if (/live smoke/.test(blocker)) return 'run one provider smoke at a time with SMOKE_* toggles';
@@ -871,4 +1094,11 @@ function stripeKeyMode(key) {
 
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function lovablePreviewFrameConfigured() {
+  return (env.security?.previewFrameSources || []).some((source) => {
+    const value = String(source || '').trim().toLowerCase().replace(/\/+$/, '');
+    return value === 'https://*.lovable.app' || value === 'https://lovable.app';
+  });
 }

@@ -10,13 +10,14 @@
  *   - short_warm    — replace openingLine + valueProp with a short warm variant.
  *   - data_driven   — open with a concrete signal from the lead profile.
  *
- * The arm assignment is sticky: assignArm() is keyed on lead.id, so repeated
- * calls for the same lead return the same arm. beginMessage is never touched,
- * so the recording-disclosure-first contract enforced by validateGeneratedPitch
- * stays intact.
+ * The arm assignment is sticky: assignAdaptiveArm() is keyed on lead.id, so
+ * repeated calls for the same lead return the same arm while new leads benefit
+ * from completed outcomes. beginMessage is never touched, so the
+ * recording-disclosure-first contract enforced by validateGeneratedPitch stays
+ * intact.
  */
 
-import { assignArm } from './experiments.js';
+import { assignAdaptiveArm } from './experiments.js';
 
 const EXPERIMENT_KEY = 'pitch_v2';
 const ARMS = ['control', 'short_warm', 'data_driven'];
@@ -137,14 +138,16 @@ export function applyPitchExperiment({ lead, pitch, profile = {}, disclosure = '
     return { pitch, assignment: null };
   }
 
-  // assignArm is idempotent on (experiment_key, bucket_key) so we always pass
-  // lead.id as both the leadId and bucketKey. Subsequent calls return the
-  // same row.
-  const assignment = assignArm({
+  // Adaptive assignment is still idempotent on (experiment_key, bucket_key):
+  // prior leads teach the policy, while this lead remains sticky across
+  // retries and callbacks.
+  const assignment = assignAdaptiveArm({
     experimentKey: EXPERIMENT_KEY,
     leadId: lead.id,
     bucketKey: lead.id,
-    arms: ARMS
+    arms: ARMS,
+    minSamplesPerArm: Number(process.env.PITCH_EXPERIMENT_MIN_SAMPLES_PER_ARM || 5),
+    explorationRate: Number(process.env.PITCH_EXPERIMENT_EXPLORATION_RATE || 0.2)
   });
 
   const arm = assignment?.arm || 'control';

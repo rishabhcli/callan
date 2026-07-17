@@ -38,3 +38,5 @@ output/
 playwright-report/
 test-results/
 callan-step*.png
+/callan-*.png
+.codex-*.md

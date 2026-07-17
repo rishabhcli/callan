@@ -36,8 +36,13 @@ export function canRunLiveBuildTarget(targetName) {
   if (!env.live.builds) {
     return { ok: false, reason: 'LIVE_BUILDS=false', live: false, target };
   }
-  if (target === 'lovable' && !env.browserUse.apiKey) {
-    return { ok: false, reason: 'BROWSER_USE_API_KEY missing', live: false, target };
+  if (target === 'lovable') {
+    const missing = [
+      !env.browserUse.apiKey && 'BROWSER_USE_API_KEY',
+      !env.browserUse.profileId && 'BROWSER_USE_PROFILE_ID',
+      !env.lovable.workspaceName && 'LOVABLE_WORKSPACE_NAME'
+    ].filter(Boolean);
+    if (missing.length) return { ok: false, reason: `${missing.join(', ')} missing`, live: false, target };
   }
   if (target === 'anything' && !env.browserUse.apiKey) {
     return { ok: false, reason: 'BROWSER_USE_API_KEY missing', live: false, target };
@@ -81,7 +86,7 @@ export function fulfillmentReadiness() {
         detail: { ...browserUseReadinessDetails().lovable, surface: 'anything.com via persistent Browser Use profile' }
       },
       lovable: {
-        configured: !!env.browserUse.apiKey,
+        configured: !!(env.browserUse.apiKey && env.browserUse.profileId && env.lovable.workspaceName),
         live: canRunLiveBuildTarget('lovable').ok,
         provider: 'browserUse',
         detail: browserUseReadinessDetails().lovable

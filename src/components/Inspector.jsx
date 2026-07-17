@@ -365,6 +365,7 @@ export default function Inspector({
                 builderInfo={builderInfo}
                 builderAction={builderAction}
                 onRetryBuild={onRetryBuild}
+                onLeadChanged={onLeadChanged}
               />
             )}
             {activeTab === 'Growth' && (
@@ -1938,7 +1939,7 @@ function ThreadView({ events, waitingCount = 0 }) {
   );
 }
 
-function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetryBuild }) {
+function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetryBuild, onLeadChanged }) {
   const state = useMemo(
     () => mergeBuilderState(detail, builderInfo, focusedLeadId),
     [detail, builderInfo, focusedLeadId]
@@ -1950,7 +1951,7 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
   const retrying = builderAction?.running && builderAction?.leadId === focusedLeadId;
   const actionError = builderAction?.leadId === focusedLeadId ? builderAction?.error : null;
   const previewUrl = state.liveUrl || state.finalSiteUrl || state.projectUrl;
-  const finalUrl = state.finalSiteUrl || state.projectUrl;
+  const finalUrl = state.finalSiteUrl;
   const isRunning = state.status === 'running';
   const buttonLabel = state.status === 'not_started' ? 'start build' : 'retry build';
   const mode = buildProofMode(state);
@@ -2011,6 +2012,11 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
         qa={detail?.builderQa}
         handoffCases={(detail?.handoff?.cases || []).filter((item) => ['qa_failure', 'build_auth_wall', 'provider_failure'].includes(item.category))}
       />
+      <ReleasePanel
+        buildId={state.latestBuildId}
+        readiness={detail?.builderQa?.releaseReadiness}
+        onReleased={() => onLeadChanged?.(focusedLeadId)}
+      />
 
       <div className="final-site-row">
         <div className="final-site-label mono">final site URL</div>
@@ -2052,6 +2058,147 @@ function BuilderTab({ detail, focusedLeadId, builderInfo, builderAction, onRetry
       ) : null}
     </div>
   );
+}
+
+function ReleasePanel({ buildId, readiness, onReleased }) {
+  const existing = readiness?.evidence || {};
+  const [form, setForm] = useState(() => releaseFormFromEvidence(existing));
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setForm(releaseFormFromEvidence(readiness?.evidence || {}));
+    setMessage(null);
+    setError(null);
+  }, [buildId, readiness?.evidence?.updatedAt]);
+
+  const set = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!buildId || saving) return;
+    setSaving(true);
+    setMessage(null);
+    setError(null);
+    const now = Date.now();
+    try {
+      const result = await api.releaseBuild(buildId, {
+        publishedUrl: form.publishedUrl,
+        customDomain: form.customDomain,
+        sourceRepoUrl: form.sourceRepoUrl,
+        ownershipPath: form.ownershipPath,
+        customerOwnerEmail: form.customerOwnerEmail,
+        ownershipEvidence: form.ownershipEvidence,
+        securityReviewPassed: form.securityReviewPassed,
+        securityReviewedAt: form.securityReviewPassed ? (existing.securityReviewedAt || now) : null,
+        codeExportedAt: form.codeExported ? (existing.codeExportedAt || now) : null,
+        customerManagedHostingConsent: form.customerManagedHostingConsent,
+        domainWaiverReason: form.domainWaiverReason,
+        operatorNote: form.operatorNote
+      });
+      if (result.released) {
+        setMessage('Released. The final URL is verified, customer ownership evidence is recorded, and aftercare is queued.');
+      } else {
+        const blockers = result.readiness?.blockers || [];
+        setMessage(`Evidence saved. Still blocked by: ${blockers.map(labelize).join(', ') || 'unknown release gate'}.`);
+      }
+      onReleased?.();
+    } catch (err) {
+      setError(err.message || 'Release evidence could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="builder-release-panel">
+      <div className="section-head">
+        <div>
+          <span className="hd">release &amp; customer handoff</span>
+          <div className="builder-release-copy">A Lovable preview is not a shipped site. This gate verifies the permanent URL and records source, domain, security, and ownership evidence.</div>
+        </div>
+        <span className={`build-status build-status-${readiness?.ok ? 'completed' : 'blocked_auth'}`}>{labelize(readiness?.status || 'not ready')}</span>
+      </div>
+
+      {readiness?.items?.length ? (
+        <div className="builder-release-gates">
+          {readiness.items.map((item) => (
+            <div key={item.key} className={`builder-release-gate ${item.passed ? 'is-passed' : 'is-blocked'}`}>
+              <span>{item.passed ? '✓' : '○'} {item.label}</span>
+              <small>{item.detail}</small>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <form className="builder-release-form" onSubmit={submit}>
+        <label>
+          <span>Permanent published HTTPS URL</span>
+          <input type="url" placeholder="https://www.customer.com" value={form.publishedUrl} onChange={(event) => set('publishedUrl', event.target.value)} />
+        </label>
+        <label>
+          <span>Customer custom domain</span>
+          <input placeholder="www.customer.com" value={form.customDomain} onChange={(event) => set('customDomain', event.target.value)} />
+        </label>
+        <label>
+          <span>Customer-accessible source repository</span>
+          <input type="url" placeholder="https://github.com/customer/site" value={form.sourceRepoUrl} onChange={(event) => set('sourceRepoUrl', event.target.value)} />
+        </label>
+        <label>
+          <span>Customer owner email</span>
+          <input type="email" placeholder="owner@customer.com" value={form.customerOwnerEmail} onChange={(event) => set('customerOwnerEmail', event.target.value)} />
+        </label>
+        <label>
+          <span>Ownership path</span>
+          <select value={form.ownershipPath} onChange={(event) => set('ownershipPath', event.target.value)}>
+            <option value="">Choose handoff path</option>
+            <option value="lovable_transfer">Lovable ownership transfer</option>
+            <option value="github_handoff">Customer GitHub handoff</option>
+            <option value="managed_hosting">Managed hosting with consent</option>
+          </select>
+        </label>
+        <label>
+          <span>Ownership evidence</span>
+          <textarea rows={3} placeholder="Invite/transfer confirmation, repository access proof, or managed-hosting consent record" value={form.ownershipEvidence} onChange={(event) => set('ownershipEvidence', event.target.value)} />
+        </label>
+        <label>
+          <span>Platform-domain waiver (if no custom domain)</span>
+          <textarea rows={2} placeholder="Customer explicitly chose the platform URL because…" value={form.domainWaiverReason} onChange={(event) => set('domainWaiverReason', event.target.value)} />
+        </label>
+        <label>
+          <span>Operator release note</span>
+          <textarea rows={2} placeholder="Final checks, exceptions, or handoff context" value={form.operatorNote} onChange={(event) => set('operatorNote', event.target.value)} />
+        </label>
+        <div className="builder-release-checks">
+          <label><input type="checkbox" checked={form.securityReviewPassed} onChange={(event) => set('securityReviewPassed', event.target.checked)} /> Lovable security check passed after the final change</label>
+          <label><input type="checkbox" checked={form.codeExported} onChange={(event) => set('codeExported', event.target.checked)} /> Customer-portable code export completed</label>
+          <label><input type="checkbox" checked={form.customerManagedHostingConsent} onChange={(event) => set('customerManagedHostingConsent', event.target.checked)} /> Customer explicitly accepted managed hosting</label>
+        </div>
+        <div className="builder-release-actions">
+          <button className="btn btn-mini" type="submit" disabled={!buildId || saving}>{saving ? 'verifying…' : readiness?.status === 'launched' ? 'update release evidence' : 'verify & release'}</button>
+          <span className="mono note">The server independently checks the published URL before launch.</span>
+        </div>
+      </form>
+      {message ? <div className="builder-release-message">{message}</div> : null}
+      {error ? <div className="builder-error mono">{error}</div> : null}
+    </section>
+  );
+}
+
+function releaseFormFromEvidence(evidence = {}) {
+  return {
+    publishedUrl: evidence.publishedUrl || '',
+    customDomain: evidence.customDomain || '',
+    sourceRepoUrl: evidence.sourceRepoUrl || '',
+    ownershipPath: evidence.ownershipPath || '',
+    customerOwnerEmail: evidence.customerOwnerEmail || '',
+    ownershipEvidence: evidence.ownershipEvidence || '',
+    securityReviewPassed: evidence.securityReviewPassed === true,
+    codeExported: Boolean(evidence.codeExportedAt),
+    customerManagedHostingConsent: evidence.customerManagedHostingConsent === true,
+    domainWaiverReason: evidence.domainWaiverReason || '',
+    operatorNote: evidence.operatorNote || ''
+  };
 }
 
 function BrowserUseBuildPanel({ state }) {
@@ -2209,7 +2356,7 @@ function mergeBuilderState(detail, builderInfo, focusedLeadId) {
     finishedAt: read.finishedAt || latest.finished_at || terminalTimelineTs(timeline),
     liveUrl: local?.liveUrl || read.liveUrl || latest.live_url || null,
     projectUrl,
-    finalSiteUrl: local?.finalSiteUrl || read.finalSiteUrl || projectUrl || (detail?.lead?.status === 'shipped' ? detail?.lead?.website : null),
+    finalSiteUrl: local?.finalSiteUrl || read.finalSiteUrl || latest.published_url || (latest.launch_status === 'launched' ? detail?.lead?.website : null),
     error: local?.error || read.error || latest.error || null,
     brief: local?.brief || read.brief || latest.brief || null,
     progressLog,

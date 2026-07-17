@@ -67,6 +67,7 @@ function buildReport(readiness, { strict, observability }) {
     webhooks: readiness.webhooks,
     admin: readiness.admin,
     jobs: readiness.jobs,
+    memory: readiness.memory,
     compliance: readiness.compliance,
     reputation: readiness.reputation,
     observability: {

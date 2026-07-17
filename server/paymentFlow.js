@@ -7,6 +7,7 @@ import { currentArmForLead, recordOutcome as recordExperimentOutcome } from './e
 import { PITCH_EXPERIMENT_KEY } from './experimentArms.js';
 import { log } from './logger.js';
 import { recordStripeFee } from './costs.js';
+import { assertMockProvenanceAllowed } from './sse.js';
 
 /**
  * Pick the invoice amount for a lead, preferring the lead's matched vertical
@@ -91,10 +92,13 @@ export function evaluateInvoiceGate({
 
   if (!resolvedLead) blockers.push(blocker('lead_missing', 'Lead was not found.'));
   if (!interest.ok) blockers.push(blocker('missing_transcript_backed_interest', 'No owner transcript turn explicitly asked to proceed or receive an invoice.'));
-  // Email gate: we only require an email exists. We do NOT require a verbal read-back
-  // confirmation in the transcript — when the customer says "send the invoice", the
-  // invoice goes out immediately to the email they gave us.
   if (!normalizedEmail) blockers.push(blocker('missing_customer_email', 'No customer email is available to send the invoice to.'));
+  else if (!emailProof.ok) {
+    blockers.push(blocker(
+      'missing_confirmed_customer_email',
+      'The invoice email was not confirmed by transcript read-back or a customer-controlled inbound email.'
+    ));
+  }
   if (optOut.found) blockers.push(blocker('customer_opted_out', optOut.reason));
 
   return {
@@ -141,15 +145,15 @@ export function ensureInvoiceConsentEvent({
       channel: 'revenue',
       provider_id: null,
       thread_id: null,
-      subject: 'Transcript-backed invoice consent',
+      subject: 'Verified invoice consent',
       body: gate?.evidence?.interest?.excerpt || 'Customer gave transcript-backed invoice consent.',
       metadata: {
         email: normalizedEmail,
         offerVersion,
         source,
         allowed: true,
-        decisionCode: 'invoice_consent.transcript_backed',
-        decisionReason: 'Transcript shows explicit interest and confirmed invoice email.',
+        decisionCode: `invoice_consent.${gate?.evidence?.email?.source || 'verified_email'}`,
+        decisionReason: `Customer interest is explicit and the invoice email was verified via ${gate?.evidence?.email?.source || 'approved proof'}.`,
         gate: compactGateForMetadata(gate)
       }
     });
@@ -363,7 +367,8 @@ export function recordPaidPayment(
           metadata: {
             paymentId: result.row?.id || null,
             stripeInvoiceId: result.row?.stripe_invoice_id || null
-          }
+          },
+          idempotencyKey: `payment:${result.row?.id || stripeId}:converted`
         });
       }
     } catch (err) {
@@ -486,6 +491,7 @@ function shouldMockInvoices() {
 }
 
 function createMockInvoice({ leadId, toEmail, idempotencyKey, amountCents, productName, daysUntilDue }) {
+  assertMockProvenanceAllowed('stripe.mock_invoice', { mock: true });
   const hash = shortHash(idempotencyKey);
   const id = `in_mock_${hash}`;
   return {

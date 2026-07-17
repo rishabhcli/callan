@@ -38,7 +38,7 @@ const {
   generateAccountManagerPlanForLead,
   runAccountManagerScheduler
 } = await import('../server/accountManager/index.js');
-const { approveLaunch } = await import('../server/customerPortal.js');
+const { approveLaunch, approveScope } = await import('../server/customerPortal.js');
 const { ACCOUNT_MANAGER_SECTION_KEYS } = await import('../server/accountManager/schema.js');
 
 try {
@@ -327,6 +327,11 @@ try {
     idempotency_key: 'aftercare-prelaunch-qa'
   });
   const approvalAt = now + 30 * 60 * 1000;
+  await approveScope({
+    leadId: prelaunchLeadId,
+    notes: 'Customer approved the website scope before launch.',
+    now: approvalAt - 1
+  });
   const launchApproval = await approveLaunch({ leadId: prelaunchLeadId, notes: 'Ready to launch.', now: approvalAt });
   assert.equal(launchApproval.ok, true, 'customer launch approval should succeed');
   assert.equal(launchApproval.aftercare?.ok, true, 'launch approval should seed aftercare automatically');

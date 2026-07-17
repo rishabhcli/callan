@@ -82,7 +82,9 @@ export default function ShareView({ token }) {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 4000);
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 8000);
     return () => clearInterval(id);
   }, [load]);
 
@@ -112,10 +114,10 @@ export default function ShareView({ token }) {
   const accountTimeline = data?.accountManagerTimeline || [];
   const memoryHighlights = brief?.memoryHighlights || [];
   const status = build?.status || (loading ? 'connecting' : 'no build');
-  const live = build?.liveUrl || build?.live_url || null;
-  const project = build?.projectUrl || build?.project_url || build?.finalSiteUrl || null;
+  const project = safePreviewUrl(build?.projectUrl || build?.project_url || build?.liveUrl || build?.live_url);
+  const finalSite = safeExternalUrl(build?.finalSiteUrl || build?.publishedUrl);
   const quoteStatus = data?.quoteStatus || 'not_yet';
-  const paymentLinkUrl = data?.paymentLinkUrl || null;
+  const paymentLinkUrl = safeNavigableUrl(data?.paymentLinkUrl);
   const pendingCallback = data?.existingPendingCallback || null;
   const verticalPack = data?.vertical_pack || null;
   const commerce = data?.commerce || null;
@@ -123,29 +125,60 @@ export default function ShareView({ token }) {
   const subscriptionManagement = data?.subscriptionManagement || { subscriptions: [] };
   const subscriptions = Array.isArray(subscriptionManagement.subscriptions) ? subscriptionManagement.subscriptions : [];
   const trust = data?.trust || null;
+  const policies = data?.policies || {};
+  const privacyPolicyUrl = safeExternalUrl(policies.privacyPolicyUrl);
+  const termsOfServiceUrl = safeExternalUrl(policies.termsOfServiceUrl);
   const accepted = quoteStatus === 'accepted' || quoteStatus === 'paid';
   const paid = quoteStatus === 'paid';
   const builderQa = data?.builderQa || {};
   const latestQa = builderQa.latestQa || null;
   const launchChecklist = builderQa.launchChecklist || null;
+  const releaseReadiness = data?.releaseReadiness || builderQa.releaseReadiness || null;
   const commerceChecklist = commerce?.launchChecklist || [];
   const launchStatusValue = build?.launchStatus || build?.launch_status || launchChecklist?.status;
   const customerApproved = ['customer_approved', 'launched'].includes(launchStatusValue) || build?.customerApprovedAt || build?.customer_approved_at;
-  const canApproveLaunch = latestQa?.passed && project && !customerApproved;
   const portalOptedOut = Boolean(actionState.optOutDone || trust?.optOutStatus?.optedOut);
   const scopeApproved = Boolean(data?.approvals?.scope || quote.scopeApproved);
+  const canApproveLaunch = latestQa?.passed && project && scopeApproved && !customerApproved;
   const launchApproved = Boolean(data?.approvals?.launch || customerApproved);
+  const customerFacingStatus = finalSite ? 'released' : launchApproved ? 'awaiting release' : status;
 
   const postAction = useCallback(async (path, body) => {
-    const res = await fetch(`/api/share/build/${encodeURIComponent(token)}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined
-    });
-    const text = await res.text();
-    const parsed = text ? JSON.parse(text) : null;
-    if (!res.ok) throw new Error(parsed?.error || res.statusText);
-    return parsed;
+    async function send(verificationAttempted = false) {
+      const res = await fetch(`/api/share/build/${encodeURIComponent(token)}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined
+      });
+      const text = await res.text();
+      const parsed = text ? JSON.parse(text) : null;
+      if (res.status === 428 && parsed?.code === 'PORTAL_VERIFICATION_REQUIRED' && !verificationAttempted) {
+        const request = await fetch(`/api/share/build/${encodeURIComponent(token)}/verification/request`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const requestBody = await request.json().catch(() => null);
+        if (!request.ok) throw new Error(requestBody?.error || 'Could not send the verification code.');
+        const code = window.prompt(`Enter the 6-digit code sent to ${requestBody.sentTo}.`);
+        if (!code) throw new Error('Email verification was cancelled.');
+        const confirmation = await fetch(`/api/share/build/${encodeURIComponent(token)}/verification/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code })
+        });
+        const confirmationBody = await confirmation.json().catch(() => null);
+        if (!confirmation.ok) throw new Error(confirmationBody?.error || 'Verification code was not accepted.');
+        return send(true);
+      }
+      if (!res.ok) throw new Error(parsed?.error || res.statusText);
+      if (parsed?.portalRotation?.url) {
+        const rotationUrl = safePortalRotationUrl(parsed.portalRotation.url);
+        if (!rotationUrl) throw new Error('The refreshed portal link was invalid. Reload this page from the original email.');
+        window.location.replace(rotationUrl);
+      }
+      return parsed;
+    }
+    return send(false);
   }, [token]);
 
   const handleAccept = useCallback(async () => {
@@ -420,7 +453,7 @@ export default function ShareView({ token }) {
     setActionState((s) => ({ ...s, launchBusy: true, launchError: null, launchMessage: null }));
     try {
       await postAction('/launch/approve');
-      setActionState((s) => ({ ...s, launchBusy: false, launchMessage: 'Approved — we will move this to launch.' }));
+      setActionState((s) => ({ ...s, launchBusy: false, launchMessage: 'Approved — final publishing and ownership handoff are now queued.' }));
       load();
     } catch (err) {
       setActionState((s) => ({ ...s, launchBusy: false, launchError: err.message }));
@@ -442,11 +475,11 @@ export default function ShareView({ token }) {
       <header className="nyna-share-bar">
         <div>
           <div className="nyna-share-title">{business.name || 'your build'}</div>
-          <div className="nyna-share-sub">your site is being built — live</div>
+          <div className="nyna-share-sub">secure build review and delivery</div>
         </div>
         <div className="nyna-share-status">
-          <span className={`nyna-action-dot ${live ? 'nyna-action-dot-live' : 'nyna-action-dot-off'}`} />
-          <span>{status}</span>
+          <span className={`nyna-action-dot ${project ? 'nyna-action-dot-live' : 'nyna-action-dot-off'}`} />
+          <span>{customerFacingStatus}</span>
         </div>
       </header>
 
@@ -455,8 +488,12 @@ export default function ShareView({ token }) {
           <div className="nyna-share-command-kicker">client operating room</div>
           <div className="nyna-share-command-title">{nextAction?.label || 'Build in progress'}</div>
           <div className="nyna-share-command-copy">
-            {scopeApproved
-              ? 'Scope is approved for the $500 website build.'
+            {finalSite
+              ? 'Your website is released. Final delivery and ownership details are below.'
+              : launchApproved
+                ? 'Approval received. We are verifying the final URL, security review, domain, source access, and ownership handoff.'
+                : scopeApproved
+                  ? 'Scope is approved for the $500 website build.'
               : quote.lineItems?.length
                 ? quote.lineItems.join(' / ')
                 : 'Your scope, invoice, assets, edits, QA, and launch approval live here.'}
@@ -472,16 +509,16 @@ export default function ShareView({ token }) {
 
       <section className="nyna-share-stage">
         <div className="nyna-share-frame">
-          {live ? (
+          {project ? (
             <iframe
-              title="your build in progress"
-              src={live}
-              sandbox={String(live).startsWith('/api/') ? 'allow-same-origin' : 'allow-scripts allow-same-origin'}
+              title="your website preview"
+              src={project}
+              sandbox={String(project).startsWith('/api/') ? 'allow-same-origin' : 'allow-scripts allow-forms allow-popups allow-same-origin'}
               referrerPolicy="no-referrer"
             />
           ) : (
             <div className="nyna-share-frame-placeholder">
-              <div className="nyna-share-frame-placeholder-eyebrow">browser-use cloud</div>
+              <div className="nyna-share-frame-placeholder-eyebrow">secure preview</div>
               <div className="nyna-share-frame-placeholder-title">
                 {loading ? 'finding your build agent…' : error ? `couldn't load: ${error}` : 'queued — your build will start shortly'}
               </div>
@@ -520,6 +557,23 @@ export default function ShareView({ token }) {
           </div>
 
           <div className="nyna-card">
+            <div className="nyna-card-title">final delivery</div>
+            <div className="nyna-card-body" style={{ fontSize: 12.5, lineHeight: 1.55 }}>
+              {finalSite ? (
+                <>
+                  <div>Published, verified, and handed off.</div>
+                  <a href={finalSite} target="_blank" rel="noreferrer" style={{ color: 'var(--apricot)', wordBreak: 'break-all' }}>{finalSite}</a>
+                </>
+              ) : (
+                <>
+                  <div>{releaseReadiness?.status === 'ready' ? 'Ready for the operator release step.' : 'Not released yet.'}</div>
+                  <div className="nyna-rail-empty">Approval does not publish the site. We still verify the final URL, security review, domain, source access, and ownership handoff.</div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="nyna-card">
             <div className="nyna-card-title">quality check</div>
             <div className="nyna-card-body" style={{ fontSize: 12.5, lineHeight: 1.55 }}>
               {latestQa ? (
@@ -539,6 +593,9 @@ export default function ShareView({ token }) {
                         </li>
                       ))}
                     </ul>
+                  ) : null}
+                  {releaseReadiness?.blockers?.length ? (
+                    <div style={{ marginTop: 10 }}>Delivery gates remaining: {releaseReadiness.blockers.map(labelize).slice(0, 5).join(', ')}</div>
                   ) : null}
                 </>
               ) : (
@@ -818,10 +875,10 @@ export default function ShareView({ token }) {
           <div className="nyna-card-body">
             <div className="nyna-share-action-body">
               {customerApproved
-                ? 'Thanks — your approval is recorded. The operator launch step is now queued.'
+                ? 'Thanks — your approval is recorded. Final publishing, URL verification, domain setup, source access, and ownership handoff still happen before the site is marked launched.'
                 : canApproveLaunch
                   ? 'The preview passed automated QA. Approve it when the obvious links, copy, and contact paths look right.'
-                  : 'Approval unlocks after the preview has a final URL and passes QA.'}
+                  : 'Approval unlocks after the review preview is available and passes QA.'}
             </div>
             <div className="nyna-share-action-row">
               <button
@@ -1105,7 +1162,9 @@ export default function ShareView({ token }) {
 
       <footer className="nyna-share-foot">
         <span>
-          callan · private build session · token <span style={{ color: 'var(--apricot)', marginLeft: 6 }}>{token.slice(0, 10)}…</span>
+          callan · private customer portal
+          {privacyPolicyUrl ? <> · <a href={privacyPolicyUrl} target="_blank" rel="noreferrer">privacy</a></> : null}
+          {termsOfServiceUrl ? <> · <a href={termsOfServiceUrl} target="_blank" rel="noreferrer">terms</a></> : null}
         </span>
         <button
           type="button"
@@ -1232,18 +1291,21 @@ function AssetList({ assets }) {
   if (!rows.length) return null;
   return (
     <div className="nyna-share-asset-list">
-      {rows.map((asset, index) => (
-        <a
-          key={`${asset.url || 'asset'}-${index}`}
-          href={asset.url?.startsWith('http') ? asset.url : undefined}
-          target="_blank"
-          rel="noreferrer"
-          className="nyna-share-asset-row"
-        >
-          <span>{asset.label || 'Customer asset'}</span>
-          <strong>{asset.url}</strong>
-        </a>
-      ))}
+      {rows.map((asset, index) => {
+        const href = safeNavigableUrl(asset.url);
+        return (
+          <a
+            key={`${asset.url || 'asset'}-${index}`}
+            href={href || undefined}
+            target={href ? '_blank' : undefined}
+            rel={href ? 'noreferrer' : undefined}
+            className="nyna-share-asset-row"
+          >
+            <span>{asset.label || 'Customer asset'}</span>
+            <strong>{asset.url}</strong>
+          </a>
+        );
+      })}
     </div>
   );
 }
@@ -1333,8 +1395,8 @@ function TrustPortalCard({ trust, business, optedOut, optOutBusy, optOutError, o
         {firstSource ? (
           <div className="nyna-trust-source">
             <span>source</span>
-            {firstSource.url ? (
-              <a href={firstSource.url} target="_blank" rel="noreferrer">
+            {safeExternalUrl(firstSource.url) ? (
+              <a href={safeExternalUrl(firstSource.url)} target="_blank" rel="noreferrer">
                 {firstSource.host || firstSource.label || firstSource.url}
               </a>
             ) : (
@@ -1443,4 +1505,48 @@ function splitList(value) {
     .map((item) => item.trim())
     .filter(Boolean)
     .slice(0, 12);
+}
+
+function safePreviewUrl(value) {
+  const text = String(value || '').trim();
+  if (/^\/api\/leads\/[^/?#]+\/build-preview$/.test(text)) return text;
+  try {
+    const url = new URL(text);
+    return url.protocol === 'https:' && (url.hostname === 'lovable.app' || url.hostname.endsWith('.lovable.app'))
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return url.protocol === 'https:' && !url.username && !url.password ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeNavigableUrl(value) {
+  const text = String(value || '').trim();
+  if (/^\/(?!\/)/.test(text)) return text;
+  try {
+    const url = new URL(text, window.location.origin);
+    if (url.origin === window.location.origin && ['http:', 'https:'].includes(url.protocol)) return url.href;
+    return url.protocol === 'https:' && !url.username && !url.password ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function safePortalRotationUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.origin);
+    if (url.origin !== window.location.origin || !/^\/share\/build\/[^/]+$/.test(url.pathname)) return null;
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return null;
+  }
 }

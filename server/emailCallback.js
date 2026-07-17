@@ -201,7 +201,8 @@ export async function handleEmailCallbackJob(payload = {}, job = null, { callbac
   const result = await callbackFn({
     msg,
     eventId: payload.eventId || job?.id || null,
-    resolvedPhone: payload.resolvedPhone || null
+    resolvedPhone: payload.resolvedPhone || null,
+    jobContext: job
   });
   if (result?.fired) {
     return {
@@ -264,7 +265,7 @@ function buildCallbackBeginMessage() {
  * Top-level handler. Returns null if no callback fired, or
  * { fired: true, toPhone, callId, providerCallId } if one did.
  */
-export async function maybePlaceEmailCallback({ msg, eventId, resolvedPhone = null }) {
+export async function maybePlaceEmailCallback({ msg, eventId, resolvedPhone = null, jobContext = null }) {
   if (!msg) return null;
   const intent = detectCallMeNowIntent({ subject: msg.subject, text: msg.text });
   if (!intent.wantsCall) return null;
@@ -328,7 +329,8 @@ export async function maybePlaceEmailCallback({ msg, eventId, resolvedPhone = nu
       toNumber: phone,
       systemPrompt,
       initialGreeting: beginMessage,
-      voice: env.agentphone.defaultVoice
+      voice: env.agentphone.defaultVoice,
+      authorization: { job: jobContext }
     });
 
     // Persist the call as a tracked row so AgentPhone's terminal webhook can

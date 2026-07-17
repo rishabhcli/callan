@@ -1,5 +1,12 @@
 name: Callan evals
 
+permissions:
+  contents: read
+
+concurrency:
+  group: callan-evals-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
   push:

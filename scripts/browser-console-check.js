@@ -3,14 +3,16 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
-import { dirname, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
 const dataDir = process.env.BROWSER_CONSOLE_CHECK_DATA_DIR || '.data/browser-console-check';
+const frontendDir = await mkdtemp(join(tmpdir(), 'callan-browser-console-dist-'));
 
 await resetDataDir(dataDir);
 forceMockEnv(dataDir);
@@ -19,7 +21,7 @@ const { leads, builds } = await import('../server/db.js');
 const { emit } = await import('../server/sse.js');
 
 const seeded = seedBrowserUseRows();
-await runCommand('npm', ['run', 'build'], { label: 'vite build' });
+await runCommand('npx', ['vite', 'build', '--outDir', frontendDir, '--emptyOutDir'], { label: 'vite build' });
 const api = await verifyApiShape({ dataDir });
 
 console.log(JSON.stringify({
@@ -28,12 +30,13 @@ console.log(JSON.stringify({
   seeded,
   api,
   commandsRun: [
-    'npm run build',
+    'vite build to an isolated production artifact',
     `DATA_DIR=${dataDir} node server/index.js`,
     'GET /api/browser-use/sessions',
     'GET /api/browser-use/events'
   ]
 }, null, 2));
+await rm(frontendDir, { recursive: true, force: true });
 
 function seedBrowserUseRows() {
   const suffix = `${Date.now().toString(36)}_${randomBytes(2).toString('hex')}`;
@@ -234,6 +237,7 @@ function forceMockEnv(target) {
   process.env.AUTONOMOUS_OUTREACH_ENABLED = 'false';
   process.env.BROWSER_USE_API_KEY = '';
   process.env.SMOKE_BROWSER_USE = 'false';
+  process.env.STATIC_DIR = frontendDir;
 }
 
 async function runCommand(cmd, args, { label }) {

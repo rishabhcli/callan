@@ -1,11 +1,9 @@
 /**
- * Live "we're researching you while we talk" effect for inbound calls.
+ * Inbound-call research orchestration.
  *
  * Two layers:
- * 1. The moment an inbound call lands, emit a synthetic burst of
- *    `research.session.*` / `research.evidence.captured` events so the
- *    dashboard's Scraper box and Memory box pulse like a real swarm is
- *    crawling the caller's phone.
+ * 1. In mock mode only, emit a clearly synthetic research burst for the
+ *    dashboard demo. Non-mock modes never manufacture evidence.
  * 2. When the caller mentions a business name or domain mid-call, enqueue
  *    a durable `research.browser_use` job against that business. In mock mode
  *    the job still runs the same 5-lane Browser Use swarm and streams real
@@ -39,6 +37,16 @@ const RESEARCH_LANES = [
  */
 export function startInboundCallerResearch({ callRow, fromNumber, lead }) {
   if (!callRow?.id) return;
+  // Fabricated research must never cross into a live workflow. In live modes
+  // the durable Browser Use job below is the only source of research evidence.
+  if (env.runMode !== 'mock') {
+    log.info('inbound.research.synthetic_burst_skipped', {
+      callId: callRow.id,
+      runMode: env.runMode,
+      reason: 'synthetic evidence is restricted to RUN_MODE=mock'
+    });
+    return;
+  }
   if (startedReverseLookupForCall.has(callRow.id)) return;
   startedReverseLookupForCall.add(callRow.id);
 

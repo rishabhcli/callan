@@ -17,7 +17,6 @@ import {
   events as eventStore,
   growthPlans,
   leads,
-  memoryDocuments,
 	  payments,
 	  portalActions,
 	  portalTokens,
@@ -38,6 +37,7 @@ import { log } from './logger.js';
 import { compactLeadIntelligence, evidenceTraceText } from './research/leadIntelligence.js';
 import { buildQaReadModel } from './fulfillment/hooks/index.js';
 import { createRevisionPlan } from './fulfillment/hooks/revision.js';
+import { buildReleaseReadiness } from './fulfillment/release.js';
 import { readAccountManagerState, runAccountManagerScheduler } from './accountManager/index.js';
 
 function requireLead(leadId) {
@@ -50,11 +50,11 @@ function requireLead(leadId) {
   return lead;
 }
 
-export function ensurePortalTokenForLead({ leadId, purpose = 'build_share', ttlMs = 30 * 86400000, metadata = {} } = {}) {
+export function ensurePortalTokenForLead({ leadId, purpose = 'build_share', ttlMs = Math.max(1, Number(env.portal?.tokenTtlHours) || 168) * 3600000, metadata = {} } = {}) {
   requireLead(leadId);
   if (!portalTokens?.ensureActive) return { token: leadId, path: `/share/build/${encodeURIComponent(leadId)}`, url: `/share/build/${encodeURIComponent(leadId)}`, fallback: true };
   const result = portalTokens.ensureActive({ lead_id: leadId, purpose, expiresInMs: ttlMs, metadata });
-  const token = result?.token || result?.row?.token || leadId;
+  const token = result?.token || leadId;
   return { token, row: result?.row || null, reused: !!result?.reused, path: `/share/build/${encodeURIComponent(token)}`, url: `/share/build/${encodeURIComponent(token)}` };
 }
 
@@ -62,11 +62,14 @@ export function legacyPortalFallbackAllowed() {
   return env.runMode === 'demo_live' || (env.runMode === 'mock' && env.nodeEnv !== 'production');
 }
 
-export function resolvePortalAccess(token) {
+export function resolvePortalAccess(token, { purposes = ['build_share'] } = {}) {
   const raw = String(token || '').trim();
   if (!raw) return null;
   const result = portalTokens?.resolve?.(raw);
   if (result?.ok && result?.lead) {
+    if (!purposes.includes(result.row?.purpose)) {
+      return { ok: false, status: 404, error: 'not found', reason: 'purpose_mismatch' };
+    }
     return {
       leadId: result.lead.id,
       lead: result.lead,
@@ -106,22 +109,25 @@ export function portalState({ leadId, access = null } = {}) {
   const lead = requireLead(leadId);
   const latestBuild = builds.listByLead(leadId)[0] || null;
   const builderEvents = eventStore.listByLead(leadId, { worker: 'builder', limit: 100 });
-  const builderQa = latestBuild ? buildQaReadModelCompat({ leadId, buildId: latestBuild.id }) : buildQaReadModelCompat({ leadId });
+  const rawBuilderQa = latestBuild ? buildQaReadModelCompat({ leadId, buildId: latestBuild.id }) : buildQaReadModelCompat({ leadId });
+  const rawReleaseReadiness = latestBuild ? buildReleaseReadiness({ build: latestBuild }) : null;
+  const releaseReadiness = customerReleaseReadiness(rawReleaseReadiness);
+  const builderQa = customerBuilderQa(rawBuilderQa, releaseReadiness);
   const intake = customerIntake.get(leadId) || emptyIntake(lead);
   const paymentsForLead = payments.listByLead(leadId);
   const latestPayment = paymentsForLead[0] || null;
   const actionRows = portalActions.listByLead?.(leadId, { limit: 120 }) || [];
   const revisionRows = buildRevisions.listByLead(leadId, { limit: 80 }) || [];
   const callbackRows = scheduledCalls.listForLead?.(leadId) || [];
-  const contactRows = contactEvents.listByLead(leadId, { limit: 80 }) || [];
-  const brief = portalBriefForLead(lead);
+  const contactRows = (contactEvents.listByLead(leadId, { limit: 80 }) || [])
+    .filter((row) => row.direction !== 'internal');
   const buildProgressLog = builderEvents
     .map((row) => {
       const payload = safeJson(row.payload_json) || {};
       return {
         ts: row.ts || row.created_at,
         type: row.type,
-        text: payload.summary || payload.note || payload.error || payload.projectUrl || payload.liveUrl || ''
+        text: payload.summary || payload.note || payload.error || ''
       };
     })
     .filter((item) => item.text)
@@ -163,14 +169,11 @@ export function portalState({ leadId, access = null } = {}) {
       city: lead.city || null,
       address: lead.address || null,
       phone: lead.phone || null,
-      website: lead.website || null,
-      sourceUrl: lead.source_url || null,
-      onlinePresenceStrength: lead.online_presence_strength || null,
-      profile: safeJson(lead.research_json)
+      website: lead.website || null
     },
     brief: {
-      ...brief,
-      memoryHighlights: memoryBriefHighlights(leadId)
+      headline: intake.primaryGoal || `${lead.business_name || 'Your business'} website`,
+      memoryHighlights: []
     },
     quoteStatus,
     quote: {
@@ -211,19 +214,32 @@ export function portalState({ leadId, access = null } = {}) {
     build: portalBuildRow(latestBuild, lead, buildProgressLog),
     builderQa,
     qa: builderQa,
+    releaseReadiness,
     revisions: revisionRows.map(portalRevisionRow),
     pendingCallback: portalCallbackRow(pendingCallback),
     existingPendingCallback: portalCallbackRow(pendingCallback),
     callbacks: callbackRows.map(portalCallbackRow),
     intake,
     approvals,
-    actions: actionRows.slice(0, 40).map(portalActionRow),
+    actions: actionRows
+      .filter((row) => row.channel === 'portal' || row.metadata?.source === 'share_portal')
+      .slice(0, 40)
+      .map(customerPortalActionRow),
     contactEvents: contactRows.map(portalContactRow),
     subscriptionManagement: subscriptionManagementForLead(leadId, actionRows),
     growth: growthStateForLead(leadId),
     launchChecklist,
-    nextAction: nextPortalAction(launchChecklist, { optedOut, quoteStatus }),
+    nextAction: nextPortalAction(launchChecklist, {
+      optedOut,
+      quoteStatus,
+      launchApproved: !!approvals.launch,
+      released: latestBuild?.launch_status === 'launched'
+    }),
     accountManagerTimeline: accountManagerTimeline({ builderEvents, actionRows, contactRows, callbackRows }),
+    policies: {
+      privacyPolicyUrl: publicPolicyUrl(env.legal?.privacyPolicyUrl),
+      termsOfServiceUrl: publicPolicyUrl(env.legal?.termsOfServiceUrl)
+    },
     timeline: builderEvents.map((e) => ({
       ts: e.ts || e.created_at,
       type: e.type || e.event_type,
@@ -3917,6 +3933,13 @@ export async function requestEdit({ leadId, tokenId = null, note } = {}) {
 
 export async function approveLaunch({ leadId, tokenId = null, notes = '', now = Date.now() } = {}) {
   const lead = requireLead(leadId);
+  const scopeApproval = (portalActions.listByLead?.(leadId, { limit: 100 }) || [])
+    .find((row) => row.type === 'scope_approved' && row.status === 'approved');
+  if (!scopeApproval) {
+    const err = new Error('website scope must be approved before launch approval');
+    err.code = 'scope_not_approved';
+    throw err;
+  }
   const latestBuild = builds.listByLead(leadId)[0] || null;
   if (!latestBuild) {
     const err = new Error('no build found to approve');
@@ -3949,8 +3972,7 @@ export async function approveLaunch({ leadId, tokenId = null, notes = '', now = 
   });
   leads.update(leadId, {
     status: 'launch_approved',
-    next_action: 'operator_launch',
-    website: latestBuild.project_url || lead.website || null
+    next_action: 'operator_release_handoff'
   });
   const eventId = contactEvents.add({
     id: `contact_launch_${latestBuild.id}`,
@@ -3963,7 +3985,6 @@ export async function approveLaunch({ leadId, tokenId = null, notes = '', now = 
     metadata: {
       source: 'share_portal',
       buildId: latestBuild.id,
-      projectUrl: latestBuild.project_url || null,
       decisionCode: 'portal.launch_approved',
       decisionReason: 'Customer approved the generated website for launch.'
     }
@@ -3975,7 +3996,7 @@ export async function approveLaunch({ leadId, tokenId = null, notes = '', now = 
     status: 'approved',
     related_type: 'build',
     related_id: latestBuild.id,
-    body: { projectUrl: latestBuild.project_url || null, notes: String(notes || '').trim() },
+    body: { notes: String(notes || '').trim() },
     metadata: { contactEventId: eventId, source: 'share_portal' },
     resolved_at: now
   });
@@ -3984,11 +4005,17 @@ export async function approveLaunch({ leadId, tokenId = null, notes = '', now = 
     leadId,
     buildId: latestBuild.id,
     launchStatus: 'customer_approved',
-    projectUrl: latestBuild.project_url || null,
     contactEventId: eventId
   });
   const aftercare = await seedAftercareAfterLaunchApproval({ leadId, now, source: 'portal_launch_approval' });
-  return { ok: true, buildId: latestBuild.id, launchStatus: 'customer_approved', projectUrl: latestBuild.project_url || null, contactEventId: eventId, aftercare };
+  return {
+    ok: true,
+    buildId: latestBuild.id,
+    launchStatus: 'customer_approved',
+    releaseReadiness: buildReleaseReadiness({ buildId: latestBuild.id }),
+    contactEventId: eventId,
+    aftercare
+  };
 }
 
 async function seedAftercareAfterLaunchApproval({ leadId, now = Date.now(), source = 'portal_launch_approval' } = {}) {
@@ -4152,6 +4179,15 @@ function safeJson(value) {
   try { return JSON.parse(value); } catch { return null; }
 }
 
+function publicPolicyUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeIntakePayload(raw = {}) {
   return {
     contactName: raw.contactName ?? raw.contact_name,
@@ -4193,18 +4229,6 @@ function emptyIntake(lead) {
   };
 }
 
-function memoryBriefHighlights(leadId) {
-  return (memoryDocuments.listByLead?.(leadId, { limit: 30 }) || [])
-    .filter((doc) => ['business_profile', 'call_analysis', 'mail_thread', 'invoice', 'build_brief', 'growth_plan'].includes(doc.kind))
-    .map((doc) => ({
-      kind: doc.kind,
-      text: compactText(doc.content_text, 280),
-      updatedAt: doc.updated_at,
-      source: doc.source_event || doc.source_id || null
-    }))
-    .slice(0, 8);
-}
-
 function portalLaunchChecklist({ intake, quoteStatus, latestPayment, latestBuild, builderQa, revisionRows, approvals, optedOut }) {
   const intakeDone = !!(
     intake?.contactName &&
@@ -4229,8 +4253,10 @@ function portalLaunchChecklist({ intake, quoteStatus, latestPayment, latestBuild
   ];
 }
 
-function nextPortalAction(checklist, { optedOut, quoteStatus }) {
+function nextPortalAction(checklist, { optedOut, quoteStatus, launchApproved = false, released = false }) {
   if (optedOut) return { id: 'opted_out', label: 'No further contact', tone: 'blocked' };
+  if (released) return { id: 'complete', label: 'Website delivered', tone: 'done' };
+  if (launchApproved) return { id: 'release_pending', label: 'Final release in progress', tone: 'active' };
   const next = checklist.find((item) => !item.done && item.id !== 'privacy');
   if (!next) return { id: 'complete', label: 'Launch approved', tone: 'done' };
   const labels = {
@@ -4248,14 +4274,27 @@ function nextPortalAction(checklist, { optedOut, quoteStatus }) {
 
 function portalBuildRow(row, lead, progressLog = []) {
   if (!row) return null;
+  const launched = row.launch_status === 'launched';
+  const finalSiteUrl = launched ? (row.published_url || lead?.website || null) : null;
+  const mockPreviewUrl = env.runMode === 'mock' && /^\/api\/leads\/[^/?#]+\/build-preview$/.test(String(row.live_url || ''))
+    ? row.live_url
+    : null;
+  const customerPreviewUrl = mockPreviewUrl || row.project_url || null;
   return {
     id: row.id,
     status: row.status,
-    liveUrl: row.live_url || null,
-    live_url: row.live_url || null,
-    projectUrl: row.project_url || null,
-    project_url: row.project_url || null,
-    finalSiteUrl: row.project_url || lead?.website || null,
+    // Browser Use session URLs can contain privileged session access. The
+    // customer portal only receives Lovable's project preview (or the local
+    // generated-site route in mock mode) and the final URL after release.
+    liveUrl: customerPreviewUrl,
+    live_url: customerPreviewUrl,
+    projectUrl: customerPreviewUrl,
+    project_url: customerPreviewUrl,
+    finalSiteUrl,
+    publishedUrl: finalSiteUrl,
+    customDomain: launched ? (row.custom_domain || null) : null,
+    ownershipStatus: launched ? (row.ownership_status || null) : null,
+    handoffCompletedAt: launched ? (row.handoff_completed_at || null) : null,
     launchStatus: row.launch_status || null,
     launch_status: row.launch_status || null,
     customerApprovedAt: row.customer_approved_at || null,
@@ -4264,6 +4303,54 @@ function portalBuildRow(row, lead, progressLog = []) {
     finishedAt: row.finished_at || null,
     updatedAt: row.updated_at || null,
     progressLog
+  };
+}
+
+function customerBuilderQa(value, releaseReadiness) {
+  const latestQa = value?.latestQa ? {
+    id: value.latestQa.id,
+    status: value.latestQa.status,
+    passed: value.latestQa.passed === true,
+    score: value.latestQa.score,
+    errors: Array.isArray(value.latestQa.errors) ? value.latestQa.errors : [],
+    checklist: Array.isArray(value.latestQa.checklist)
+      ? value.latestQa.checklist.map((item) => ({ key: item.key, label: item.label, passed: item.passed === true, detail: item.detail || null }))
+      : []
+  } : null;
+  return {
+    buildId: value?.buildId || null,
+    status: value?.status || 'unknown',
+    latestQa,
+    qaResults: latestQa ? [latestQa] : [],
+    revisions: Array.isArray(value?.revisions) ? value.revisions.map(portalRevisionRow) : [],
+    launchChecklist: value?.launchChecklist ? {
+      status: value.launchChecklist.status,
+      readyToLaunch: value.launchChecklist.readyToLaunch === true,
+      launched: value.launchChecklist.launched === true,
+      score: value.launchChecklist.score,
+      errors: Array.isArray(value.launchChecklist.errors) ? value.launchChecklist.errors : [],
+      launchBlocking: Array.isArray(value.launchChecklist.launchBlocking) ? value.launchChecklist.launchBlocking : [],
+      items: Array.isArray(value.launchChecklist.items)
+        ? value.launchChecklist.items.map((item) => ({ key: item.key, label: item.label, passed: item.passed === true, detail: item.detail || null }))
+        : []
+    } : null,
+    releaseReadiness,
+    maxRevisions: value?.maxRevisions ?? null
+  };
+}
+
+function customerReleaseReadiness(value) {
+  if (!value) return null;
+  return {
+    ok: value.ok === true,
+    status: value.status,
+    buildId: value.buildId,
+    blockers: Array.isArray(value.blockers) ? value.blockers : [],
+    items: Array.isArray(value.items)
+      ? value.items.map((item) => ({ key: item.key, label: item.label, passed: item.passed === true, detail: item.detail || null }))
+      : [],
+    finalUrl: value.status === 'launched' ? value.finalUrl : null,
+    launchedAt: value.status === 'launched' ? value.launchedAt : null
   };
 }
 
@@ -4296,16 +4383,29 @@ function portalActionRow(row) {
   };
 }
 
+function customerPortalActionRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    type: row.type,
+    status: row.status,
+    relatedType: row.related_type || null,
+    relatedId: row.related_id || null,
+    createdAt: row.created_at || null,
+    resolvedAt: row.resolved_at || null
+  };
+}
+
 function portalCallbackRow(row) {
   if (!row) return null;
+  const brief = safeJson(row.brief_json) || {};
   return {
     id: row.id,
     scheduledAtMs: row.scheduled_at_ms,
     status: row.status,
-    brief: safeJson(row.brief_json),
+    brief: { ask: compactText(brief.ask, 500), source: brief.source || null },
     createdAt: row.created_at,
-    firedAt: row.fired_at || null,
-    placedCallId: row.placed_call_id || null
+    firedAt: row.fired_at || null
   };
 }
 
@@ -4317,7 +4417,6 @@ function portalContactRow(row) {
     channel: row.channel,
     subject: row.subject,
     body: compactText(row.body, 500),
-    metadata: safeJson(row.metadata_json) || {},
     createdAt: row.created_at
   };
 }

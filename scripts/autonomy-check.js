@@ -434,6 +434,9 @@ async function runCoreChecks(mods) {
   });
 
   await check('agentmail.reply_idempotency_prevents_duplicate_auto_send', async () => {
+    const previousMode = env.runMode;
+    env.runMode = 'mock';
+    try {
     const leadId = insertLead(leads, containerTagFor, {
       id: stamp('agentmail_idem'),
       phone: phone('0218'),
@@ -464,6 +467,9 @@ async function runCoreChecks(mods) {
     assert(inbound.length === 1, `expected 1 inbound event, got ${inbound.length}`);
     assert(outbound.length === 1, `expected 1 outbound auto reply, got ${outbound.length}`);
     return { inbound: inbound.length, outbound: outbound.length, duplicate: duplicate.duplicate };
+    } finally {
+      env.runMode = previousMode;
+    }
   });
 
   await check('payment_build.invoice_paid_starts_builder_once', () => {

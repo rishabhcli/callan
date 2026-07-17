@@ -31,7 +31,7 @@ const KNOWN_EVENTS = [
   'builder.hosting_upsell_queued', 'builder.hosting_upsell_duplicate',
   'builder.hosting_upsell_sent', 'builder.hosting_upsell_skipped',
   'builder.start', 'builder.submission_created', 'builder.live_url', 'builder.provider_action', 'builder.progress',
-  'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.error',
+  'builder.project_url', 'builder.blocked_auth', 'builder.done', 'builder.released', 'builder.error',
   'hosting_upsell.sent',
   'stripe.webhook', 'stripe.paid', 'agentmail.webhook',
   'scheduledCall.created', 'scheduledCall.replaced', 'scheduledCall.canceled',

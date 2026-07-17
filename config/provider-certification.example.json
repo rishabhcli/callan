@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "environment": "staging",
+  "loadTest": {
+    "completedAt": "2026-01-01T00:00:00.000Z",
+    "forecastConcurrentWorkflows": 10,
+    "testedConcurrentWorkflows": 30,
+    "durationMinutes": 60,
+    "sqliteBusyErrors": 0,
+    "webhookBurstVerified": true,
+    "sseFanoutVerified": true,
+    "slowProviderVerified": true
+  },
+  "providers": [
+    {
+      "provider": "agentphone",
+      "certifiedAt": "2026-01-01T00:00:00.000Z",
+      "ownedTarget": "replace-with-redacted-owned-target-receipt",
+      "requestSchema": "replace-with-version-or-artifact-hash",
+      "responseSchema": "replace-with-version-or-artifact-hash",
+      "quotaVerified": "replace-with-receipt",
+      "retryPolicyVerified": "replace-with-receipt",
+      "idempotencyBehavior": "replace-with-observed-provider-behavior",
+      "webhookOrderingVerified": "replace-with-receipt",
+      "outageBehaviorVerified": "replace-with-receipt",
+      "credentialScopeVerified": "replace-with-receipt"
+    }
+  ]
+}
