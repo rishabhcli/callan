@@ -13,6 +13,7 @@ import { enqueueEmailCallbackJob } from '../emailCallback.js';
 import { enqueuePreviewBuilderBuild } from '../builderQueue.js';
 import { recordProviderFlag } from '../reputation.js';
 import { processInboundIntake } from '../inboundIntake.js';
+import { customerPortalLink, previewAssetLink } from '../customerLinks.js';
 import {
   classifyHandoffRisk,
   createHandoffCaseFromMail,
@@ -1258,7 +1259,7 @@ export async function writePreviewRecap({ leadId = null, businessName, profile, 
     websiteBrief: briefSummary
   };
   const prompt = [
-    `Write a 50-100 word email paragraph telling ${businessName} we just kicked off the build for their website and they can watch the live Browser Use session.`,
+    `Write a 50-100 word email paragraph telling ${businessName} we just kicked off the build for their website and they can follow progress in their secure customer portal.`,
     `Tone: a teammate texting a quick update. Warm, confident, NOT a marketing pitch.`,
     `HARD RULE: cite at least TWO concrete facts from the supplied data. Each cited fact must appear in the body (verbatim or near-verbatim). Citations must reference: customer quotes from replayMoments / customerQuestions, brief section names being built right now, or specific services/USPs from the profile.`,
     `FORBIDDEN: vague adjectives ("unique vibe", "translates perfectly", "comes together", "make booking a breeze", "stoked", "the energy of"). Replace them with the concrete facts above.`,
@@ -1366,21 +1367,12 @@ async function loadPreviewRecapContext(leadId, buildId = null) {
   return out;
 }
 
-function absolutizeLiveUrl(value) {
-  const url = String(value || '').trim();
-  if (!url) return '';
-  if (/^https?:\/\//i.test(url)) return url;
-  const base = String(env.publicUrl || 'http://localhost:8787').replace(/\/+$/, '');
-  return `${base}${url.startsWith('/') ? '' : '/'}${url}`;
-}
-
-function previewScreenshotUrl(buildId) {
-  const base = String(env.publicUrl || 'http://localhost:8787').replace(/\/+$/, '');
-  return `${base}/api/preview-build/${encodeURIComponent(buildId)}/screenshot.png`;
+function previewScreenshotUrl(leadId, buildId) {
+  return previewAssetLink({ leadId, buildId }).url;
 }
 
 function previewBuildThumbnailSvg() {
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 630"><rect width="1120" height="630" fill="#0a0a0a"/><rect x="32" y="32" width="1056" height="566" rx="14" fill="#161616" stroke="#2a2a2a"/><circle cx="68" cy="68" r="6" fill="#ff5f56"/><circle cx="92" cy="68" r="6" fill="#ffbd2e"/><circle cx="116" cy="68" r="6" fill="#27c93f"/><rect x="160" y="58" width="880" height="22" rx="6" fill="#222"/><text x="180" y="74" font-family="-apple-system,Segoe UI,sans-serif" font-size="13" fill="#888">lovable.dev/your-site — building now</text><rect x="80" y="120" width="960" height="430" rx="10" fill="#0f0f0f" stroke="#222"/><circle cx="130" cy="180" r="10" fill="#e74c3c"/><text x="155" y="186" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#e74c3c" font-weight="700">LIVE</text><text x="120" y="290" font-family="-apple-system,Segoe UI,sans-serif" font-size="40" fill="#fafafa" font-weight="700">Your site is being built</text><text x="120" y="340" font-family="-apple-system,Segoe UI,sans-serif" font-size="20" fill="#aaa">Tap to watch the live session in your browser →</text></svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 630"><rect width="1120" height="630" fill="#0a0a0a"/><rect x="32" y="32" width="1056" height="566" rx="14" fill="#161616" stroke="#2a2a2a"/><circle cx="68" cy="68" r="6" fill="#ff5f56"/><circle cx="92" cy="68" r="6" fill="#ffbd2e"/><circle cx="116" cy="68" r="6" fill="#27c93f"/><rect x="160" y="58" width="880" height="22" rx="6" fill="#222"/><text x="180" y="74" font-family="-apple-system,Segoe UI,sans-serif" font-size="13" fill="#888">secure customer portal — build in progress</text><rect x="80" y="120" width="960" height="430" rx="10" fill="#0f0f0f" stroke="#222"/><circle cx="130" cy="180" r="10" fill="#e74c3c"/><text x="155" y="186" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#e74c3c" font-weight="700">BUILDING</text><text x="120" y="290" font-family="-apple-system,Segoe UI,sans-serif" font-size="40" fill="#fafafa" font-weight="700">Your site is being built</text><text x="120" y="340" font-family="-apple-system,Segoe UI,sans-serif" font-size="20" fill="#aaa">Open your portal to follow progress and review →</text></svg>`;
 }
 
 function previewBuildEmailHtml({ businessName, liveUrl, recap, thumbnailUrl }) {
@@ -1397,11 +1389,11 @@ function previewBuildEmailHtml({ businessName, liveUrl, recap, thumbnailUrl }) {
     `<p>${safeRecap}</p>`,
     `<p style="text-align:center;margin:24px 0;">`,
     `<a href="${href}" style="text-decoration:none;">`,
-    `<img src="${thumbSrc}" alt="Watch the build live" width="560" style="display:block;max-width:100%;border-radius:12px;border:1px solid #e5e5e5;" />`,
+    `<img src="${thumbSrc}" alt="Follow your website build" width="560" style="display:block;max-width:100%;border-radius:12px;border:1px solid #e5e5e5;" />`,
     `</a>`,
     `</p>`,
     `<p style="text-align:center;margin:24px 0;">`,
-    `<a href="${href}" style="display:inline-block;background:#111;color:#fff;padding:14px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Watch the build live</a>`,
+    `<a href="${href}" style="display:inline-block;background:#111;color:#fff;padding:14px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Open your build portal</a>`,
     `</p>`,
     `<p style="font-size:13px;color:#666;">If the button doesn't open, paste this into your browser: <a href="${href}" style="color:#666;">${href}</a></p>`,
     `<p>Reply here any time if you want tweaks while it's running.</p>`,
@@ -1418,7 +1410,7 @@ function previewBuildEmailText({ businessName, liveUrl, recap }) {
     '',
     recap,
     '',
-    `Watch the build live: ${liveUrl}`,
+    `Follow the build securely: ${liveUrl}`,
     '',
     `Reply here any time if you want tweaks while it's running.`,
     '',
@@ -1506,13 +1498,16 @@ export async function sendPreviewBuildEmail({
   if (lead.risk_status === 'email-opt-out') return { ok: false, reason: 'opted_out' };
 
   const businessName = businessNameInput || lead.business_name || 'there';
-  const absoluteLiveUrl = absolutizeLiveUrl(liveUrl);
+  // Never put Browser Use's authenticated session URL in customer mail. A
+  // purpose-scoped portal token is the only customer entry point.
+  const portal = customerPortalLink(leadId);
+  const securePortalUrl = portal.url;
   const { profile, postMortem, websiteBrief } = await loadPreviewRecapContext(leadId, buildId);
   const recap = await writePreviewRecap({ leadId, businessName, profile, postMortem, websiteBrief });
-  const thumbnailUrl = buildId ? previewScreenshotUrl(buildId) : null;
+  const thumbnailUrl = buildId ? previewScreenshotUrl(leadId, buildId) : null;
   const subject = `Payment received — watch your ${businessName === 'there' ? 'site' : businessName + ' site'} come together live`;
-  const text = previewBuildEmailText({ businessName, liveUrl: absoluteLiveUrl, recap: recap.body });
-  const html = previewBuildEmailHtml({ businessName, liveUrl: absoluteLiveUrl, recap: recap.body, thumbnailUrl });
+  const text = previewBuildEmailText({ businessName, liveUrl: securePortalUrl, recap: recap.body });
+  const html = previewBuildEmailHtml({ businessName, liveUrl: securePortalUrl, recap: recap.body, thumbnailUrl });
 
   let sendResult;
   if (!inReplyToMessageId || shouldMockEmail(toEmail)) {
@@ -1551,11 +1546,11 @@ export async function sendPreviewBuildEmail({
     provider_id: sendResult.providerId || null,
     thread_id: sendResult.threadId || threadId || null,
     subject,
-    body: text,
+    body: text.replace(securePortalUrl, '[secure customer portal link]'),
     metadata: {
-      liveUrl: absoluteLiveUrl,
+      portalLinkIssued: true,
+      portalTokenId: portal.tokenId,
       buildId,
-      sessionId,
       mock: !!sendResult.mock || mock,
       messageId: sendResult.messageId,
       inReplyTo: inReplyToMessageId,
@@ -1576,9 +1571,7 @@ export async function sendPreviewBuildEmail({
     worker: 'mailer',
     leadId,
     threadId: sendResult.threadId || threadId,
-    liveUrl: absoluteLiveUrl,
     buildId,
-    sessionId,
     mock: !!sendResult.mock || mock
   });
 
@@ -1586,7 +1579,7 @@ export async function sendPreviewBuildEmail({
     ok: true,
     threadId: sendResult.threadId || threadId,
     messageId: sendResult.messageId,
-    liveUrl: absoluteLiveUrl,
+    portalLinkIssued: true,
     mock: !!sendResult.mock || mock
   };
 }

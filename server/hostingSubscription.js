@@ -1,14 +1,14 @@
 // Hosting/edits monthly subscription ($29/mo) sold AFTER the one-shot $500 build
 // ships. Flow:
-//   1. builder.done -> durable hosting.upsell job -> sendHostingUpsellEmail.
-//   2. /api/hosting/accept/:leadId -> acceptHostingSubscription -> Stripe Checkout
+//   1. verified release -> durable hosting.upsell job -> sendHostingUpsellEmail.
+//   2. /api/hosting/accept/:token -> acceptHostingSubscription -> Stripe Checkout
 //      session (subscription mode) -> 302 to the Checkout URL.
 //   3. customer.subscription.* webhook -> handleStripeSubscriptionEvent ->
 //      subscriptions.upsert + leads.subscription_id link.
 //
 // Idempotency: callers must check that leads.subscription_id IS NULL (or no
 // active row in subscriptions.forLead) before sending the upsell. Both
-// sendHostingUpsellEmail and the builder.done hook guard against double-send.
+// sendHostingUpsellEmail and the release hook guard against double-send.
 
 import { randomBytes } from 'node:crypto';
 import { env } from './env.js';
@@ -17,16 +17,13 @@ import { emit } from './sse.js';
 import { leads, subscriptions, payments, contactEvents } from './db.js';
 import { stripeClient } from './providers/stripe.js';
 import { sendAgentMailMessage } from './providers/agentmail.js';
+import { customerPortalLink, hostingAcceptLink, unsubscribeLink } from './customerLinks.js';
 
 export const STRIPE_PRICE_ID_HOSTING = process.env.STRIPE_PRICE_ID_HOSTING || '';
 
 const HOSTING_PLAN_LABEL = 'hosting_plus_edits_29';
 const HOSTING_DEFAULT_AMOUNT_CENTS = 2900;
 const HOSTING_DEFAULT_CURRENCY = 'usd';
-
-function publicUrl() {
-  return env.publicUrl || process.env.APP_PUBLIC_URL || 'http://localhost:8787';
-}
 
 function genId() {
   return `sub_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
@@ -60,7 +57,7 @@ function alreadySentHostingUpsell(leadId) {
   ));
 }
 
-function buildHostingEmailBody({ leadId, businessName, acceptUrl, optOutUrl }) {
+function buildHostingEmailBody({ businessName, acceptUrl, optOutUrl }) {
   const name = businessName || 'team';
   const text = [
     `Hi ${name},`,
@@ -72,14 +69,14 @@ function buildHostingEmailBody({ leadId, businessName, acceptUrl, optOutUrl }) {
     '  - 30 minutes of edits each month (copy, photos, sections, hours, menus, etc.)',
     '  - Priority email support — reply to this thread any time',
     '',
-    'One-click accept (no signup, just Stripe Checkout):',
+    'Review and accept securely in Stripe:',
     acceptUrl,
     '',
     'Cancel any time from the Stripe customer portal — no contracts, no platform fees.',
     '',
     'Questions? Reply here and a human will answer.',
     '',
-    `Don't want this email? Opt out: ${optOutUrl}`
+    `Stop future sales outreach: ${optOutUrl}`
   ].join('\n');
 
   const html = `
@@ -94,7 +91,7 @@ function buildHostingEmailBody({ leadId, businessName, acceptUrl, optOutUrl }) {
 <p><a href="${escapeAttr(acceptUrl)}" style="display:inline-block;padding:12px 18px;background:#7dffb6;color:#0b1116;text-decoration:none;font-weight:600;border-radius:6px;">Accept &amp; subscribe — $29/mo</a></p>
 <p style="color:#6b7280;font-size:13px;">Cancel any time from the Stripe customer portal — no contracts, no platform fees.</p>
 <p>Questions? Reply here and a human will answer.</p>
-<p style="color:#9ca3af;font-size:12px;">Don't want this email? <a href="${escapeAttr(optOutUrl)}">Opt out</a>.</p>
+<p style="color:#9ca3af;font-size:12px;"><a href="${escapeAttr(optOutUrl)}">Stop future sales outreach</a>.</p>
 `.trim();
 
   return { text, html };
@@ -122,7 +119,7 @@ function maskEmail(value) {
 /**
  * Send the $29/mo hosting upsell. Silent-skip with a log.warn when the price
  * isn't configured or the lead already has a subscription. Never throws — the
- * caller (builder.done) must keep running.
+ * caller (release flow) must keep running.
  */
 export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
   if (!leadId) {
@@ -157,11 +154,11 @@ export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
     return { sent: false, reason: 'no_recipient_email' };
   }
 
-  const base = publicUrl().replace(/\/+$/, '');
-  const acceptUrl = `${base}/api/hosting/accept/${encodeURIComponent(leadId)}`;
-  const optOutUrl = `${base}/api/optout?lead=${encodeURIComponent(leadId)}&topic=hosting`;
+  const acceptLink = hostingAcceptLink(leadId);
+  const optOutLink = unsubscribeLink(leadId, 'hosting');
+  const acceptUrl = acceptLink.url;
+  const optOutUrl = optOutLink.url;
   const { text, html } = buildHostingEmailBody({
-    leadId,
     businessName: leadRow.business_name,
     acceptUrl,
     optOutUrl
@@ -188,13 +185,17 @@ export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
         provider_id: result?.providerId || result?.messageId || null,
         thread_id: result?.threadId || null,
         subject,
-        body: text,
+        body: text
+          .replace(acceptUrl, '[secure hosting acceptance link]')
+          .replace(optOutUrl, '[secure unsubscribe link]'),
         metadata: {
           plan: HOSTING_PLAN_LABEL,
           amountCents: HOSTING_DEFAULT_AMOUNT_CENTS,
           currency: HOSTING_DEFAULT_CURRENCY,
-          acceptUrl,
-          optOutUrl,
+          acceptLinkIssued: true,
+          acceptTokenId: acceptLink.tokenId,
+          unsubscribeLinkIssued: true,
+          unsubscribeTokenId: optOutLink.tokenId,
           messageId: result?.messageId || null,
           toMasked: maskEmail(recipient),
           decisionCode: 'agentmail.outbound.hosting_upsell',
@@ -220,7 +221,7 @@ export async function sendHostingUpsellEmail({ leadId, toEmail, lead } = {}) {
       sent: true,
       messageId: result?.messageId || null,
       threadId: result?.threadId || null,
-      acceptUrl
+      acceptLinkIssued: true
     };
   } catch (err) {
     log.warn('hosting_upsell.failed', { leadId, error: err?.message || String(err) });
@@ -240,9 +241,9 @@ export async function acceptHostingSubscription({ leadId } = {}) {
   if (!lead) throw new Error(`lead ${leadId} not found`);
 
   const customerEmail = pickLeadEmail(lead);
-  const base = publicUrl().replace(/\/+$/, '');
-  const successUrl = `${base}/hosting/thanks?lead=${encodeURIComponent(leadId)}`;
-  const cancelUrl = `${base}/share/build/${encodeURIComponent(leadId)}`;
+  const base = String(env.publicUrl || process.env.APP_PUBLIC_URL || 'http://localhost:8787').replace(/\/+$/, '');
+  const successUrl = `${base}/hosting/thanks`;
+  const cancelUrl = customerPortalLink(leadId).url;
 
   const stripe = stripeClient();
   const session = await stripe.checkout.sessions.create({
@@ -265,6 +266,8 @@ export async function acceptHostingSubscription({ leadId } = {}) {
       callmemaybeLeadId: leadId,
       plan: HOSTING_PLAN_LABEL
     }
+  }, {
+    idempotencyKey: `hosting-checkout:${leadId}:${STRIPE_PRICE_ID_HOSTING}`
   });
 
   emit('hosting_subscription.checkout_created', {

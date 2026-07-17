@@ -9,7 +9,8 @@ const PUBLIC_API_PREFIXES = [
   '/api/webhooks/',
   '/api/share/build/',
   '/api/hosting/accept/',
-  '/api/preview-build/'
+  '/api/preview-build/',
+  '/api/unsubscribe/'
 ];
 const PUBLIC_API_EXACT_PATHS = new Set([
   '/api/ping',

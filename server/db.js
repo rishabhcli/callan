@@ -126,8 +126,15 @@ db.exec(`
     status TEXT NOT NULL,
     launch_status TEXT NOT NULL DEFAULT 'not_started',
     launch_readiness_json TEXT,
+    delivery_evidence_json TEXT,
+    published_url TEXT,
+    custom_domain TEXT,
+    source_repo_url TEXT,
+    ownership_status TEXT,
     operator_approved_at INTEGER,
     customer_approved_at INTEGER,
+    security_reviewed_at INTEGER,
+    handoff_completed_at INTEGER,
     launched_at INTEGER,
     preview_html TEXT,
     screenshot_url TEXT,
@@ -6075,8 +6082,15 @@ ensureColumn('builds', 'provider_deployment_id', 'TEXT');
 ensureColumn('builds', 'attempt', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('builds', 'launch_status', "TEXT NOT NULL DEFAULT 'not_started'");
 ensureColumn('builds', 'launch_readiness_json', 'TEXT');
+ensureColumn('builds', 'delivery_evidence_json', 'TEXT');
+ensureColumn('builds', 'published_url', 'TEXT');
+ensureColumn('builds', 'custom_domain', 'TEXT');
+ensureColumn('builds', 'source_repo_url', 'TEXT');
+ensureColumn('builds', 'ownership_status', 'TEXT');
 ensureColumn('builds', 'operator_approved_at', 'INTEGER');
 ensureColumn('builds', 'customer_approved_at', 'INTEGER');
+ensureColumn('builds', 'security_reviewed_at', 'INTEGER');
+ensureColumn('builds', 'handoff_completed_at', 'INTEGER');
 ensureColumn('builds', 'launched_at', 'INTEGER');
 ensureColumn('builds', 'preview_html', 'TEXT');
 ensureColumn('builds', 'screenshot_url', 'TEXT');

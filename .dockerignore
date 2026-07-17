@@ -7,6 +7,9 @@ output
 playwright-report
 test-results
 coverage
+callan-*.png
+.codex-*
+.playwright-mcp
 *.log
 .DS_Store
 .env

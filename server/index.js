@@ -2,6 +2,7 @@ import express from 'express';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { resolve } from 'node:path';
 import { env, isValidRunMode } from './env.js';
 import { log } from './logger.js';
 import { attachStream, emit } from './sse.js';
@@ -51,7 +52,7 @@ import { runAnalyst } from './workers/analyst.js';
 import { handleAgentMailInbound, runMailer } from './workers/mailer.js';
 import { runBuilder, runPreviewBuilder } from './workers/builder.js';
 import { BUILDER_BUILD_JOB_TYPE, enqueueBuilderBuild } from './builderQueue.js';
-import { HOSTING_UPSELL_JOB_TYPE, handleHostingUpsellJob } from './hostingUpsellQueue.js';
+import { HOSTING_UPSELL_JOB_TYPE, enqueueHostingUpsell, handleHostingUpsellJob } from './hostingUpsellQueue.js';
 import { runScheduledCaller } from './workers/scheduledCaller.js';
 import {
   registerScheduledCallDispatcher,
@@ -72,7 +73,7 @@ import {
   runBrowserUseResearchJob,
   stopBrowserUseResearchJob
 } from './research/browserUseSwarm.js';
-import { BrowserUseLovableAdapter, normalizeBrowserUseSessionSnapshot } from './providers/browserUse.js';
+import { BrowserUseLovableAdapter, fetchSafePublicBuffer, fetchSafePublicText, normalizeBrowserUseSessionSnapshot } from './providers/browserUse.js';
 import { growthStatus, readGrowthState, recordGrowthCustomerResponse } from './growth/index.js';
 import { GROWTH_FOLLOWUP_JOB_TYPE, GROWTH_PLAN_JOB_TYPE, enqueueGrowthFollowupJob, enqueueGrowthPlanJob, handleGrowthFollowupJob, handleGrowthPlanJob } from './growthQueue.js';
 import {
@@ -97,6 +98,8 @@ import {
 import { commerceStatus, planCommerceForLead, readCommerceState, submitPortalCommerceIntake } from './commerce/index.js';
 import { mossStatusForLead } from './moss/hotIndex.js';
 import { buildQaReadModel, renderMockGeneratedSite } from './fulfillment/hooks/index.js';
+import { buildReleaseReadiness, recordReleaseEvidence } from './fulfillment/release.js';
+import { CUSTOMER_LINK_PURPOSES, resolveCustomerLinkToken } from './customerLinks.js';
 import { recordReferralClick, referralRollup, totalReferralClicks } from './referrals.js';
 import {
   acceptQuote as portalAcceptQuote,
@@ -228,6 +231,23 @@ app.use('/api', (_req, res, next) => {
 });
 app.use('/api/referrals/leads', publicIntakeLimiter);
 app.use('/api/hosting/accept', publicIntakeLimiter);
+app.use('/api/unsubscribe', publicIntakeLimiter);
+app.use(['/api/hosting/accept', '/api/unsubscribe'], (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase())) return next();
+  const fetchSite = String(req.get('sec-fetch-site') || '').toLowerCase();
+  const origin = String(req.get('origin') || '').trim();
+  if (fetchSite === 'cross-site') {
+    return res.status(403).send('Cross-site customer actions are not allowed.');
+  }
+  if (origin) {
+    try {
+      if (!portalOriginAllowed(origin)) return res.status(403).send('Customer action origin is not allowed.');
+    } catch {
+      return res.status(403).send('Customer action origin is invalid.');
+    }
+  }
+  return next();
+});
 app.use('/api/share/build', scopedLinkLimiter);
 app.use('/api/share/build', (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase())) return next();
@@ -4588,6 +4608,71 @@ app.get('/api/leads/:id/build-qa', (req, res) => {
   res.json(buildQaReadModel({ leadId: lead.id, buildId: buildRows[0]?.id || null }));
 });
 
+app.get('/api/builds/:id/release-readiness', (req, res) => {
+  const build = builds.get(req.params.id);
+  if (!build) return res.status(404).json({ ok: false, error: 'build not found' });
+  return res.json(buildReleaseReadiness({ build }));
+});
+
+app.post('/api/builds/:id/release', async (req, res) => {
+  const build = builds.get(req.params.id);
+  if (!build) return res.status(404).json({ ok: false, error: 'build not found' });
+  try {
+    const evidence = { ...(req.body || {}), publishedUrlVerifiedAt: null };
+    const existingEvidence = buildReleaseReadiness({ build }).evidence || {};
+    const candidateUrl = String(evidence.publishedUrl || evidence.published_url || existingEvidence.publishedUrl || '').trim();
+    if (candidateUrl) evidence.publishedUrl = candidateUrl;
+    if (candidateUrl) {
+      try {
+        const html = await fetchSafePublicText(candidateUrl, 12_000);
+        if (String(html || '').trim().length < 80) throw new Error('published page returned an empty response');
+        evidence.publishedUrlVerifiedAt = Date.now();
+      } catch (err) {
+        log.warn('build.release_url_verification_failed', { buildId: build.id, error: err?.message || String(err) });
+      }
+    }
+    const result = recordReleaseEvidence({ buildId: build.id, evidence });
+    if (!result.released) return res.status(200).json({ ok: false, released: false, readiness: result.readiness });
+
+    const finalUrl = result.build?.published_url || result.readiness?.finalUrl || null;
+    leads.update(build.lead_id, {
+      website: finalUrl,
+      status: 'shipped',
+      next_action: 'aftercare_and_hosting_offer'
+    });
+    emit('builder.released', {
+      worker: 'builder',
+      leadId: build.lead_id,
+      buildId: build.id,
+      launchStatus: 'launched',
+      finalSiteUrl: finalUrl,
+      ownershipStatus: result.build?.ownership_status || null
+    });
+    let hostingUpsellJob = null;
+    try {
+      hostingUpsellJob = enqueueHostingUpsell({
+        leadId: build.lead_id,
+        buildId: build.id,
+        projectUrl: finalUrl,
+        target: build.target || null,
+        source: 'build.release'
+      }).row || null;
+    } catch (err) {
+      log.warn('release.hosting_upsell_enqueue_failed', { leadId: build.lead_id, buildId: build.id, error: err?.message || String(err) });
+    }
+    return res.json({
+      ok: true,
+      released: true,
+      readiness: result.readiness,
+      hostingUpsellQueued: Boolean(hostingUpsellJob),
+      hostingUpsellJobId: hostingUpsellJob?.id || null
+    });
+  } catch (err) {
+    log.warn('build.release_failed', { buildId: build.id, leadId: build.lead_id, error: err?.message || String(err) });
+    return res.status(err?.code === 'build_not_found' ? 404 : 400).json({ ok: false, error: 'release evidence could not be recorded' });
+  }
+});
+
 app.get('/api/leads/:id/moss', (req, res) => {
   const lead = leads.get(req.params.id);
   if (!lead) return res.status(404).json({ error: 'lead not found' });
@@ -5369,18 +5454,18 @@ const previewScreenshotAdapter = (() => {
 
 function sendPreviewScreenshotFallback(res, businessName) {
   const safe = (businessName || 'Your site').replace(/[<>&]/g, '');
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 630"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0a0a"/><stop offset="1" stop-color="#191d24"/></linearGradient></defs><rect width="1120" height="630" fill="url(#g)"/><rect x="32" y="32" width="1056" height="566" rx="14" fill="#0f0f0f" stroke="#2a2a2a"/><circle cx="68" cy="68" r="6" fill="#ff5f56"/><circle cx="92" cy="68" r="6" fill="#ffbd2e"/><circle cx="116" cy="68" r="6" fill="#27c93f"/><rect x="160" y="58" width="880" height="22" rx="6" fill="#1a1a1a"/><text x="180" y="74" font-family="-apple-system,Segoe UI,sans-serif" font-size="13" fill="#888">lovable.dev/${safe.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)} — building now</text><circle cx="130" cy="180" r="10" fill="#e74c3c"/><text x="155" y="186" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#e74c3c" font-weight="700">LIVE</text><text x="120" y="290" font-family="-apple-system,Segoe UI,sans-serif" font-size="40" fill="#fafafa" font-weight="700">${safe}</text><text x="120" y="340" font-family="-apple-system,Segoe UI,sans-serif" font-size="20" fill="#aaa">Tap to watch the live build session →</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 630"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0a0a"/><stop offset="1" stop-color="#191d24"/></linearGradient></defs><rect width="1120" height="630" fill="url(#g)"/><rect x="32" y="32" width="1056" height="566" rx="14" fill="#0f0f0f" stroke="#2a2a2a"/><circle cx="68" cy="68" r="6" fill="#ff5f56"/><circle cx="92" cy="68" r="6" fill="#ffbd2e"/><circle cx="116" cy="68" r="6" fill="#27c93f"/><rect x="160" y="58" width="880" height="22" rx="6" fill="#1a1a1a"/><text x="180" y="74" font-family="-apple-system,Segoe UI,sans-serif" font-size="13" fill="#888">secure customer portal — build in progress</text><circle cx="130" cy="180" r="10" fill="#e74c3c"/><text x="155" y="186" font-family="-apple-system,Segoe UI,sans-serif" font-size="16" fill="#e74c3c" font-weight="700">BUILDING</text><text x="120" y="290" font-family="-apple-system,Segoe UI,sans-serif" font-size="40" fill="#fafafa" font-weight="700">${safe}</text><text x="120" y="340" font-family="-apple-system,Segoe UI,sans-serif" font-size="20" fill="#aaa">Open your portal to follow progress and review →</text></svg>`;
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Content-Type', 'image/svg+xml');
   res.send(svg);
 }
 
-app.get('/api/preview-build/:buildId/screenshot.png', async (req, res) => {
+app.get('/api/preview-build/:token/:buildId/screenshot.png', async (req, res) => {
+  const access = resolveCustomerLinkToken(req.params.token, CUSTOMER_LINK_PURPOSES.previewAsset);
   const buildId = req.params.buildId;
   const buildRow = builds.get(buildId);
-  if (!buildRow) {
-    sendPreviewScreenshotFallback(res, 'Your site');
-    return;
+  if (!access?.ok || !buildRow || buildRow.lead_id !== access.lead?.id || access.row?.metadata?.buildId !== buildId) {
+    return res.status(404).send('Not found');
   }
   const lead = leads.get(buildRow.lead_id);
   const businessName = lead?.business_name || 'Your site';
@@ -5404,16 +5489,11 @@ app.get('/api/preview-build/:buildId/screenshot.png', async (req, res) => {
       sendPreviewScreenshotFallback(res, businessName);
       return;
     }
-    const upstream = await fetch(shotUrl);
-    if (!upstream.ok) {
-      sendPreviewScreenshotFallback(res, businessName);
-      return;
-    }
-    const contentType = upstream.headers.get('content-type') || 'image/png';
+    const upstream = await fetchSafePublicBuffer(shotUrl, 10_000);
+    const contentType = upstream.contentType || 'image/png';
     res.set('Content-Type', contentType);
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.send(buf);
+    res.send(upstream.body);
   } catch (err) {
     log.warn('preview_build.screenshot_failed', { buildId, sessionId, err: err?.message || String(err) });
     sendPreviewScreenshotFallback(res, businessName);
@@ -5509,11 +5589,31 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
   res.json(subscription ? { ...result, subscription } : result);
 });
 
-// Customer-facing one-click accept link from the hosting upsell email.
-// 302-redirects to the Stripe Checkout URL so the customer never sees JSON.
-app.get('/api/hosting/accept/:leadId', async (req, res) => {
-  const leadId = String(req.params.leadId || '').trim();
-  if (!leadId) return res.status(400).send('leadId required');
+function customerActionPage({ title, message, action = null, submitLabel = null, nonce = '' } = {}) {
+  const form = action && submitLabel
+    ? `<form method="post" action="${escapeHtml(action)}"><button type="submit">${escapeHtml(submitLabel)}</button></form>`
+    : '';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style nonce="${escapeHtml(nonce)}">:root{color-scheme:light}body{margin:0;background:#f5f2eb;color:#151515;font:16px/1.55 system-ui,sans-serif}main{max-width:560px;margin:12vh auto;padding:32px;background:#fff;border:1px solid #ddd8ce;border-radius:18px;box-shadow:0 18px 60px #00000012}h1{font-size:28px;line-height:1.15;margin:0 0 14px}p{color:#555;margin:0 0 24px}button{border:0;border-radius:999px;background:#151515;color:#fff;padding:12px 18px;font:inherit;font-weight:700;cursor:pointer}</style></head><body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${form}</main></body></html>`;
+}
+
+// Email scanners often follow links automatically, so GET only displays a
+// confirmation. The same-origin POST creates Stripe Checkout.
+app.get('/api/hosting/accept/:token', (req, res) => {
+  const access = resolveCustomerLinkToken(req.params.token, CUSTOMER_LINK_PURPOSES.hostingAccept);
+  if (!access?.ok) return res.status(404).send('Not found');
+  return res.type('html').send(customerActionPage({
+    title: 'Confirm hosting and edit care',
+    message: 'Continue to Stripe to review the $29/month plan before subscribing. You will not be charged on this page.',
+    action: `/api/hosting/accept/${encodeURIComponent(req.params.token)}`,
+    submitLabel: 'Review plan in Stripe',
+    nonce: res.locals.cspNonce
+  }));
+});
+
+app.post('/api/hosting/accept/:token', async (req, res) => {
+  const access = resolveCustomerLinkToken(req.params.token, CUSTOMER_LINK_PURPOSES.hostingAccept);
+  if (!access?.ok) return res.status(404).send('Not found');
+  const leadId = access.lead.id;
   try {
     const { url } = await acceptHostingSubscription({ leadId });
     if (!url) return res.status(502).send('Stripe Checkout URL missing');
@@ -5523,7 +5623,41 @@ app.get('/api/hosting/accept/:leadId', async (req, res) => {
       leadId,
       error: err?.message || String(err)
     });
-    return res.status(500).send(`Could not start hosting subscription: ${err?.message || 'unknown error'}`);
+    return res.status(500).send(env.nodeEnv === 'production'
+      ? 'Could not start the hosting subscription. Please reply to the email for help.'
+      : `Could not start hosting subscription: ${err?.message || 'unknown error'}`);
+  }
+});
+
+app.get('/unsubscribe/:token', (req, res) => {
+  const access = resolveCustomerLinkToken(req.params.token, CUSTOMER_LINK_PURPOSES.unsubscribe);
+  if (!access?.ok) return res.status(404).send('Not found');
+  return res.type('html').send(customerActionPage({
+    title: 'Stop future outreach',
+    message: 'Confirm to stop future sales emails and calls from Callan. Existing service and billing messages may still be sent when legally required.',
+    action: `/api/unsubscribe/${encodeURIComponent(req.params.token)}`,
+    submitLabel: 'Unsubscribe me',
+    nonce: res.locals.cspNonce
+  }));
+});
+
+app.post('/api/unsubscribe/:token', (req, res) => {
+  const access = resolveCustomerLinkToken(req.params.token, CUSTOMER_LINK_PURPOSES.unsubscribe);
+  if (!access?.ok) return res.status(404).send('Not found');
+  try {
+    portalOptOut({
+      leadId: access.lead.id,
+      tokenId: access.row.id,
+      reason: `customer_unsubscribe:${access.row?.metadata?.topic || 'all'}`
+    });
+    return res.type('html').send(customerActionPage({
+      title: 'You are unsubscribed',
+      message: 'We recorded your preference and stopped future sales outreach.',
+      nonce: res.locals.cspNonce
+    }));
+  } catch (err) {
+    log.warn('customer.unsubscribe_failed', { portalTokenId: access.row?.id || null, error: err?.message || String(err) });
+    return res.status(500).send('We could not record your preference. Please reply to the email and ask to opt out.');
   }
 });
 
@@ -5549,7 +5683,11 @@ function portalActionFailed(res, eventType, err, metadata = {}) {
     : err?.code === 'lead_not_found' || err?.code === 'portal_action_not_found'
       ? 404
       : 500;
-  res.status(status).json({ error: err?.message || 'portal_action_failed' });
+  res.status(status).json({
+    error: status >= 500 && env.nodeEnv === 'production'
+      ? 'portal action failed'
+      : (err?.message || 'portal_action_failed')
+  });
 }
 
 function portalLogContext(access) {
@@ -5655,7 +5793,7 @@ app.get('/api/share/build/:token', (req, res) => {
     });
   } catch (err) {
     log.warn('portal.state_failed', { portalTokenId: access.tokenRow?.id || null, leadId: access.lead?.id || null, error: err?.message || String(err) });
-    res.status(500).json({ error: err?.message || 'portal_state_failed' });
+    res.status(500).json({ error: env.nodeEnv === 'production' ? 'portal state unavailable' : (err?.message || 'portal_state_failed') });
   }
 });
 
@@ -6029,9 +6167,10 @@ app.use('/api', (req, res) => {
   });
 });
 
-app.use(express.static('dist'));
+const staticDir = resolve(process.cwd(), env.staticDir);
+app.use(express.static(staticDir));
 app.get('*', (_req, res) => {
-  res.sendFile(`${process.cwd()}/dist/index.html`, (err) => {
+  res.sendFile(resolve(staticDir, 'index.html'), (err) => {
     if (err) res.status(200).send('<!doctype html><html><body><p>UI not built. Run <code>npm run build</code>.</p></body></html>');
   });
 });
@@ -6057,7 +6196,11 @@ app.use((err, req, res, _next) => {
 function safeRequestPath(req) {
   return String(req?.path || req?.originalUrl || '')
     .replace(/(\/api\/share\/build\/)[^/?#]+/i, '$1:token')
-    .replace(/(\/share\/build\/)[^/?#]+/i, '$1:token');
+    .replace(/(\/share\/build\/)[^/?#]+/i, '$1:token')
+    .replace(/(\/api\/preview-build\/)[^/?#]+/i, '$1:token')
+    .replace(/(\/api\/hosting\/accept\/)[^/?#]+/i, '$1:token')
+    .replace(/(\/api\/unsubscribe\/)[^/?#]+/i, '$1:token')
+    .replace(/(\/unsubscribe\/)[^/?#]+/i, '$1:token');
 }
 
 const httpServer = app.listen(env.port, () => {
@@ -7894,6 +8037,7 @@ const BUILDER_LABELS = {
   'builder.hosting_upsell_sent': 'Hosting upsell sent',
   'builder.hosting_upsell_skipped': 'Hosting upsell skipped',
   'builder.done': 'Build completed',
+  'builder.released': 'Customer site released',
   'browserUse.session.stopped': 'Browser Use stopped',
   'builder.error': 'Build failed'
 };
@@ -7986,7 +8130,7 @@ function buildBuilderReadModel({ lead, buildRows, builderEvents }) {
     finishedAt: latest?.finished_at || terminalTs(timeline),
     liveUrl: latest?.live_url || lastValue(timeline, 'liveUrl'),
     projectUrl: latest?.project_url || lastValue(timeline, 'projectUrl'),
-    finalSiteUrl: latest?.project_url || (['shipped', 'awaiting_launch_approval', 'launch_approved'].includes(lead.status) ? lead.website : null),
+    finalSiteUrl: latest?.launch_status === 'launched' ? (latest?.published_url || lead.website || null) : null,
     launchStatus: latest?.launch_status || lastValue(timeline, 'launchStatus') || 'not_started',
     customerApprovedAt: latest?.customer_approved_at || null,
     operatorApprovedAt: latest?.operator_approved_at || null,
@@ -8032,6 +8176,7 @@ function builderTimelineItem(row) {
     summary: payload.summary || payload.note || payload.error || payload.projectUrl || payload.liveUrl || '',
     liveUrl: payload.liveUrl || null,
     projectUrl: payload.projectUrl || null,
+    finalSiteUrl: payload.finalSiteUrl || null,
     target: payload.target || null,
     submissionUrl: payload.submissionUrl || payload.submission_url || null,
     promptPreview: payload.promptPreview || null,
@@ -8078,7 +8223,7 @@ function builderStatusForEvent(type) {
     type === 'builder.progress' ||
     type === 'builder.project_url'
   ) return 'running';
-  if (type === 'builder.done') return 'completed';
+  if (type === 'builder.done' || type === 'builder.released') return 'completed';
   if (type === 'builder.blocked_auth') return 'blocked_auth';
   if (type === 'browserUse.session.stopped') return 'stopped';
   if (type === 'builder.error') return 'failed';
@@ -8103,7 +8248,7 @@ function firstTs(timeline) {
 }
 
 function terminalTs(timeline) {
-  const terminal = [...timeline].reverse().find((item) => ['builder.done', 'builder.blocked_auth', 'builder.error'].includes(item.type));
+  const terminal = [...timeline].reverse().find((item) => ['builder.done', 'builder.released', 'builder.blocked_auth', 'builder.error'].includes(item.type));
   return terminal?.ts || null;
 }
 

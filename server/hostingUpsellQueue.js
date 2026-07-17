@@ -13,7 +13,7 @@ export function enqueueHostingUpsell({
   projectUrl = null,
   target = null,
   mock = false,
-  source = 'builder.done',
+  source = 'build.release',
   runAt = Date.now(),
   maxAttempts = 5,
   idempotencyKey = null
@@ -81,7 +81,7 @@ export async function handleHostingUpsellJob(payload = {}, job = null, { sendFn 
       buildId: payload.buildId || null,
       messageId: result.messageId || null,
       threadId: result.threadId || null,
-      acceptUrl: result.acceptUrl || null
+      acceptLinkIssued: result.acceptLinkIssued === true
     };
   }
 

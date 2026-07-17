@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import MemoryConsole from '../components/MemoryConsole.jsx';
 import BrowserUseConsole from '../components/BrowserUseConsole.jsx';
 import BrowserResearchConsole from '../components/BrowserResearchConsole.jsx';
@@ -6,14 +6,7 @@ import Inspector from '../components/Inspector.jsx';
 import LiveInboundPanel from '../components/LiveInboundPanel.jsx';
 import { api } from '../api.js';
 
-const AgentScene = lazy(() => import('../components/AgentScene.jsx'));
-
-/**
- * Lightweight metadata mirror of the 3D scene node list.
- * Kept here so the heavy AgentScene chunk only loads once the Operations
- * tab is actually opened — the detail panel still needs labels/colors
- * before the canvas is mounted.
- */
+/** Provider metadata used by the lightweight operational flow map. */
 const NODE_META = {
   memory:  { id: 'memory',  label: 'Supermemory',  sub: 'long-term memory',          code: 'SM', accent: '#58A8FF', glow: '#A7CBF2', description: 'Knowledge graph linking every business, evidence shard, transcript, and outcome.' },
   caller:  { id: 'caller',  label: 'Agent Phone',  sub: 'Caller logs and sessions', code: 'AP', accent: '#FD9BB7', glow: '#FD9BB7', description: 'Multiple voice agent instances dialing leads, recording transcripts, pitching builds.' },
@@ -67,14 +60,12 @@ export default function OperationsView({
       <ProductionCommandCenter />
 
       <div className="nyna-stage-scene">
-        <Suspense fallback={<SceneFallback />}>
-          <AgentScene
-            states={nodeStates}
-            counters={counters}
-            selectedId={selectedNodeId}
-            onSelect={onSelectNode}
-          />
-        </Suspense>
+        <AgentFlowBoard
+          states={nodeStates}
+          counters={counters}
+          selectedId={selectedNodeId}
+          onSelect={onSelectNode}
+        />
       </div>
 
       {inbound && (inbound.active || inbound.callId || inbound.threadId || inbound.sessionId) ? (
@@ -760,16 +751,39 @@ function downloadJson(payload, filename) {
   URL.revokeObjectURL(url);
 }
 
-function SceneFallback() {
+function AgentFlowBoard({ states = {}, counters = {}, selectedId = null, onSelect }) {
+  const nodes = Object.values(NODE_META);
   return (
-    <div style={{
-      position: 'absolute', inset: 0, display: 'flex',
-      alignItems: 'center', justifyContent: 'center',
-      fontFamily: 'var(--font-mono)', fontSize: 11,
-      color: 'var(--ink-400)', letterSpacing: '0.18em',
-      textTransform: 'uppercase'
-    }}>
-      conjuring the floor…
+    <div className="agent-flow-board" aria-label="Callan worker flow">
+      <div className="agent-flow-route mono" aria-hidden="true">research → remember → contact → build → verify</div>
+      <div className="agent-flow-hub">
+        <span>CALLAN</span>
+        <strong>self-correcting delivery loop</strong>
+      </div>
+      <div className="agent-flow-nodes" role="list">
+        {nodes.map((node) => {
+          const state = states[node.id] || 'idle';
+          return (
+            <button
+              key={node.id}
+              type="button"
+              role="listitem"
+              className={`agent-flow-node is-${state} ${selectedId === node.id ? 'is-selected' : ''}`}
+              style={{ '--node-accent': node.accent }}
+              onClick={() => onSelect?.(node.id)}
+              aria-pressed={selectedId === node.id}
+            >
+              <span className="agent-flow-code mono">{node.code}</span>
+              <span className="agent-flow-copy">
+                <strong>{node.label}</strong>
+                <small>{node.sub}</small>
+              </span>
+              <span className="agent-flow-count mono">{counters[node.id] || 0}</span>
+              <span className="agent-flow-state mono">{state}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

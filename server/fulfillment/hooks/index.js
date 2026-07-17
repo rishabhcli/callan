@@ -3,6 +3,7 @@ import { buildHooks, buildQaResults, buildRevisions, builds, payments } from '..
 import { createLovablePromptUrl, inspectGeneratedSite, browserUseSiteInspectionEnabled } from '../../providers/browserUse.js';
 import { buildWebsiteBrief, createLovableBuildPrompt, renderMockGeneratedSite, validateWebsiteBrief } from './brief.js';
 import { createRevisionPlan } from './revision.js';
+import { buildReleaseReadiness } from '../release.js';
 
 export const BUILD_HOOKS = [
   'preBrief',
@@ -267,6 +268,7 @@ export function buildQaReadModel({ leadId, buildId }) {
   const websiteBrief = parseJson(latestBuild?.website_brief_json) || [...hooks].reverse().find((row) => row.hook === 'preBrief')?.output || null;
   const latestPayment = leadId ? payments.listByLead(leadId)[0] || null : null;
   const launchChecklist = buildLaunchChecklist({ build: latestBuild, qa: latestQa, websiteBrief, latestPayment });
+  const releaseReadiness = latestBuild ? buildReleaseReadiness({ build: latestBuild }) : null;
   return {
     leadId,
     buildId: effectiveBuildId,
@@ -279,6 +281,7 @@ export function buildQaReadModel({ leadId, buildId }) {
     latestQa,
     revisions,
     launchChecklist,
+    releaseReadiness,
     maxRevisions: maxRevisionCount()
   };
 }
@@ -331,8 +334,8 @@ export function buildLaunchChecklist({ build, qa, websiteBrief, latestPayment } 
     score: Math.round((items.filter((item) => item.passed).length / items.length) * 100),
     errors,
     launchBlocking,
-    finalUrl: build?.project_url || null,
-    previewUrl: build?.live_url || null,
+    finalUrl: launched ? (build?.published_url || null) : null,
+    previewUrl: build?.project_url || null,
     screenshotUrls: qa?.claims?.screenshots || [],
     inspectedUrl: qa?.url || qa?.claims?.inspectedUrl || null,
     businessName: websiteBrief?.businessName || null,

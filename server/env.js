@@ -100,6 +100,7 @@ const MODE_POLICIES = Object.freeze({
 export const env = {
   port: Number(process.env.PORT || 8787),
   publicUrl: process.env.APP_PUBLIC_URL || 'http://localhost:8787',
+  staticDir: process.env.STATIC_DIR || 'dist',
   dataDir: process.env.DATA_DIR || '.data',
   nodeEnv: process.env.NODE_ENV || 'development',
   trustProxyHops: Math.max(0, Math.floor(num(process.env.TRUST_PROXY_HOPS, 0))),
@@ -126,6 +127,11 @@ export const env = {
     expiredPortalTokenRetentionDays: Math.max(1, Math.floor(num(process.env.EXPIRED_PORTAL_TOKEN_RETENTION_DAYS, 30))),
     dataAtRestEncrypted: bool(process.env.DATA_AT_REST_ENCRYPTED),
     backupsEncrypted: bool(process.env.BACKUPS_ENCRYPTED)
+  },
+  legal: {
+    privacyPolicyUrl: process.env.PRIVACY_POLICY_URL || '',
+    termsOfServiceUrl: process.env.TERMS_OF_SERVICE_URL || '',
+    reviewAck: process.env.LEGAL_REVIEW_ACK || ''
   },
   deployment: {
     replicaCount: Math.max(1, Math.floor(num(process.env.APP_REPLICA_COUNT, 1))),
@@ -262,7 +268,13 @@ export const env = {
 
   browserUse: {
     apiKey: process.env.BROWSER_USE_API_KEY || '',
-    baseUrl: process.env.BROWSER_USE_BASE_URL || 'https://api.browser-use.com/api/v3'
+    baseUrl: process.env.BROWSER_USE_BASE_URL || 'https://api.browser-use.com/api/v3',
+    profileId: process.env.BROWSER_USE_PROFILE_ID || '',
+    workspaceId: process.env.BROWSER_USE_WORKSPACE_ID || ''
+  },
+
+  lovable: {
+    workspaceName: process.env.LOVABLE_WORKSPACE_NAME || ''
   },
 
   agentmail: {

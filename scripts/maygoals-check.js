@@ -34170,7 +34170,10 @@ async function verifyRetentionCommandLeaseMaintenanceRouteBoundary() {
   }
 }
 
-async function waitForRouteJson(url, child, output, timeoutMs = 30_000) {
+// This suite repeatedly boots the full route server against a growing SQLite
+// fixture. On slower CI hosts, later boots can legitimately spend more than
+// 30 seconds loading the portfolio schema before the ping route is available.
+async function waitForRouteJson(url, child, output, timeoutMs = 60_000) {
   const startedAt = Date.now();
   let lastErr;
   while (Date.now() - startedAt < timeoutMs) {

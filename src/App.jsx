@@ -1,9 +1,10 @@
 import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import RightRail from './components/RightRail.jsx';
-import OperationsView from './views/OperationsView.jsx';
+import LoopView from './views/LoopView.jsx';
 import { useSSE } from './useSSE.js';
 import { api } from './api.js';
 
+const RightRail = lazy(() => import('./components/RightRail.jsx'));
+const OperationsView = lazy(() => import('./views/OperationsView.jsx'));
 const PortfolioView = lazy(() => import('./views/PortfolioView.jsx'));
 const ScraperView = lazy(() => import('./views/ScraperView.jsx'));
 const MemoryView = lazy(() => import('./views/MemoryView.jsx'));
@@ -164,17 +165,23 @@ function appendInboundPreview(transcript = [], evt = {}) {
   ].slice(-MAX_TRANSCRIPT);
 }
 
-const TABS = [
+const PRIMARY_TABS = [
+  { id: 'loop',       label: 'Loop',        sub: 'proof' },
   { id: 'operations', label: 'Operations', sub: 'agent floor' },
-  { id: 'portfolio',  label: 'Portfolio',  sub: 'holding co' },
+  { id: 'portfolio',  label: 'Portfolio',  sub: 'agency' }
+];
+
+const TOOL_TABS = [
   { id: 'agents',     label: 'Agents',     sub: 'workers' },
   { id: 'scraper',    label: 'Scraper',    sub: 'browser fleet' },
   { id: 'memory',     label: 'Memory',     sub: 'supermemory' },
   { id: 'settings',   label: 'Settings',   sub: 'config' }
 ];
 
+const TABS = [...PRIMARY_TABS, ...TOOL_TABS];
+
 const WORKER_FROM_TYPE = (t) => t.split('.')[0];
-const SUCCESS_TYPES = new Set(['scraper.done', 'caller.done', 'analyst.done', 'mailer.done', 'builder.done']);
+const SUCCESS_TYPES = new Set(['scraper.done', 'caller.done', 'analyst.done', 'mailer.done', 'builder.done', 'builder.released']);
 const ERROR_TYPES   = new Set(['scraper.error', 'caller.error', 'analyst.error', 'mailer.error', 'builder.error']);
 
 const EDGE_FOR = {
@@ -230,7 +237,7 @@ function builderStatusForEvent(type) {
     'builder.provider_action', 'builder.hook', 'builder.qa',
     'builder.revision', 'builder.progress', 'builder.project_url'
   ].includes(type)) return 'running';
-  if (type === 'builder.done') return 'completed';
+  if (type === 'builder.done' || type === 'builder.released') return 'completed';
   if (type === 'builder.blocked_auth') return 'blocked_auth';
   if (type === 'builder.error') return 'failed';
   return null;
@@ -248,7 +255,7 @@ function mergeBuilderEvent(prev, evt) {
     status: builderStatusForEvent(evt.type) || base.status,
     liveUrl: evt.liveUrl || base.liveUrl,
     projectUrl: evt.projectUrl || base.projectUrl,
-    finalSiteUrl: evt.projectUrl || base.finalSiteUrl,
+    finalSiteUrl: evt.type === 'builder.released' ? (evt.finalSiteUrl || base.finalSiteUrl) : base.finalSiteUrl,
     target: evt.target || base.target,
     submissionUrl: evt.submissionUrl || base.submissionUrl,
     providerProjectId: evt.providerProjectId || base.providerProjectId,
@@ -300,7 +307,7 @@ function Console() {
   const [leads, setLeads] = useState([]);
   const [focusedLeadId, setFocusedLeadId] = useState(null);
   const [leadDetail, setLeadDetail] = useState(null);
-  const [activeTab, setActiveTab] = useState('operations');
+  const [activeTab, setActiveTab] = useState('loop');
   const [focusedNodeId, setFocusedNodeId] = useState(null);
   const [outreach, setOutreach] = useState(null);
   const [handoffCases, setHandoffCases] = useState([]);
@@ -338,7 +345,9 @@ function Console() {
   const refreshLeads = useCallback(async () => {
     try {
       const data = await api.listLeads();
-      setLeads(data?.leads || []);
+      const rows = data?.leads || [];
+      setLeads(rows);
+      setFocusedLeadId((current) => current || rows[0]?.id || null);
     } catch (e) {
       // ignore — non-fatal
     }
@@ -665,8 +674,8 @@ function Console() {
         queueCounts={queueCounts}
       />
 
-      <main className="nyna-main">
-        <SideNav
+      <main className={`nyna-main ${activeTab === 'loop' ? 'nyna-main-focus' : ''}`}>
+        {activeTab !== 'loop' ? <SideNav
           activeTab={activeTab}
           counters={counters}
           queueCounts={queueCounts}
@@ -678,7 +687,7 @@ function Console() {
           onSelectNode={handleNodeSelect}
           onStartAutonomy={running ? pauseAutonomy : startAutonomy}
           onEmergencyStop={emergencyStop}
-        />
+        /> : null}
 
         <div
           id="main-content"
@@ -688,7 +697,20 @@ function Console() {
           tabIndex="-1"
         >
           <Suspense fallback={<ViewFallback label={`Loading ${activeTab}`} />}>
-            {activeTab === 'operations' ? (
+            {activeTab === 'loop' ? (
+              <LoopView
+                leads={leads}
+                focusedLeadId={focusedLeadId}
+                leadDetail={leadDetail}
+                builderInfo={builderInfo}
+                builderAction={builderAction}
+                sseStatus={sseStatus}
+                health={health}
+                onFocusLead={handleLeadFocus}
+                onRunBuild={retryBuild}
+                onOpenWorkbench={() => setActiveTab('operations')}
+              />
+            ) : activeTab === 'operations' ? (
               <OperationsView
                 nodeStates={nodeStates}
                 counters={counters}
@@ -742,7 +764,7 @@ function Console() {
           </Suspense>
         </div>
 
-        <RightRail
+        {activeTab !== 'loop' ? <Suspense fallback={null}><RightRail
           leads={leads}
           focusedLeadId={focusedLeadId}
           onFocus={handleLeadFocus}
@@ -752,7 +774,7 @@ function Console() {
           handoffCases={handoffCases}
           onCancelScheduled={cancelScheduledCall}
           onFireScheduled={fireScheduledCallNow}
-        />
+        /></Suspense> : null}
       </main>
     </div>
   );
@@ -776,15 +798,15 @@ function Sparkle({ size = 16, color = '#640D14' }) {
 }
 
 function Topbar({ activeTab, onTabChange, queueCounts }) {
-  const onTabKeyDown = (event, currentId) => {
-    const currentIndex = TABS.findIndex((tab) => tab.id === currentId);
-    let nextIndex = currentIndex;
-    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % TABS.length;
-    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + TABS.length) % TABS.length;
-    else if (event.key === 'Home') nextIndex = 0;
-    else if (event.key === 'End') nextIndex = TABS.length - 1;
-    else return;
+  const handleTabKeyDown = (event, tabId) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
+    const currentIndex = Math.max(0, TABS.findIndex((tab) => tab.id === tabId));
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? TABS.length - 1
+        : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length;
     const next = TABS[nextIndex];
     onTabChange(next.id);
     requestAnimationFrame(() => document.getElementById(`tab-${next.id}`)?.focus());
@@ -798,12 +820,13 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
         </div>
         <div className="nyna-brand-text">
           <div className="nyna-brand-name">Callan</div>
-          <div className="nyna-brand-tag">AI Cold-Calling</div>
+          <div className="nyna-brand-tag">Autonomous agency</div>
         </div>
       </div>
 
-      <nav className="nyna-tabs" role="tablist">
-        {TABS.map((tab) => {
+      <nav className="nyna-tabs" aria-label="Workspace">
+        <div className="nyna-primary-tabs" role="tablist" aria-label="Primary workspace views">
+          {PRIMARY_TABS.map((tab) => {
           const isActive = activeTab === tab.id;
           const badge = badgeFor(tab.id, queueCounts);
           return (
@@ -811,10 +834,10 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
               key={tab.id}
               id={`tab-${tab.id}`}
               type="button"
+              role="tab"
               className={`nyna-tab ${isActive ? 'nyna-tab-active' : ''}`}
               onClick={() => onTabChange(tab.id)}
-              onKeyDown={(event) => onTabKeyDown(event, tab.id)}
-              role="tab"
+              onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
               aria-selected={isActive}
               aria-controls="main-content"
               tabIndex={isActive ? 0 : -1}
@@ -823,7 +846,31 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
               {badge ? <span className="nyna-tab-badge">{badge}</span> : null}
             </button>
           );
-        })}
+          })}
+        </div>
+        <details className={`nyna-tools ${TOOL_TABS.some((tab) => tab.id === activeTab) ? 'is-active' : ''}`}>
+          <summary>Tools</summary>
+          <div className="nyna-tools-menu" role="tablist" aria-label="Workspace tools">
+            {TOOL_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                id={`tab-${tab.id}`}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                aria-controls="main-content"
+                tabIndex={activeTab === tab.id ? 0 : -1}
+                onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
+                onClick={(event) => {
+                  onTabChange(tab.id);
+                  event.currentTarget.closest('details')?.removeAttribute('open');
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </details>
       </nav>
     </header>
   );

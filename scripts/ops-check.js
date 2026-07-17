@@ -781,7 +781,7 @@ try {
           sent: true,
           messageId: 'msg_ops_hosting_upsell',
           threadId: 'thread_ops_hosting_upsell',
-          acceptUrl: 'https://callan.example.test/api/hosting/accept/ops_hosting_upsell_lead'
+          acceptLinkIssued: true
         })
       })
     }, { workerId: 'ops-hosting-upsell-success-check', concurrency: 1, maxJobs: 1 });
@@ -790,6 +790,7 @@ try {
     assert.equal(completed.status, 'completed');
     assert.equal(completed.result?.sent, true);
     assert.equal(completed.result?.messageId, 'msg_ops_hosting_upsell');
+    assert.equal(completed.result?.acceptLinkIssued, true);
     assert.equal(completed.attempts, 2);
   });
 
@@ -4878,6 +4879,9 @@ function configureProductionReadyPosture(env) {
   env.privacy.retentionEnabled = true;
   env.privacy.dataAtRestEncrypted = true;
   env.privacy.backupsEncrypted = true;
+  env.legal.privacyPolicyUrl = 'https://callan.example.com/privacy';
+  env.legal.termsOfServiceUrl = 'https://callan.example.com/terms';
+  env.legal.reviewAck = 'I_CONFIRM_COUNSEL_REVIEWED_OUTREACH_AND_PRIVACY';
   env.deployment.replicaCount = 1;
   env.deployment.singleNodePilotAck = 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS';
   const certificationFile = join(dataDir, 'provider-certification.json');
@@ -4909,6 +4913,7 @@ function configureProductionReadyPosture(env) {
     }))
   }));
   env.deployment.providerCertificationFile = certificationFile;
+  env.security.previewFrameSources = ['https://*.lovable.app'];
   env.outreach.enabled = true;
   Object.assign(env.live, {
     calls: true,
@@ -4929,6 +4934,8 @@ function configureProductionReadyPosture(env) {
   env.agentmail.inboxId = 'ops_inbox';
   env.agentmail.webhookSecret = 'ops_agentmail_secret';
   env.browserUse.apiKey = 'ops_browser_use_key';
+  env.browserUse.profileId = 'ops_browser_use_profile';
+  env.lovable.workspaceName = 'Ops Customer Workspace';
   env.stripe.secretKey = ['rk_', 'live_', 'ops_check'].join('');
   env.stripe.webhookSecret = ['whsec_', 'ops'].join('');
 }

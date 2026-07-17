@@ -117,6 +117,7 @@ try {
     assert(readModel.launchChecklist?.status === 'ready_for_customer', `read model launch status wrong: ${readModel.launchChecklist?.status}`);
     assert(readModel.launchChecklist?.launchBlocking?.includes('customer_approval'), 'customer approval should remain a separate launch gate');
     assert(hooks.some((hook) => hook.hook === 'finalAccept' && hook.output?.accepted === true), 'finalAccept hook should accept');
+    await portalApi.approveScope({ leadId, notes: 'Customer accepted the tested website scope.' });
     const approval = await portalApi.approveLaunch({ leadId });
     const approvedBuild = dbApi.builds.get(build.id);
     assert(approval.ok, 'customer approval should be recorded');

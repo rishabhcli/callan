@@ -61,6 +61,8 @@ export const api = {
   explainCallability: (id) => call('GET', `/api/leads/${id}/callability`),
   followup: (id, toEmail) => call('POST', `/api/leads/${id}/followup`, { toEmail }),
   build: (id, body = {}) => call('POST', `/api/leads/${id}/build`, body),
+  getBuildReleaseReadiness: (buildId) => call('GET', `/api/builds/${encodeURIComponent(buildId)}/release-readiness`),
+  releaseBuild: (buildId, body = {}) => call('POST', `/api/builds/${encodeURIComponent(buildId)}/release`, body),
   getGrowth: (id) => call('GET', `/api/leads/${id}/growth`),
   generateGrowthPlan: (id, body = {}) => call('POST', `/api/leads/${id}/growth/plan`, body),
   sendGrowthFollowup: (id, body = {}) => call('POST', `/api/leads/${id}/growth/followup`, body),

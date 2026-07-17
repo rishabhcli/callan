@@ -54,13 +54,16 @@ export function normalizeLovableProgress(message, { phase = 'lovable_build' } = 
 }
 
 export function buildLovableSubmissionTask({ submissionUrl, brief }) {
+  const workspaceName = env.lovable.workspaceName;
   return [
     'You are submitting a paid customer website build to Lovable.',
     `Open this exact URL: ${submissionUrl}`,
+    `Select the Lovable workspace named exactly "${workspaceName}". Do not create the project in a personal or different workspace.`,
     'If the build-with-URL flow does not start, paste the full brief below into Lovable and submit it.',
-    'If Lovable shows any login, sign-in, account, Google/GitHub OAuth, or authentication wall, stop immediately and answer exactly BLOCKED_AUTH.',
+    'If Lovable shows any login/authentication wall, or the exact workspace is unavailable, stop immediately and answer exactly BLOCKED_AUTH.',
     'While Lovable works, keep the session on the build page and report concise progress.',
-    'When a final published .lovable.app URL is visible, copy it exactly.',
+    'This is a review build. Do not publish or update a permanent production deployment and do not connect a domain.',
+    'When the build is ready, use Share > Share preview and copy the temporary public, view-only preview URL.',
     'Your final answer must include either "PROJECT_URL: https://...lovable.app" or "BLOCKED_AUTH".',
     '',
     'Brief:',
@@ -248,3 +251,4 @@ function truncate(value, max) {
   const text = String(value || '');
   return text.length > max ? `${text.slice(0, max - 1)}...` : text;
 }
+import { env } from '../env.js';

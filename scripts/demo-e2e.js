@@ -40,7 +40,7 @@ const { recordPaidPayment } = await import('../server/paymentFlow.js');
 const { handleAgentMailInbound } = await import('../server/workers/mailer.js');
 const { ensurePortalTokenForLead } = await import('../server/customerPortal.js');
 const { runBuilder } = await import('../server/workers/builder.js');
-const { approveLaunch } = await import('../server/customerPortal.js');
+const { approveLaunch, approveScope } = await import('../server/customerPortal.js');
 const { buildQaReadModel } = await import('../server/fulfillment/hooks/index.js');
 
 const demo = await seedLifecycle();
@@ -417,6 +417,7 @@ async function seedLifecycle() {
   if (!qaReadModel.latestQa?.passed) {
     throw new Error(`demo build QA did not pass: ${(qaReadModel.latestQa?.errors || []).join(', ')}`);
   }
+  await approveScope({ leadId, notes: 'Demo customer approved the website scope.' });
   const approval = await approveLaunch({ leadId });
   const approvedBuild = builds.get(latestBuild.id);
   const approvedReadModel = buildQaReadModel({ leadId, buildId: latestBuild.id });
@@ -511,7 +512,7 @@ async function verifyUiPath({ leadId, portalToken, dataDir, allowLiveEnv }) {
       portalBusiness: portal.business?.id === leadId,
       portalInvoicePaid: portal.invoice?.status === 'paid',
       portalLaunchApproved: Boolean(portal.approvals?.launch || portal.build?.launchStatus === 'customer_approved' || portal.build?.launch_status === 'customer_approved'),
-      portalNextAction: !!portal.nextAction?.label,
+      portalNextAction: portal.nextAction?.id === 'release_pending',
       htmlServed: html.includes('id="root"') || html.includes('callmemaybe'),
       ...previewChecks
     };
@@ -652,6 +653,7 @@ function forceMockEnv({ dataDir, allowLiveEnv, target = process.env }) {
   target.LIVE_PAYMENTS = 'false';
   target.LIVE_BUILDS = 'false';
   target.AUTONOMOUS_OUTREACH_ENABLED = 'false';
+  target.DEMO_FORCE_QA_REVISION = 'true';
 
   for (const key of [
     'GEMINI_API_KEY',

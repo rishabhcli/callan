@@ -152,13 +152,19 @@ async function smokeBrowserUse() {
 
 async function smokeLovable() {
   const startedAt = Date.now();
-  if (!env.browserUse.apiKey) return dry('lovable', false, { dependency: 'browserUse' }, elapsed(startedAt));
+  const missing = [
+    !env.browserUse.apiKey && 'BROWSER_USE_API_KEY',
+    !env.browserUse.profileId && 'BROWSER_USE_PROFILE_ID',
+    !env.lovable.workspaceName && 'LOVABLE_WORKSPACE_NAME'
+  ].filter(Boolean);
+  if (missing.length) return dry('lovable', false, { dependency: 'browserUse', missing }, elapsed(startedAt));
   if (!env.smoke.lovableNavigation) {
     return dry('lovable', true, {
       dependency: 'browserUse',
       skipped: 'set SMOKE_LOVABLE_NAVIGATION=true to open Lovable through Browser Use without creating a project',
-      buildWithUrl: 'https://lovable.dev/?prompt=<encoded>',
-      projectUrlExtraction: '.lovable.app'
+      buildWithUrl: 'https://lovable.dev/?autosubmit=true#prompt=<encoded>',
+      projectUrlExtraction: 'temporary shared preview on .lovable.app',
+      releaseBoundary: 'final publish and handoff are separately gated'
     }, elapsed(startedAt));
   }
   const adapter = new BrowserUseLovableAdapter({

@@ -2,14 +2,17 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const repoRoot = process.cwd();
 const dataDir = mkdtempSync(join(tmpdir(), 'callan-ui-flow-'));
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const frontendDir = mkdtempSync(join(tmpdir(), 'callan-ui-flow-dist-'));
+const npxCommand = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+const screenshotDir = process.env.UI_FLOW_SCREENSHOT_DIR || '';
+if (screenshotDir) mkdirSync(screenshotDir, { recursive: true });
 
 let devChild = null;
 let browser = null;
@@ -21,7 +24,7 @@ try {
   const appUrl = `${apiBaseUrl}/`;
   const env = mockEnv({ apiPort });
 
-  await runCapture(npmCommand, ['run', 'build'], { env });
+  await runCapture(npxCommand, ['vite', 'build', '--outDir', frontendDir, '--emptyOutDir'], { env });
 
   devChild = spawn(process.execPath, ['server/index.js'], {
     cwd: repoRoot,
@@ -41,6 +44,9 @@ try {
   const desktop = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const desktopIssues = captureBrowserIssues(desktop);
   await desktop.goto(appUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+  await desktop.locator('.loop-view').waitFor({ state: 'visible' });
+  await desktop.getByText('An agency that corrects its own work.').waitFor({ state: 'visible' });
+  await openTab(desktop, 'Operations', '.nyna-stage');
   await desktop.locator('.prod-command-center').waitFor({ state: 'visible' });
   await desktop.waitForTimeout(1_500);
 
@@ -50,6 +56,7 @@ try {
   const expandedBox = await desktop.locator('.prod-command-center').boundingBox();
   assert(expandedBox && expandedBox.height > compactBox.height, 'production details expand on demand');
   await desktop.getByRole('button', { name: 'collapse' }).click();
+  if (screenshotDir) await desktop.screenshot({ path: join(screenshotDir, 'operations-desktop.png'), fullPage: false });
 
   await desktop.getByRole('button', { name: /supermemory/i }).dispatchEvent('click');
   await desktop.locator('.nyna-detail-overlay').waitFor({ state: 'visible' });
@@ -93,10 +100,13 @@ try {
   await portalFrame.waitFor({ state: 'visible' });
   const portalPreviewText = await portalFrame.contentFrame().locator('body').innerText();
   assert.match(portalPreviewText, /Luna Ridge HVAC/i, 'customer portal embeds the generated preview');
+  if (screenshotDir) await portal.screenshot({ path: join(screenshotDir, 'customer-portal.png'), fullPage: false });
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
   const mobileIssues = captureBrowserIssues(mobile);
   await mobile.goto(appUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+  await mobile.locator('.loop-view').waitFor({ state: 'visible' });
+  await openTab(mobile, 'Operations', '.nyna-stage');
   await mobile.locator('.prod-command-center').waitFor({ state: 'visible' });
   await mobile.waitForTimeout(1_000);
   const mobileLayout = await mobile.evaluate(() => ({
@@ -108,6 +118,7 @@ try {
   assert(mobileLayout.bodyWidth <= mobileLayout.viewportWidth, 'mobile shell has no horizontal overflow');
   assert(mobileLayout.sideHeight < 180, 'mobile operator controls stay compact');
   assert(mobileLayout.commandHeight < 230, 'mobile readiness summary stays compact');
+  if (screenshotDir) await mobile.screenshot({ path: join(screenshotDir, 'operations-mobile.png'), fullPage: false });
   await openTab(mobile, 'Settings', '.nyna-settings-shell');
 
   assert.deepEqual(desktopIssues(), [], 'desktop console stays clean');
@@ -119,6 +130,7 @@ try {
     browserPath: 'playwright-production-artifact',
     demoLeadId: demo.leadId,
     flows: {
+      loopFirstProductNarrative: true,
       compactReadinessSummary: true,
       expandableProductionDetails: true,
       agentDetailNavigation: true,
@@ -132,12 +144,14 @@ try {
       customerPortalPreview: true,
       responsiveMobileShell: true
     },
-    consoleIssues: []
+    consoleIssues: [],
+    screenshots: screenshotDir || null
   }, null, 2));
 } finally {
   if (browser) await browser.close().catch(() => {});
   if (devChild) await stopChild(devChild);
   rmSync(dataDir, { recursive: true, force: true });
+  rmSync(frontendDir, { recursive: true, force: true });
 }
 
 async function seedDemoLifecycle() {
@@ -166,6 +180,7 @@ function mockEnv({ apiPort } = {}) {
     DATA_DIR: dataDir,
     RUN_MODE: 'mock',
     ...(apiPort ? { PORT: String(apiPort) } : {}),
+    STATIC_DIR: frontendDir,
     LIVE_CALLS: 'false',
     LIVE_EMAILS: 'false',
     LIVE_PAYMENTS: 'false',
@@ -192,9 +207,14 @@ function mockEnv({ apiPort } = {}) {
 }
 
 async function openTab(page, name, selector) {
-  await page.getByRole('tab', { name }).dispatchEvent('click');
+  let tab = page.getByRole('tab', { name });
+  if (await tab.count() === 0) {
+    await page.locator('.nyna-tools > summary').click();
+    tab = page.getByRole('tab', { name });
+  }
+  await tab.click();
   await page.locator(selector).waitFor({ state: 'visible', timeout: 30_000 });
-  assert.equal(await page.getByRole('tab', { name }).getAttribute('aria-selected'), 'true');
+  assert.equal(await page.locator(`#tab-${name.toLowerCase()}`).getAttribute('aria-selected'), 'true');
 }
 
 function captureBrowserIssues(page) {

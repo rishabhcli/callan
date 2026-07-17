@@ -75,9 +75,13 @@ export function browserUseReadinessDetails(config = env.browserUse) {
     lovable: {
       buildWithUrl: 'https://lovable.dev/?autosubmit=true#prompt=<encoded>',
       authWall: 'blocked_auth_event',
-      projectUrlExtraction: '.lovable.app'
+      projectUrlExtraction: 'temporary shared preview on .lovable.app',
+      persistentProfile: config.profileId ? 'configured' : 'missing_BROWSER_USE_PROFILE_ID',
+      workspaceName: env.lovable.workspaceName ? 'configured' : 'missing_LOVABLE_WORKSPACE_NAME',
+      releaseBoundary: 'preview only; final publish, security review, domain, source portability, and ownership are separately gated'
     },
-    profileId: process.env.BROWSER_USE_PROFILE_ID ? 'configured' : 'default',
+    profileId: config.profileId ? 'configured' : 'missing',
+    workspaceId: config.workspaceId ? 'configured' : 'default',
     sessionPolicy: env.smoke.browserUse ? 'smoke_can_create_stop_session' : 'no_session_side_effects_without_SMOKE_BROWSER_USE',
     navigationSmoke: browserUseLovableNavigationSmokeEnabled() ? 'enabled' : 'disabled_by_default'
   };
@@ -347,8 +351,8 @@ export class BrowserUseCloudAdapter {
   constructor({
     apiKey = env.browserUse.apiKey,
     baseUrl = env.browserUse.baseUrl,
-    profileId = process.env.BROWSER_USE_PROFILE_ID || undefined,
-    workspaceId = process.env.BROWSER_USE_WORKSPACE_ID || undefined,
+    profileId = env.browserUse.profileId || undefined,
+    workspaceId = env.browserUse.workspaceId || undefined,
     proxyCountryCode = process.env.BROWSER_USE_PROXY_COUNTRY || undefined,
     useOwnKey = bool(process.env.BROWSER_USE_USE_OWN_KEY),
     enableRecording = bool(process.env.BROWSER_USE_ENABLE_RECORDING),
@@ -544,7 +548,8 @@ export class BrowserUseLovableAdapter {
     apiKey = env.browserUse.apiKey,
     baseUrl = env.browserUse.baseUrl,
     model = process.env.BROWSER_USE_MODEL || undefined,
-    profileId = process.env.BROWSER_USE_PROFILE_ID || undefined,
+    profileId = env.browserUse.profileId || undefined,
+    workspaceId = env.browserUse.workspaceId || undefined,
     maxCostUsd = process.env.BROWSER_USE_MAX_COST_USD || undefined,
     proxyCountryCode = process.env.BROWSER_USE_PROXY_COUNTRY || undefined,
     useOwnKey = bool(process.env.BROWSER_USE_USE_OWN_KEY),
@@ -566,6 +571,7 @@ export class BrowserUseLovableAdapter {
     });
     this.model = model;
     this.profileId = profileId;
+    this.workspaceId = workspaceId;
     this.maxCostUsd = maxCostUsd;
     this.proxyCountryCode = proxyCountryCode ? proxyCountryCode.toLowerCase() : undefined;
     this.enableRecording = enableRecording;
@@ -584,6 +590,7 @@ export class BrowserUseLovableAdapter {
       keepAlive,
       model: this.model,
       profileId: this.profileId,
+      workspaceId: this.workspaceId,
       maxCostUsd: this.maxCostUsd,
       proxyCountryCode: this.proxyCountryCode,
       enableRecording: this.enableRecording,
@@ -911,10 +918,10 @@ function buildLovableSubmissionTask({ lovableUrl, brief }) {
 function buildLovableRevisionTask({ projectUrl, revisionPrompt }) {
   return [
     'You are revising a generated Lovable customer website after QA.',
-    projectUrl ? `Open the existing project/site URL: ${projectUrl}` : 'Stay in the current Lovable project.',
+    projectUrl ? `The current public preview is: ${projectUrl}. Stay in the existing Lovable editor project in this session.` : 'Stay in the current Lovable project.',
     'Submit only the targeted revision prompt below. Do not create a new unrelated app.',
     'If Lovable shows any login, sign-in, account, Google/GitHub OAuth, or authentication wall, stop immediately and answer exactly BLOCKED_AUTH.',
-    'When the revised published .lovable.app URL is visible, copy it exactly.',
+    'Do not publish or update a permanent production deployment. Create or refresh a temporary Share preview link after the revision.',
     'Your final answer must include either "PROJECT_URL: https://...lovable.app" or "BLOCKED_AUTH".',
     '',
     'Revision prompt:',
@@ -947,7 +954,24 @@ export async function fetchSafePublicText(url, timeoutMs, redirectCount = 0) {
     return fetchSafePublicText(redirected, timeoutMs, redirectCount + 1);
   }
   if (response.status < 200 || response.status >= 300) throw new Error(`fetch ${response.status}`);
-  return response.body;
+  return response.body.toString('utf8');
+}
+
+export async function fetchSafePublicBuffer(url, timeoutMs, redirectCount = 0) {
+  if (redirectCount > MAX_INSPECTION_REDIRECTS) throw unsafeUrlError('too many redirects');
+  const destination = await assertSafePublicHttpUrl(url);
+  const response = await requestPinnedDestination(destination, timeoutMs, {
+    accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8'
+  });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.location;
+    if (!location) throw new Error(`fetch ${response.status} without Location header`);
+    return fetchSafePublicBuffer(new URL(location, destination.url).href, timeoutMs, redirectCount + 1);
+  }
+  if (response.status < 200 || response.status >= 300) throw new Error(`fetch ${response.status}`);
+  const contentType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!contentType.startsWith('image/')) throw unsafeUrlError('destination did not return an image');
+  return { body: response.body, contentType };
 }
 
 function absolutizeUrl(url) {
@@ -1035,7 +1059,7 @@ function isPublicIpv4(address) {
   return true;
 }
 
-function requestPinnedDestination(destination, timeoutMs) {
+function requestPinnedDestination(destination, timeoutMs, { accept = 'text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8' } = {}) {
   const target = destination.parsed;
   const chosen = destination.addresses[0];
   const transport = target.protocol === 'https:' ? https : http;
@@ -1047,7 +1071,7 @@ function requestPinnedDestination(destination, timeoutMs) {
       method: 'GET',
       path: `${target.pathname}${target.search}`,
       headers: {
-        Accept: 'text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8',
+        Accept: accept,
         'Accept-Encoding': 'identity',
         'User-Agent': 'Callan-Site-QA/1.0'
       },
@@ -1068,7 +1092,7 @@ function requestPinnedDestination(destination, timeoutMs) {
       response.on('end', () => resolve({
         status: Number(response.statusCode || 0),
         headers: response.headers,
-        body: Buffer.concat(chunks).toString('utf8')
+        body: Buffer.concat(chunks)
       }));
     });
     request.once('timeout', () => request.destroy(new Error('destination request timed out')));

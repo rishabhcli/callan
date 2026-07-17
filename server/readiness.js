@@ -21,6 +21,7 @@ const LIVE_PROVIDER_MODES = new Set(['demo_live', 'autonomous_live', 'production
 export const PRODUCTION_REQUIRED_PROVIDERS = new Set(PROVIDER_ORDER.filter((name) => name !== 'v0'));
 const REQUIRED_WEBHOOK_MODES = new Set(['demo_live', 'autonomous_live', 'production_review', 'production_live']);
 const PRODUCTION_LIVE_ACK_VALUE = 'I_UNDERSTAND_LIVE_OUTREACH';
+const LEGAL_REVIEW_ACK_VALUE = 'I_CONFIRM_COUNSEL_REVIEWED_OUTREACH_AND_PRIVACY';
 const PROVIDER_SMOKE_FRESH_MS = 24 * 60 * 60 * 1000;
 const WEBHOOK_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const PRODUCTION_REVIEW_MODE = 'production_review';
@@ -34,7 +35,7 @@ export const PROVIDER_DOCS = Object.freeze({
   stripeInvoices: 'https://docs.stripe.com/invoicing/integration',
   browserUseSessions: 'https://docs.browser-use.com/guides/sessions',
   browserUseStatus: 'https://docs.browser-use.com/cloud/api-v2/tasks/get-task-status',
-  lovableBuildWithUrl: 'https://lovable-f9060f1e.mintlify.app/integrations/build-with-url',
+  lovableBuildWithUrl: 'https://docs.lovable.dev/integrations/build-with-url',
   v0Platform: 'https://v0.app/docs/api/platform/overview',
   v0Deployments: 'https://v0.app/docs/api/platform/reference/deployments/create',
   supermemoryContainers: 'https://docs.supermemory.ai/memory-api/features/filtering',
@@ -176,7 +177,11 @@ export function providerConfigured(name) {
   if (name === 'moss') return requiredEnv({ MOSS_PROJECT_ID: env.moss.projectId, MOSS_PROJECT_KEY: env.moss.projectKey });
   if (name === 'agentphone') return requiredEnv({ AGENTPHONE_API_KEY: env.agentphone.apiKey });
   if (name === 'browserUse') return requiredEnv({ BROWSER_USE_API_KEY: env.browserUse.apiKey });
-  if (name === 'lovable') return requiredEnv({ BROWSER_USE_API_KEY: env.browserUse.apiKey });
+  if (name === 'lovable') return requiredEnv({
+    BROWSER_USE_API_KEY: env.browserUse.apiKey,
+    BROWSER_USE_PROFILE_ID: env.browserUse.profileId,
+    LOVABLE_WORKSPACE_NAME: env.lovable.workspaceName
+  });
   if (name === 'v0') return requiredEnv({ V0_API_KEY: process.env.V0_API_KEY });
   if (name === 'agentmail') return requiredEnv({ AGENTMAIL_API_KEY: env.agentmail.apiKey, AGENTMAIL_INBOX_ID: env.agentmail.inboxId });
   if (name === 'stripe') return requiredEnv({ STRIPE_SECRET_KEY: env.stripe.secretKey });
@@ -354,7 +359,10 @@ function providerDetail(name) {
       execution: 'Browser Use cloud session',
       buildWithUrl: 'https://lovable.dev/?autosubmit=true#prompt=<encoded>',
       authWall: 'blocked_auth_event',
-      projectUrlExtraction: '.lovable.app',
+      projectUrlExtraction: 'temporary shared preview on .lovable.app',
+      persistentProfile: env.browserUse.profileId ? 'configured' : 'missing',
+      workspaceName: env.lovable.workspaceName ? 'configured' : 'missing',
+      releaseBoundary: 'explicit publish/security/domain/source/ownership evidence after customer approval',
       docs: PROVIDER_DOCS.lovableBuildWithUrl,
       sideEffects: {
         navigationSmoke: env.smoke.lovableNavigation ? 'enabled_by_SMOKE_LOVABLE_NAVIGATION' : 'disabled_by_default',
@@ -475,6 +483,7 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, 
   if (!isProductionAcked()) blockers.push(`PRODUCTION_LIVE_ACK must equal ${PRODUCTION_LIVE_ACK_VALUE}`);
   if (env.nodeEnv !== 'production') blockers.push('NODE_ENV must be production for production_live');
   if (!isHttpsPublicUrl(env.publicUrl)) blockers.push('APP_PUBLIC_URL must be a public https URL for production webhooks');
+  if (!lovablePreviewFrameConfigured()) blockers.push('PREVIEW_FRAME_SOURCES must allow https://*.lovable.app for customer review previews');
   if (!env.outreach.enabled) blockers.push('AUTONOMOUS_OUTREACH_ENABLED must be true for production_live');
   if (String(env.portal?.tokenSecret || '').length < 32) blockers.push('PORTAL_TOKEN_SECRET must be at least 32 characters for production_live');
   if (String(env.safety?.interlockSecret || '').length < 32) blockers.push('SAFETY_INTERLOCK_SECRET must be at least 32 characters for production_live');
@@ -484,6 +493,9 @@ function productionLiveBlockers({ providers, webhooks, sideEffects, compliance, 
   if (!env.privacy?.retentionEnabled) blockers.push('DATA_RETENTION_ENABLED must be true for production_live');
   if (!env.privacy?.dataAtRestEncrypted) blockers.push('DATA_AT_REST_ENCRYPTED must attest encrypted production storage');
   if (!env.privacy?.backupsEncrypted) blockers.push('BACKUPS_ENCRYPTED must attest encrypted backup storage');
+  if (!isHttpsPublicUrl(env.legal?.privacyPolicyUrl)) blockers.push('PRIVACY_POLICY_URL must be a public https URL for production_live');
+  if (!isHttpsPublicUrl(env.legal?.termsOfServiceUrl)) blockers.push('TERMS_OF_SERVICE_URL must be a public https URL for production_live');
+  if (env.legal?.reviewAck !== LEGAL_REVIEW_ACK_VALUE) blockers.push(`LEGAL_REVIEW_ACK must equal ${LEGAL_REVIEW_ACK_VALUE}`);
   if (env.deployment?.replicaCount !== 1) blockers.push('SQLite deployment requires APP_REPLICA_COUNT=1');
   if (env.deployment?.singleNodePilotAck !== 'I_ACCEPT_SINGLE_NODE_PILOT_LIMITS') blockers.push('SINGLE_NODE_PILOT_ACK must equal I_ACCEPT_SINGLE_NODE_PILOT_LIMITS');
   blockers.push(...(providerCertification.blockers || []));
@@ -582,6 +594,14 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
       detail: { current: env.publicUrl }
     }),
     gate({
+      name: 'lovable_preview_csp',
+      label: 'Lovable preview CSP',
+      ok: lovablePreviewFrameConfigured(),
+      blockers: lovablePreviewFrameConfigured() ? [] : ['PREVIEW_FRAME_SOURCES must allow https://*.lovable.app for customer review previews'],
+      nextAction: 'set PREVIEW_FRAME_SOURCES=https://*.lovable.app before customer review',
+      detail: { configured: env.security?.previewFrameSources || [] }
+    }),
+    gate({
       name: 'autonomous_outreach',
       label: 'Autonomous outreach enabled',
       ok: env.outreach.enabled,
@@ -623,6 +643,24 @@ function promotionGateReport({ mode, providers, webhooks, compliance, reputation
         ...(env.privacy?.backupsEncrypted ? [] : ['BACKUPS_ENCRYPTED must attest encrypted backup storage'])
       ],
       nextAction: 'enable the retention scheduler and deploy the database and backups on encrypted storage'
+    }),
+    gate({
+      name: 'legal_review',
+      label: 'Customer policies and legal review',
+      ok: isHttpsPublicUrl(env.legal?.privacyPolicyUrl)
+        && isHttpsPublicUrl(env.legal?.termsOfServiceUrl)
+        && env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE,
+      blockers: [
+        ...(isHttpsPublicUrl(env.legal?.privacyPolicyUrl) ? [] : ['PRIVACY_POLICY_URL must be a public https URL for production_live']),
+        ...(isHttpsPublicUrl(env.legal?.termsOfServiceUrl) ? [] : ['TERMS_OF_SERVICE_URL must be a public https URL for production_live']),
+        ...(env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE ? [] : [`LEGAL_REVIEW_ACK must equal ${LEGAL_REVIEW_ACK_VALUE}`])
+      ],
+      nextAction: 'have qualified counsel review outreach, privacy, and customer terms; publish both policies; then record the explicit legal review acknowledgement',
+      detail: {
+        privacyPolicyConfigured: isHttpsPublicUrl(env.legal?.privacyPolicyUrl),
+        termsConfigured: isHttpsPublicUrl(env.legal?.termsOfServiceUrl),
+        reviewed: env.legal?.reviewAck === LEGAL_REVIEW_ACK_VALUE
+      }
     }),
     gate({
       name: 'single_node_pilot',
@@ -1023,6 +1061,8 @@ function nextActionsFor(blockers) {
     if (/PRODUCTION_LIVE_ACK/.test(blocker)) return `set PRODUCTION_LIVE_ACK=${PRODUCTION_LIVE_ACK_VALUE} when intentionally launching`;
     if (/ADMIN_API_TOKEN/.test(blocker)) return 'set a strong ADMIN_API_TOKEN before production review/live';
     if (/APP_PUBLIC_URL/.test(blocker)) return 'set APP_PUBLIC_URL to the deployed https origin and register webhooks';
+    if (/PREVIEW_FRAME_SOURCES/.test(blocker)) return 'set PREVIEW_FRAME_SOURCES=https://*.lovable.app for customer review previews';
+    if (/PRIVACY_POLICY_URL|TERMS_OF_SERVICE_URL|LEGAL_REVIEW_ACK/.test(blocker)) return 'publish counsel-reviewed privacy and terms pages, then set the legal review acknowledgement';
     if (/WEBHOOK_SECRET|webhook/.test(blocker)) return 'configure provider webhook secret and endpoint';
     if (/dry-run\/config smoke/.test(blocker)) return 'run npm run smoke:providers without live toggles';
     if (/live smoke/.test(blocker)) return 'run one provider smoke at a time with SMOKE_* toggles';
@@ -1054,4 +1094,11 @@ function stripeKeyMode(key) {
 
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function lovablePreviewFrameConfigured() {
+  return (env.security?.previewFrameSources || []).some((source) => {
+    const value = String(source || '').trim().toLowerCase().replace(/\/+$/, '');
+    return value === 'https://*.lovable.app' || value === 'https://lovable.app';
+  });
 }
