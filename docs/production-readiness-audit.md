@@ -1,6 +1,6 @@
 # Callan end-to-end product and production-readiness audit
 
-Audit date: 2026-07-17
+Audit date: 2026-08-04
 Decision: **code release candidate; production activation on hold pending external evidence**
 
 ## 1. Product overview
@@ -32,7 +32,8 @@ Callan is an autonomous website agency for local service businesses. It is not m
 
 ```mermaid
 flowchart LR
-  UI["React operator console"] --> API["Express API + SSE"]
+  Public["Public landing + scoped tracking"] --> API["Express API + SSE"]
+  UI["React operator console at /app"] --> API
   Portal["Scoped customer portal"] --> API
   API --> Jobs["Durable SQLite job ledger"]
   Jobs --> Workers["Research / caller / analyst / mailer / builder"]
@@ -47,6 +48,8 @@ flowchart LR
 ### Runtime shape
 
 - React 19 and Vite 6 produce a static operator/customer frontend.
+- `/` is the public acquisition surface; `/app` is the protected operator workspace.
+- Public intake creates a durable request and non-callable lead before any later operator action.
 - Express 4 serves the artifact, JSON APIs, webhooks, and SSE.
 - `better-sqlite3` is the operational system of record and durable queue.
 - Provider adapters isolate external API/browser behavior.
@@ -97,6 +100,11 @@ Overall: **8.5/10 as a production-minded release candidate; 4/10 as a live busin
 - Added customer-visible privacy/terms links and a production legal-review gate.
 - Hardened the runtime container and CI permissions.
 - Added isolated artifact builds so verification does not overwrite a developer's `dist` work.
+- Refreshed the npm lockfile to patched dependency versions and raised the Hono override floor to keep future installs audit-clean.
+- Added a public request form, hashed tracking links, refresh-safe progress, and explicit no-side-effect submission boundaries.
+- Added a searchable operator request queue with claim/research/review/contact/reject actions and durable audit history.
+- Added a provider integration workbench with local adapter verification, idempotent receipts, blocker evidence, and per-provider history.
+- Added authenticated `/app` entry coverage, session-scoped operator token persistence, and Playwright proof for the public-to-operator journey.
 
 ## 5. Lovable integration and customer ownership
 
@@ -218,17 +226,24 @@ Completed in this audit environment:
 - operations/durable job/readiness suite: pass;
 - browser console/API contract: pass;
 - desktop, mobile, keyboard, embedded preview, and customer portal browser flows: pass with no console warnings/errors;
-- production build: pass, 53 modules, ~0.8 seconds;
+- public intake API contract: pass, including invalid input, token scoping, refresh persistence, operator claim, durable research completion, and fresh-job retry;
+- integration workbench contract: pass, including provider registry, local blocked receipt, secret redaction, idempotency replay, history, and unsupported-provider handling;
+- public-to-operator browser journey: pass through the repository's Playwright fallback, including public entry, form submission, scoped tracking refresh, expected unauthenticated 401 denial, authenticated request search/action, integration verification, and mobile layout;
+- portfolio readiness browser gate: pass through the repository's Playwright fallback because the in-app browser backend was unavailable; no console issues;
+- production build: pass, 57 modules, ~1.3 seconds;
 - production dependency audit: 0 vulnerabilities;
-- safe-to-sell evals: 6/6 pass, with launch correctly held for missing external proof.
+- full `npm run check:deploy`: pass, including production-mode HTTP security headers, protected health, public referral intake, and graceful shutdown;
+- safe-to-sell evals: 6/6 pass, with launch correctly held for missing external proof;
+- strict production readiness: correctly fails closed in this mock environment; `npm run check:production -- --strict` reports 21 review blockers and 53 live blockers;
+- `npm run safe-to-sell`: correctly exits nonzero with `safe: no`, 0/8 live-ready providers, and no live-smoke-verified providers.
 
 Frontend artifact after bloat removal:
 
 | Artifact | Raw | Gzip |
 | --- | ---: | ---: |
-| Main application JS | 252.5 KB | 76.5 KB |
-| Global CSS | 171.2 KB | 28.0 KB |
-| Share portal JS (lazy) | 43.0 KB | 10.3 KB |
+| Main application JS | 270.8 KB | 81.2 KB |
+| Global CSS | 196.7 KB | 32.4 KB |
+| Share portal JS (lazy) | 43.3 KB | 10.4 KB |
 | Operations JS (lazy) | 52.1 KB | 14.4 KB |
 | Portfolio JS (lazy) | 355.4 KB | 45.8 KB |
 
@@ -257,6 +272,6 @@ These are not pilot launch blockers, but they should shape the post-pilot roadma
 
 ## 9. Final ship decision
 
-The code changes needed to prevent the previously unsafe customer-delivery behavior are complete. The product now has a coherent end-to-end boundary and fails closed when release proof is absent.
+The code changes needed to prevent the previously unsafe customer-delivery behavior are complete. The product now has a public acquisition workflow, durable operator handoff, provider verification evidence, and a coherent end-to-end boundary that fails closed when release proof is absent.
 
-The current environment must remain in mock/review mode. It becomes eligible for a controlled customer pilot only after the external checklist in section 6 is completed and both strict readiness commands pass. Sponsor qualification is intentionally outside this audit and remains deferred as requested.
+The current environment must remain in mock/review mode. The product is staging-ready, but it is not production-ready: live credentials, signed webhook proof, provider certification, encrypted-storage and restore evidence, MFA enforcement, public HTTPS, and legal sign-off are absent. It becomes eligible for a controlled customer pilot only after the external checklist in section 6 is completed and both strict readiness commands pass. Sponsor qualification is intentionally outside this audit and remains deferred as requested.

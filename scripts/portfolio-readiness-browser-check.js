@@ -35,7 +35,7 @@ try {
   const port = await getFreePort();
   const vitePort = await getFreePort();
   const apiBaseUrl = `http://127.0.0.1:${port}`;
-  const appUrl = `http://localhost:${vitePort}/`;
+  const appUrl = `http://localhost:${vitePort}/app`;
 
   devChild = spawn('npm', ['run', 'dev'], {
     cwd: repoRoot,
@@ -52,7 +52,7 @@ try {
   devChild.stderr.on('data', (buf) => devOutput.push(buf.toString()));
 
   await waitForHealth(apiBaseUrl, devChild, devOutput);
-  await waitForVite(appUrl, devChild, devOutput);
+  await waitForVite(`http://localhost:${vitePort}/`, devChild, devOutput);
 
   const { chromium } = await import('playwright');
   browser = await chromium.launch({ headless: true });
@@ -62,7 +62,7 @@ try {
   await desktop.goto(appUrl, { waitUntil: 'domcontentloaded' });
   const desktopTitle = await desktop.title();
   assert(desktopTitle.includes('Callan'));
-  assert(desktopTitle.includes('agency console'));
+  assert(desktopTitle.includes('websites that earn the next call'));
   await desktop.getByRole('tab', { name: 'Portfolio' }).click();
   const commandCenter = desktop.locator('section[aria-label="board decision command center"]');
   await commandCenter.getByRole('heading', { name: 'Decision Command Center' }).waitFor({ state: 'visible', timeout: UI_SETTLE_TIMEOUT_MS });

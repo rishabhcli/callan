@@ -5,7 +5,10 @@ async function jsonOr(res) {
 }
 
 const ADMIN_TOKEN_EVENT = 'callan-admin-token-changed';
-let inMemoryAdminToken = '';
+let inMemoryAdminToken = (() => {
+  if (typeof window === 'undefined') return '';
+  try { return window.sessionStorage.getItem('callan.adminToken') || ''; } catch { return ''; }
+})();
 
 function adminToken() {
   return inMemoryAdminToken;
@@ -34,10 +37,27 @@ export const api = {
     const value = String(token || '').trim();
     inMemoryAdminToken = value;
     if (typeof window !== 'undefined') {
+      try {
+        if (value) window.sessionStorage.setItem('callan.adminToken', value);
+        else window.sessionStorage.removeItem('callan.adminToken');
+      } catch {
+        // A locked-down browser may reject session storage; the in-memory token still works.
+      }
       window.dispatchEvent(new CustomEvent(ADMIN_TOKEN_EVENT, { detail: { configured: Boolean(value) } }));
     }
   },
   health: () => call('GET', '/api/health'),
+  publicIntake: (body) => call('POST', '/api/public/intake', body),
+  publicIntakeStatus: (token) => call('GET', `/api/public/intake/${encodeURIComponent(token)}`),
+  listIntakeRequests: (params = {}) => {
+    const q = new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== ''));
+    return call('GET', `/api/intake/requests${q.toString() ? `?${q}` : ''}`);
+  },
+  intakeRequestEvents: (id) => call('GET', `/api/intake/requests/${encodeURIComponent(id)}/events`),
+  intakeAction: (id, action) => call('POST', `/api/intake/requests/${encodeURIComponent(id)}/actions`, { action }),
+  integrations: () => call('GET', '/api/integrations'),
+  verifyIntegration: (provider, idempotencyKey) => call('POST', `/api/integrations/${encodeURIComponent(provider)}/verify`, { idempotencyKey }),
+  integrationHistory: (provider) => call('GET', `/api/integrations/${encodeURIComponent(provider)}/history`),
   listLeads: () => call('GET', '/api/leads'),
   getLead: (id) => call('GET', `/api/leads/${id}`),
   getLeadTrust: (id) => call('GET', `/api/leads/${id}/trust`),

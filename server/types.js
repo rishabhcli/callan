@@ -135,6 +135,17 @@ export const DiscoverRequest = z.object({
   count: z.number().int().min(1).max(8).default(4)
 });
 
+export const PublicIntakeRequest = z.object({
+  businessName: z.string().trim().min(2).max(160),
+  niche: z.string().trim().min(2).max(80),
+  city: z.string().trim().min(2).max(120),
+  website: z.string().trim().max(320).optional(),
+  phone: z.string().trim().max(40).optional(),
+  email: z.union([z.string().trim().email().max(320), z.literal('')]).optional(),
+  notes: z.string().trim().max(2000).optional(),
+  consent: z.literal(true)
+});
+
 export const CallRequest = z.object({
   leadId: z.string(),
   toPhone: z.string().optional()

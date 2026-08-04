@@ -21,7 +21,7 @@ try {
   const demo = await seedDemoLifecycle();
   const apiPort = await getFreePort();
   const apiBaseUrl = `http://127.0.0.1:${apiPort}`;
-  const appUrl = `${apiBaseUrl}/`;
+  const appUrl = `${apiBaseUrl}/app`;
   const env = mockEnv({ apiPort });
 
   await runCapture(npxCommand, ['vite', 'build', '--outDir', frontendDir, '--emptyOutDir'], { env });
@@ -91,7 +91,7 @@ try {
 
   const portal = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   const portalIssues = captureBrowserIssues(portal);
-  await portal.goto(`${appUrl.replace(/\/$/, '')}${demo.portalPath}`, {
+  await portal.goto(`${apiBaseUrl}${demo.portalPath}`, {
     waitUntil: 'domcontentloaded',
     timeout: 15_000
   });

@@ -464,7 +464,7 @@ try {
     const leadId = 'ops_cadence_call_retry';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: `lead:${leadId}`,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Cadence Studio',
       phone: '+14155550164',
       address: '7 Ops Way',
@@ -507,7 +507,7 @@ try {
     const scheduledCallId = 'sched_ops_callback_due';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Callback Studio',
       phone: '+14155550163',
       address: '8 Ops Way',
@@ -558,7 +558,7 @@ try {
     const now = Date.now();
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Retry Callback Studio',
       phone: '+14155550172',
       address: '8 Retry Way',
@@ -1297,7 +1297,7 @@ try {
     const callId = 'call_ops_inbound_memory';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Inbound caller memory',
       phone: '+14155550160',
       address: '11 Ops Way',
@@ -1353,7 +1353,7 @@ try {
     const callId = 'call_ops_inbound_research';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Inbound caller research',
       phone: '+14155550159',
       address: '12 Ops Way',
@@ -1409,7 +1409,7 @@ try {
     const callId = 'call_ops_operator_transfer';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Transfer Studio',
       phone: '+14155550161',
       address: '10 Ops Way',
@@ -1529,7 +1529,7 @@ try {
     const leadId = 'ops_aftercare_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Aftercare Studio',
       phone: '+14155550177',
       address: '3 Ops Way',
@@ -1667,7 +1667,7 @@ try {
     const leadId = 'ops_safe_to_renew_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Renewal Studio',
       phone: '+14155550988',
       address: '5 Renewal Way',
@@ -1761,7 +1761,7 @@ try {
     const leadId = 'ops_safe_to_renew_snapshot_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Renewal Snapshot Studio',
       phone: '+14155550989',
       address: '7 Renewal Way',
@@ -1854,7 +1854,7 @@ try {
     const leadId = 'ops_renewal_change_queue_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: `lead:${leadId}`,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Renewal Change Studio',
       phone: '+14155550212',
       address: '212 Change Way',
@@ -1951,7 +1951,7 @@ try {
     const leadId = 'ops_renewal_change_resolve_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: `lead:${leadId}`,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Renewal Resolve Studio',
       phone: '+14155550213',
       address: '213 Resolve Way',
@@ -2099,7 +2099,7 @@ try {
 	    const leadId = 'ops_renewal_billing_preflight_lead';
 	    dbModule.leads.insert({
 	      id: leadId,
-	      container_tag: `lead:${leadId}`,
+	      container_tag: containerTagFor(leadId),
 	      business_name: 'Ops Renewal Billing Preflight Studio',
 	      phone: '+14155550214',
 	      address: '214 Billing Preflight Way',
@@ -2295,7 +2295,7 @@ try {
 	    const leadId = 'ops_renewal_billing_execute_gate_lead';
 	    dbModule.leads.insert({
 	      id: leadId,
-	      container_tag: `lead:${leadId}`,
+	      container_tag: containerTagFor(leadId),
 	      business_name: 'Ops Renewal Billing Execute Gate Studio',
 	      phone: '+14155550217',
 	      address: '217 Billing Gate Way',
@@ -2505,7 +2505,7 @@ try {
 	    const leadId = 'ops_renewal_message_preflight_lead';
 	    dbModule.leads.insert({
 	      id: leadId,
-	      container_tag: `lead:${leadId}`,
+	      container_tag: containerTagFor(leadId),
 	      business_name: 'Ops Renewal Message Preflight Studio',
 	      phone: '+14155550215',
 	      address: '215 Message Preflight Way',
@@ -2739,7 +2739,7 @@ try {
 	    const leadId = 'ops_renewal_message_execute_gate_lead';
 	    dbModule.leads.insert({
 	      id: leadId,
-	      container_tag: `lead:${leadId}`,
+	      container_tag: containerTagFor(leadId),
 	      business_name: 'Ops Renewal Message Execute Gate Studio',
 	      phone: '+14155550216',
 	      address: '216 Message Gate Way',
@@ -2936,7 +2936,7 @@ try {
 	    const leadId = 'ops_renewal_confirmation_lead';
 	    dbModule.leads.insert({
 	      id: leadId,
-	      container_tag: `lead:${leadId}`,
+	      container_tag: containerTagFor(leadId),
 	      business_name: 'Ops Renewal Confirmation Studio',
 	      phone: '+14155550218',
 	      address: '218 Confirmation Way',
@@ -3810,7 +3810,7 @@ try {
     const leadId = 'demo_ops_recovery_lead';
     dbModule.leads.insert({
       id: leadId,
-      container_tag: leadId,
+      container_tag: containerTagFor(leadId),
       business_name: 'Ops Recovery Studio',
       phone: '+14155550188',
       address: '4 Ops Way',

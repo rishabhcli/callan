@@ -4,11 +4,11 @@ import { rateLimit } from 'express-rate-limit';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { resolve } from 'node:path';
 import { env, isValidRunMode } from './env.js';
-import { log } from './logger.js';
+import { log, redact } from './logger.js';
 import { attachStream, emit } from './sse.js';
-import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, portalTokens, accountManagerPlans, accountTasks, handoffCases, portfolioOperatingModel, portfolioOperatorInbox } from './db.js';
+import { leads, runs, calls, payments, builds, contactEvents, webhookEvents, doNotCall, events as eventStore, auditTrail, reasoningTraces, scheduledCalls as scheduledCallsDb, subscriptions, db, leadCosts, durableJobs, portalTokens, accountManagerPlans, accountTasks, handoffCases, portfolioOperatingModel, portfolioOperatorInbox, publicIntakeRequests, integrationVerificationReceipts } from './db.js';
 import { marginForLead } from './costs.js';
-import { DiscoverRequest, CallRequest, FollowupRequest, BuildRequest } from './types.js';
+import { DiscoverRequest, PublicIntakeRequest, CallRequest, FollowupRequest, BuildRequest } from './types.js';
 import {
   listKinds,
   memoryBusinesses,
@@ -127,7 +127,7 @@ import {
 	  updateIntake as portalUpdateIntake
 	} from './customerPortal.js';
 import { customerTrustSummaryForLead, trustSummaryForLead } from './trust.js';
-import { enqueueJob, jobQueueHealth, startDurableJobLoop, stopDurableJobLoop } from './jobs.js';
+import { enqueueJob, isRetryableJobError, jobQueueHealth, startDurableJobLoop, stopDurableJobLoop } from './jobs.js';
 import { EMAIL_CALLBACK_JOB_TYPE, handleEmailCallbackJob } from './emailCallback.js';
 import { CALL_ANALYSIS_JOB_TYPE } from './analysisQueue.js';
 import { MAIL_REPLY_JOB_TYPE, enqueueMailReplyJob } from './mailReplyQueue.js';
@@ -160,6 +160,13 @@ const publicIntakeLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { ok: false, code: 'PUBLIC_INTAKE_RATE_LIMITED', error: 'too many requests; try again later' }
+});
+const publicTrackingLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 180,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { ok: false, code: 'PUBLIC_TRACKING_RATE_LIMITED', error: 'too many tracking refreshes; try again later' }
 });
 const scopedLinkLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -430,9 +437,62 @@ async function handleBuilderBuildJob(payload = {}, job = null) {
   return runBuilderWithLiveEmail(payload);
 }
 
+async function handlePublicIntakeResearchJob(payload = {}, job = null) {
+  const intake = publicIntakeRequests.get(payload.intakeId);
+  if (!intake) throw new Error(`public intake ${payload.intakeId} not found`);
+  try {
+    const result = await runScraper({ niche: intake.niche, city: intake.city, count: 1 });
+    const matchedLead = result?.leads?.[0] || null;
+    publicIntakeRequests.update(intake.id, {
+      status: matchedLead ? 'ready_for_review' : 'failed',
+      matched_lead_id: matchedLead?.leadId || null,
+      final_message: matchedLead
+        ? 'Research is complete. An operator can now review the evidence and prepare the next step.'
+        : 'Research finished without a usable match. An operator needs to review the request manually.'
+    }, {
+      actor: 'scraper',
+      eventType: matchedLead ? 'research_completed' : 'research_needs_attention',
+      summary: matchedLead
+        ? 'Research completed and a candidate is ready for operator review.'
+        : 'Research completed without a usable candidate.',
+      metadata: {
+        runId: result?.runId || null,
+        matchedLeadId: matchedLead?.leadId || null,
+        mode: result?.mode || null,
+        failedCount: result?.failed?.length || 0
+      }
+    });
+    return { intakeId: intake.id, runId: result?.runId || null, matchedLeadId: matchedLead?.leadId || null };
+  } catch (error) {
+    const retryable = isRetryableJobError(error);
+    const finalAttempt = Number(job?.attempts || 0) >= Number(job?.max_attempts || 1);
+    const terminal = retryable === false || finalAttempt;
+    publicIntakeRequests.update(intake.id, {
+      status: terminal ? 'failed' : 'researching',
+      final_message: terminal
+        ? 'Research could not finish. An operator can retry it from the request queue.'
+        : 'Research is retrying after a temporary issue. An operator can monitor this request.'
+    }, {
+      actor: 'scraper',
+      eventType: terminal ? 'research_failed' : 'research_retry_scheduled',
+      summary: terminal
+        ? 'Research job failed and needs an operator retry.'
+        : 'Research job will retry automatically after a temporary failure.',
+      metadata: {
+        error: redact(error?.message || String(error)),
+        retryable: retryable !== false,
+        attempt: Number(job?.attempts || 0) || null,
+        maxAttempts: Number(job?.max_attempts || 0) || null
+      }
+    });
+    throw error;
+  }
+}
+
 const startBuilder = (args = {}) => enqueueBuilderBuild(args).row;
 
 const durableJobHandlers = {
+  'public_intake.research': handlePublicIntakeResearchJob,
   'research.discover': runScraper,
   'research.browser_use': runBrowserUseResearchJob,
   'call.followup': runCaller,
@@ -528,6 +588,70 @@ app.get('/api/health', (_req, res) => {
     lastErrors: Object.fromEntries(Object.entries(readiness.providers).map(([k, v]) => [k, v.lastError]).filter(([, v]) => v)),
     hackathon: env.hackathon
   });
+});
+
+const INTEGRATION_PROVIDERS = [
+  'gemini', 'supermemory', 'moss', 'agentphone', 'browserUse', 'lovable', 'v0', 'agentmail', 'stripe'
+];
+
+app.get('/api/integrations', (_req, res) => {
+  const readiness = liveReadiness();
+  const latest = integrationVerificationReceipts.latestByProvider();
+  const providers = Object.fromEntries(INTEGRATION_PROVIDERS.map((provider) => [provider, {
+    provider,
+    readiness: readiness.providers?.[provider] || { configured: false, status: 'unknown', missing: [] },
+    latestReceipt: latest[provider] || null
+  }]));
+  res.json({ ok: true, mode: env.runMode, providers });
+});
+
+app.post('/api/integrations/:provider/verify', (req, res) => {
+  const provider = String(req.params.provider || '').trim();
+  if (!INTEGRATION_PROVIDERS.includes(provider)) {
+    return res.status(404).json({ ok: false, code: 'INTEGRATION_NOT_SUPPORTED', error: 'provider is not supported' });
+  }
+  const startedAt = Date.now();
+  const readiness = liveReadiness();
+  const providerState = readiness.providers?.[provider] || {};
+  const configured = providerState.configured === true;
+  const idempotencyKey = String(req.body?.idempotencyKey || '').trim().slice(0, 160)
+    || `integration_verify:${provider}:${Date.now().toString(36)}:${randomBytes(4).toString('hex')}`;
+  const response = {
+    provider,
+    mode: env.runMode,
+    externalCall: false,
+    sideEffects: false,
+    adapterContract: 'readiness_and_provider_policy',
+    configured,
+    missing: Array.isArray(providerState.missing) ? providerState.missing : [],
+    required: providerState.required === true,
+    providerStatus: providerState.status || 'unknown',
+    blockerReasons: Array.isArray(providerState.blockerReasons) ? providerState.blockerReasons : [],
+    nextAction: providerState.nextAction || (configured ? 'run a provider sandbox smoke with authorized credentials' : 'configure the listed environment variables')
+  };
+  const recorded = integrationVerificationReceipts.record({
+    provider,
+    status: configured ? 'verified_local' : 'blocked_configuration',
+    mode: 'local',
+    verificationKind: 'adapter_configuration_policy',
+    durationMs: Date.now() - startedAt,
+    request: { provider, mode: env.runMode },
+    response,
+    actor: req.operatorAuth?.id || 'operator',
+    idempotencyKey
+  });
+  res.status(recorded.reused ? 200 : 201).json({
+    ok: true,
+    reused: recorded.reused,
+    receipt: recorded.receipt,
+    note: 'This receipt proves the local adapter contract and configuration posture; it is not a live provider smoke.'
+  });
+});
+
+app.get('/api/integrations/:provider/history', (req, res) => {
+  const provider = String(req.params.provider || '').trim();
+  if (!INTEGRATION_PROVIDERS.includes(provider)) return res.status(404).json({ ok: false, code: 'INTEGRATION_NOT_SUPPORTED', error: 'provider is not supported' });
+  res.json({ ok: true, provider, receipts: integrationVerificationReceipts.list({ provider, limit: req.query?.limit }) });
 });
 
 app.get('/api/revenue/status', (_req, res) => {
@@ -5043,6 +5167,136 @@ app.post('/api/leads/discover', (req, res) => {
   res.status(202).json({ accepted: true, jobId: job?.id, jobStatus: job?.status });
 });
 
+// Public acquisition flow. It creates a scoped customer request and a
+// non-callable lead record; no outbound side effect happens at submission.
+app.post('/api/public/intake', publicIntakeLimiter, (req, res) => {
+  const parsed = PublicIntakeRequest.safeParse({
+    businessName: req.body?.businessName,
+    niche: req.body?.niche,
+    city: req.body?.city,
+    website: req.body?.website || undefined,
+    phone: req.body?.phone || undefined,
+    email: req.body?.email || undefined,
+    notes: req.body?.notes || undefined,
+    consent: req.body?.consent
+  });
+  if (!parsed.success) return res.status(400).json({ ok: false, code: 'PUBLIC_INTAKE_INVALID', error: parsed.error.flatten() });
+  try {
+    const created = publicIntakeRequests.create({
+      businessName: parsed.data.businessName,
+      niche: parsed.data.niche,
+      city: parsed.data.city,
+      website: parsed.data.website || null,
+      phone: parsed.data.phone || null,
+      email: parsed.data.email || null,
+      notes: parsed.data.notes || null
+    });
+    res.status(201).json({
+      ok: true,
+      accepted: true,
+      trackingToken: created.token,
+      trackingPath: `/request/${encodeURIComponent(created.token)}`,
+      request: {
+        status: created.request.status,
+        businessName: created.request.business_name,
+        city: created.request.city,
+        createdAt: created.request.created_at
+      },
+      nextAction: 'An operator will review the brief before any outreach or build action.'
+    });
+  } catch (error) {
+    log.error('public_intake.create_failed', { error: error?.message || String(error) });
+    res.status(500).json({ ok: false, code: 'PUBLIC_INTAKE_CREATE_FAILED', error: 'request could not be saved' });
+  }
+});
+
+app.get('/api/public/intake/:token', publicTrackingLimiter, (req, res) => {
+  const view = publicIntakeRequests.publicView(req.params.token);
+  if (!view) return res.status(404).json({ ok: false, code: 'PUBLIC_INTAKE_NOT_FOUND', error: 'tracking link not found' });
+  res.json({ ok: true, ...view });
+});
+
+app.get('/api/intake/requests', (req, res) => {
+  const requests = publicIntakeRequests.list({
+    q: req.query?.q,
+    status: req.query?.status,
+    limit: req.query?.limit
+  });
+  res.json({
+    ok: true,
+    requests,
+    counts: publicIntakeRequests.countByStatus(),
+    total: requests.length
+  });
+});
+
+app.get('/api/intake/requests/:id/events', (req, res) => {
+  const request = publicIntakeRequests.get(req.params.id);
+  if (!request) return res.status(404).json({ ok: false, code: 'PUBLIC_INTAKE_NOT_FOUND', error: 'request not found' });
+  res.json({ ok: true, request, events: publicIntakeRequests.events(request.id) });
+});
+
+app.post('/api/intake/requests/:id/actions', (req, res) => {
+  const request = publicIntakeRequests.get(req.params.id);
+  if (!request) return res.status(404).json({ ok: false, code: 'PUBLIC_INTAKE_NOT_FOUND', error: 'request not found' });
+  const action = String(req.body?.action || '').trim().toLowerCase();
+  if (action === 'start_research') {
+    if (request.status === 'researching') return res.status(409).json({ ok: false, code: 'PUBLIC_INTAKE_RESEARCH_IN_PROGRESS', error: 'research is already running' });
+    const actor = req.operatorAuth?.id || 'operator';
+    const previousStatus = request.status;
+    const previousResearchJobId = request.research_job_id || null;
+    const researchAttemptKey = `public_intake_research:${request.id}:${request.research_job_id || 'initial'}`;
+    // Stage the state before enqueueing so a fast worker cannot finish and then
+    // have its terminal status overwritten by this request handler.
+    const staged = publicIntakeRequests.action(request.id, action, {
+      actor,
+      researchJobId: null,
+      metadata: {
+        action,
+        researchAttemptKey,
+        previousStatus,
+        previousResearchJobId
+      }
+    });
+    if (!staged.ok) return res.status(409).json({ ok: false, code: `PUBLIC_INTAKE_${staged.reason.toUpperCase()}`, error: staged.reason });
+    let job;
+    try {
+      job = fire('public_intake.research', { intakeId: request.id }, handlePublicIntakeResearchJob, {
+        type: 'public_intake.research',
+        idempotencyKey: researchAttemptKey
+      });
+      if (!job?.id) throw new Error('durable research job did not return an id');
+    } catch (error) {
+      publicIntakeRequests.update(request.id, {
+        status: previousStatus,
+        research_job_id: previousResearchJobId
+      }, {
+        actor,
+        eventType: 'research_queue_failed',
+        summary: 'Research could not be queued; the request returned to its prior state.',
+        metadata: { action, error: redact(error?.message || String(error)) }
+      });
+      log.error('public_intake.research_enqueue_failed', {
+        intakeId: request.id,
+        error: redact(error?.message || String(error))
+      });
+      return res.status(503).json({ ok: false, code: 'PUBLIC_INTAKE_RESEARCH_QUEUE_FAILED', error: 'research could not be queued' });
+    }
+    const updated = publicIntakeRequests.update(request.id, {
+      research_job_id: job.id
+    }, {
+      actor,
+      eventType: 'research_job_recorded',
+      summary: 'Durable research job recorded for this request.',
+      metadata: { action, jobId: job.id }
+    });
+    return res.status(202).json({ ok: true, accepted: true, jobId: job.id, action, request: updated });
+  }
+  const result = publicIntakeRequests.action(request.id, action, { actor: req.operatorAuth?.id || 'operator' });
+  if (!result.ok) return res.status(result.reason === 'unsupported_action' ? 400 : 404).json({ ok: false, code: `PUBLIC_INTAKE_${result.reason.toUpperCase()}`, error: result.reason });
+  res.json(result);
+});
+
 app.post('/api/referrals/leads', (req, res) => {
   const parsed = DiscoverRequest.safeParse({
     niche: req.body?.niche,
@@ -6205,6 +6459,14 @@ function safeRequestPath(req) {
 
 const httpServer = app.listen(env.port, () => {
   log.info(`callmemaybe server listening`, { port: env.port, mode: env.runMode });
+  try {
+    const recoveredResearch = publicIntakeRequests.reconcileResearchQueue();
+    if (recoveredResearch.length) {
+      log.warn('public_intake.research_queue_reconciled', { count: recoveredResearch.length, recoveredResearch });
+    }
+  } catch (err) {
+    log.warn('public_intake.research_queue_reconcile_failed', { error: err?.message || String(err) });
+  }
   startDurableJobLoop(durableJobHandlers);
   try {
     log.info('ops.backup_scheduler_start', startOpsBackupScheduler());

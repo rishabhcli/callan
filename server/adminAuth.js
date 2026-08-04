@@ -10,12 +10,14 @@ const PUBLIC_API_PREFIXES = [
   '/api/share/build/',
   '/api/hosting/accept/',
   '/api/preview-build/',
-  '/api/unsubscribe/'
+  '/api/unsubscribe/',
+  '/api/public/intake/'
 ];
 const PUBLIC_API_EXACT_PATHS = new Set([
   '/api/ping',
   '/api/referrals/leads',
-  '/api/referrals/landing-html'
+  '/api/referrals/landing-html',
+  '/api/public/intake'
 ]);
 
 export function adminAuthPosture({

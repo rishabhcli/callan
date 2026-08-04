@@ -11,6 +11,10 @@ const MemoryView = lazy(() => import('./views/MemoryView.jsx'));
 const AgentsView = lazy(() => import('./views/AgentsView.jsx'));
 const SettingsView = lazy(() => import('./views/SettingsView.jsx'));
 const ShareView = lazy(() => import('./views/ShareView.jsx'));
+const RequestsView = lazy(() => import('./views/RequestsView.jsx'));
+const IntegrationsView = lazy(() => import('./views/IntegrationsView.jsx'));
+import PublicLandingView from './views/PublicLandingView.jsx';
+import PublicIntakeTrackView from './views/PublicIntakeTrackView.jsx';
 
 const RESEARCH_LANE_LABELS = {
   'reverse-phone': 'Reverse phone lookup',
@@ -167,6 +171,7 @@ function appendInboundPreview(transcript = [], evt = {}) {
 
 const PRIMARY_TABS = [
   { id: 'loop',       label: 'Loop',        sub: 'proof' },
+  { id: 'requests',   label: 'Requests',    sub: 'intake queue' },
   { id: 'operations', label: 'Operations', sub: 'agent floor' },
   { id: 'portfolio',  label: 'Portfolio',  sub: 'agency' }
 ];
@@ -175,6 +180,7 @@ const TOOL_TABS = [
   { id: 'agents',     label: 'Agents',     sub: 'workers' },
   { id: 'scraper',    label: 'Scraper',    sub: 'browser fleet' },
   { id: 'memory',     label: 'Memory',     sub: 'supermemory' },
+  { id: 'integrations', label: 'Integrations', sub: 'provider checks' },
   { id: 'settings',   label: 'Settings',   sub: 'config' }
 ];
 
@@ -290,8 +296,17 @@ function getShareToken() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+function getPublicIntakeToken() {
+  if (typeof window === 'undefined') return null;
+  const path = window.location.pathname || '';
+  const match = path.match(/^\/request\/([^/?#]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 export default function App() {
   const shareToken = useMemo(getShareToken, []);
+  const intakeToken = useMemo(getPublicIntakeToken, []);
+  const path = typeof window === 'undefined' ? '' : window.location.pathname;
   if (shareToken) {
     return (
       <Suspense fallback={<ViewFallback label="Loading customer portal" />}>
@@ -299,6 +314,8 @@ export default function App() {
       </Suspense>
     );
   }
+  if (intakeToken) return <PublicIntakeTrackView token={intakeToken} />;
+  if (path === '/' || path === '/index.html' || path === '') return <PublicLandingView />;
   return <Console />;
 }
 
@@ -307,7 +324,10 @@ function Console() {
   const [leads, setLeads] = useState([]);
   const [focusedLeadId, setFocusedLeadId] = useState(null);
   const [leadDetail, setLeadDetail] = useState(null);
-  const [activeTab, setActiveTab] = useState('loop');
+  const [activeTab, setActiveTab] = useState(() => {
+    if (typeof window === 'undefined') return 'loop';
+    return new URLSearchParams(window.location.search).get('view') || 'loop';
+  });
   const [focusedNodeId, setFocusedNodeId] = useState(null);
   const [outreach, setOutreach] = useState(null);
   const [handoffCases, setHandoffCases] = useState([]);
@@ -710,6 +730,8 @@ function Console() {
                 onRunBuild={retryBuild}
                 onOpenWorkbench={() => setActiveTab('operations')}
               />
+            ) : activeTab === 'requests' ? (
+              <RequestsView onFocusLead={handleLeadFocus} onLeadChanged={handleLeadChanged} />
             ) : activeTab === 'operations' ? (
               <OperationsView
                 nodeStates={nodeStates}
@@ -752,6 +774,8 @@ function Console() {
               />
             ) : activeTab === 'memory' ? (
               <MemoryView focusedLeadId={focusedLeadId} />
+            ) : activeTab === 'integrations' ? (
+              <IntegrationsView health={health} />
             ) : activeTab === 'settings' ? (
               <SettingsView
                 health={health}
@@ -814,7 +838,7 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
 
   return (
     <header className="nyna-topbar">
-      <div className="nyna-brand">
+      <a className="nyna-brand nyna-brand-link" href="/" aria-label="Open public Callan site">
         <div className="nyna-brand-mark">
           <Sparkle />
         </div>
@@ -822,7 +846,7 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
           <div className="nyna-brand-name">Callan</div>
           <div className="nyna-brand-tag">Autonomous agency</div>
         </div>
-      </div>
+      </a>
 
       <nav className="nyna-tabs" aria-label="Workspace">
         <div className="nyna-primary-tabs" role="tablist" aria-label="Primary workspace views">
@@ -877,6 +901,7 @@ function Topbar({ activeTab, onTabChange, queueCounts }) {
 }
 
 function badgeFor(tabId, queue = {}) {
+  if (tabId === 'requests' && (queue.publicIntake || 0) > 0) return queue.publicIntake;
   if (tabId === 'operations' && (queue.calling || 0) > 0) return queue.calling;
   if (tabId === 'scraper' && (queue.queued || 0) > 0) return queue.queued;
   return null;
@@ -980,6 +1005,14 @@ function sectionItemsForTab(tab, counters = {}, queue = {}, selectedNodeId = nul
       { label: 'lovable', nodeId: 'builder', count: counters.builder || 0, tone: counters.builder ? 'live' : null, active: selectedNodeId === 'builder' }
     ];
   }
+  if (tab === 'requests') {
+    return [
+      { label: 'public intake queue', active: true },
+      { label: 'needs review' },
+      { label: 'research handoffs' },
+      { label: 'audit history' }
+    ];
+  }
   if (tab === 'agents') {
     return [
       { label: 'fleet rollup',  active: true },
@@ -1009,6 +1042,14 @@ function sectionItemsForTab(tab, counters = {}, queue = {}, selectedNodeId = nul
       { label: 'businesses' },
       { label: 'ledger' },
       { label: 'failed writes' }
+    ];
+  }
+  if (tab === 'integrations') {
+    return [
+      { label: 'provider registry', active: true },
+      { label: 'local verification' },
+      { label: 'receipt history' },
+      { label: 'live blockers' }
     ];
   }
   if (tab === 'settings') {

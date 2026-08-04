@@ -6790,6 +6790,70 @@ db.exec(`
     ON scheduled_calls(lead_id) WHERE status='pending';
 `);
 
+// Public intake is the customer-facing acquisition boundary. Store only a
+// hash of the tracking token so a database read cannot mint a valid link.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS public_intake_requests (
+    id TEXT PRIMARY KEY,
+    tracking_token_hash TEXT NOT NULL UNIQUE,
+    lead_id TEXT NOT NULL,
+    business_name TEXT NOT NULL,
+    niche TEXT NOT NULL,
+    city TEXT NOT NULL,
+    website TEXT,
+    phone TEXT,
+    email TEXT,
+    notes TEXT,
+    source TEXT NOT NULL DEFAULT 'public_landing',
+    status TEXT NOT NULL DEFAULT 'received',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    assigned_to TEXT,
+    research_job_id TEXT,
+    matched_lead_id TEXT,
+    final_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(lead_id) REFERENCES leads(id) ON DELETE CASCADE,
+    FOREIGN KEY(matched_lead_id) REFERENCES leads(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_public_intake_status_updated
+    ON public_intake_requests(status, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_public_intake_lead
+    ON public_intake_requests(lead_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS public_intake_events (
+    id TEXT PRIMARY KEY,
+    intake_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(intake_id) REFERENCES public_intake_requests(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_public_intake_events_intake
+    ON public_intake_events(intake_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS integration_verification_receipts (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    verification_kind TEXT NOT NULL,
+    duration_ms INTEGER,
+    request_json TEXT,
+    response_json TEXT,
+    error TEXT,
+    actor TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_integration_receipts_provider_created
+    ON integration_verification_receipts(provider, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_integration_receipts_status_created
+    ON integration_verification_receipts(status, created_at DESC);
+`);
+
 backfillLeadDedupeKeys();
 backfillAuditEvents();
 backfillComplianceDecisions();
@@ -39239,11 +39303,11 @@ export const portfolioOperatingModel = {
 };
 
 export const leads = {
-  insert(row) {
+  insert(row, { skipDedupe = false } = {}) {
     const now = Date.now();
     const record = leadDefaults(row, now);
     const runInsert = db.transaction(() => {
-      const duplicate = findDuplicateCandidate(record);
+      const duplicate = skipDedupe ? null : findDuplicateCandidate(record);
       if (duplicate) {
         const idOnly = duplicate.reasons.includes('id') && duplicate.reasons.length === 1;
         const patch = buildDuplicateMergePatch(duplicate.lead, record, duplicate.reasons, now);
@@ -39411,6 +39475,411 @@ export const leads = {
       paid: db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE status = 'paid'`).get().n,
       shipped: db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE status = 'shipped'`).get().n
     };
+  }
+};
+
+const PUBLIC_INTAKE_STATUSES = new Set([
+  'received', 'claimed', 'researching', 'ready_for_review', 'contacted', 'rejected', 'failed'
+]);
+
+function intakeId() {
+  return `intake_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
+}
+
+function intakeEventId() {
+  return `intake_evt_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
+}
+
+function intakeToken() {
+  return `trk_${randomBytes(24).toString('base64url')}`;
+}
+
+function intakeTokenHash(token) {
+  return createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function hydratePublicIntake(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    metadata: safeJson(row.metadata_json) || null
+  };
+}
+
+function publicIntakeEvent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    intakeId: row.intake_id,
+    eventType: row.event_type,
+    actor: row.actor,
+    summary: row.summary,
+    metadata: safeJson(row.metadata_json) || null,
+    createdAt: row.created_at
+  };
+}
+
+// Public requests deliberately have a separate lifecycle from leads. A lead
+// is the operator's working record; this row is the customer-owned handoff.
+export const publicIntakeRequests = {
+  create({
+    businessName,
+    niche,
+    city,
+    website = null,
+    phone = null,
+    email = null,
+    notes = null,
+    source = 'public_landing',
+    priority = 'normal',
+    now = Date.now()
+  } = {}) {
+    const create = db.transaction(() => {
+      const id = intakeId();
+      const token = intakeToken();
+      const leadId = `lead_${id}`;
+      const leadResult = leads.insert({
+        id: leadId,
+        container_tag: `lead:${leadId}`,
+        business_name: businessName,
+        phone,
+        address: null,
+        niche,
+        city,
+        website,
+        status: 'discovered',
+        research_status: 'new',
+        outreach_status: 'not_queued',
+        risk_status: 'pending',
+        consent_status: 'public_intake',
+        phone_classification: phone ? 'business' : 'unknown',
+        next_action: 'review_public_intake',
+        source_url: website || null
+      }, { skipDedupe: true });
+      const lead = leadResult.lead;
+      db.prepare(`
+        INSERT INTO public_intake_requests (
+          id, tracking_token_hash, lead_id, business_name, niche, city, website,
+          phone, email, notes, source, status, priority, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?)
+      `).run(
+        id,
+        intakeTokenHash(token),
+        lead.id,
+        businessName,
+        niche,
+        city,
+        website || null,
+        phone || null,
+        email || null,
+        notes || null,
+        source,
+        priority,
+        now,
+        now
+      );
+      this.recordEvent({
+        intakeId: id,
+        eventType: 'received',
+        actor: 'public_intake',
+        summary: 'Request received from the public landing page.',
+        metadata: { source, duplicateLead: false },
+        now
+      });
+      return {
+        token,
+        request: this.get(id),
+        lead,
+        duplicateLead: false
+      };
+    });
+    return create();
+  },
+  get(id) {
+    return hydratePublicIntake(db.prepare(`SELECT * FROM public_intake_requests WHERE id = ?`).get(id));
+  },
+  getByToken(token) {
+    const raw = String(token || '').trim();
+    if (!/^trk_[A-Za-z0-9_-]{32,}$/.test(raw)) return null;
+    return this.getByTokenHash(intakeTokenHash(raw));
+  },
+  getByTokenHash(hash) {
+    return hydratePublicIntake(db.prepare(`
+      SELECT * FROM public_intake_requests WHERE tracking_token_hash = ? LIMIT 1
+    `).get(hash));
+  },
+  publicView(token) {
+    const row = this.getByToken(token);
+    if (!row) return null;
+    const events = this.events(row.id, { limit: 20 }).map((event) => ({
+      eventType: event.eventType,
+      summary: event.summary,
+      createdAt: event.createdAt
+    }));
+    return {
+      request: {
+        businessName: row.business_name,
+        niche: row.niche,
+        city: row.city,
+        status: row.status,
+        priority: row.priority,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        researchJobQueued: row.status === 'researching',
+        finalMessage: row.final_message || null
+      },
+      events
+    };
+  },
+  list({ q = '', status = '', limit = 100 } = {}) {
+    const capped = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const clauses = [];
+    const params = [];
+    const query = String(q || '').trim().slice(0, 120);
+    if (query) {
+      const like = `%${query.replace(/[%_]/g, '\\$&')}%`;
+      clauses.push(`(
+        r.business_name LIKE ? ESCAPE '\\' OR r.niche LIKE ? ESCAPE '\\' OR
+        r.city LIKE ? ESCAPE '\\' OR r.status LIKE ? ESCAPE '\\'
+      )`);
+      params.push(like, like, like, like);
+    }
+    if (status && PUBLIC_INTAKE_STATUSES.has(status)) {
+      clauses.push('r.status = ?');
+      params.push(status);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return db.prepare(`
+      SELECT r.*, l.research_status AS lead_research_status,
+             l.outreach_status AS lead_outreach_status,
+             l.next_action AS lead_next_action
+      FROM public_intake_requests r
+      JOIN leads l ON l.id = r.lead_id
+      ${where}
+      ORDER BY r.updated_at DESC, r.created_at DESC, r.id DESC
+      LIMIT ?
+    `).all(...params, capped).map(hydratePublicIntake);
+  },
+  countByStatus() {
+    const rows = db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM public_intake_requests GROUP BY status ORDER BY status
+    `).all();
+    return Object.fromEntries(rows.map((row) => [row.status, Number(row.count) || 0]));
+  },
+  events(intakeIdValue, { limit = 50 } = {}) {
+    const capped = Math.max(1, Math.min(Number(limit) || 50, 200));
+    return db.prepare(`
+      SELECT * FROM public_intake_events
+      WHERE intake_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(intakeIdValue, capped).map(publicIntakeEvent);
+  },
+  reconcileResearchQueue({ now = Date.now(), staleAfterMs = 0, limit = 100 } = {}) {
+    const cutoff = now - Math.max(0, Number(staleAfterMs) || 0);
+    const capped = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const rows = db.prepare(`
+      SELECT * FROM public_intake_requests
+      WHERE status = 'researching'
+        AND (research_job_id IS NULL OR research_job_id = '')
+        AND updated_at <= ?
+      ORDER BY updated_at ASC, id ASC
+      LIMIT ?
+    `).all(cutoff, capped);
+    const recovered = [];
+    for (const row of rows) {
+      const job = db.prepare(`
+        SELECT id, status, attempts, max_attempts
+        FROM jobs
+        WHERE type = 'public_intake.research'
+          AND json_extract(payload_json, '$.intakeId') = ?
+          AND status IN ('queued', 'retry', 'running')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `).get(row.id);
+      if (job) {
+        this.update(row.id, { research_job_id: job.id }, {
+          actor: 'system',
+          eventType: 'research_job_reconciled',
+          summary: 'A durable research job was recovered and linked to this request.',
+          metadata: {
+            jobId: job.id,
+            jobStatus: job.status,
+            attempts: job.attempts,
+            maxAttempts: job.max_attempts
+          },
+          now
+        });
+        recovered.push({ intakeId: row.id, action: 'linked', jobId: job.id, jobStatus: job.status });
+        continue;
+      }
+
+      const started = db.prepare(`
+        SELECT metadata_json
+        FROM public_intake_events
+        WHERE intake_id = ? AND event_type = 'research_started'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `).get(row.id);
+      const metadata = safeJson(started?.metadata_json) || {};
+      const previousStatus = PUBLIC_INTAKE_STATUSES.has(metadata.previousStatus)
+        && metadata.previousStatus !== 'researching'
+        ? metadata.previousStatus
+        : (row.assigned_to ? 'claimed' : 'received');
+      const previousResearchJobId = typeof metadata.previousResearchJobId === 'string'
+        ? metadata.previousResearchJobId
+        : null;
+      this.update(row.id, {
+        status: previousStatus,
+        research_job_id: previousResearchJobId,
+        final_message: 'Research was interrupted before its durable job could be recorded. An operator can retry it.'
+      }, {
+        actor: 'system',
+        eventType: 'research_queue_recovered',
+        summary: 'Research queue state was restored after no durable job could be found.',
+        metadata: {
+          reason: 'missing_durable_job',
+          previousStatus,
+          previousResearchJobId
+        },
+        now
+      });
+      recovered.push({ intakeId: row.id, action: 'reset', status: previousStatus });
+    }
+    return recovered;
+  },
+  recordEvent({ intakeId: intakeIdValue, eventType, actor = 'system', summary, metadata = null, now = Date.now() } = {}) {
+    const id = intakeEventId();
+    db.prepare(`
+      INSERT INTO public_intake_events (id, intake_id, event_type, actor, summary, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, intakeIdValue, eventType, actor, summary, jsonText(metadata), now);
+    return publicIntakeEvent(db.prepare(`SELECT * FROM public_intake_events WHERE id = ?`).get(id));
+  },
+  update(id, patch = {}, { actor = 'system', eventType = null, summary = null, metadata = null, now = Date.now() } = {}) {
+    const update = db.transaction(() => {
+      const before = this.get(id);
+      if (!before) return null;
+      const allowed = ['status', 'priority', 'assigned_to', 'research_job_id', 'matched_lead_id', 'final_message'];
+      const changes = Object.fromEntries(Object.entries(patch).filter(([key]) => allowed.includes(key)));
+      if (changes.status && !PUBLIC_INTAKE_STATUSES.has(changes.status)) throw new Error(`invalid public intake status: ${changes.status}`);
+      const columns = Object.keys(changes);
+      if (columns.length) {
+        const set = columns.map((column) => `${column} = @${column}`).join(', ');
+        db.prepare(`UPDATE public_intake_requests SET ${set}, updated_at = @updated_at WHERE id = @id`)
+          .run({ ...changes, updated_at: now, id });
+      }
+      const after = this.get(id);
+      if (eventType || columns.length) {
+        this.recordEvent({
+          intakeId: id,
+          eventType: eventType || 'updated',
+          actor,
+          summary: summary || `Request updated: ${columns.join(', ') || 'no fields changed'}.`,
+          metadata: metadata || { changed: columns },
+          now
+        });
+      }
+      return after;
+    });
+    return update();
+  },
+  action(id, action, { actor = 'operator', researchJobId = null, metadata = null, now = Date.now() } = {}) {
+    const current = this.get(id);
+    if (!current) return { ok: false, reason: 'not_found', request: null };
+    const normalized = String(action || '').trim().toLowerCase();
+    const actionMap = {
+      claim: { status: 'claimed', eventType: 'claimed', summary: 'Request claimed for operator review.' },
+      start_research: { status: 'researching', eventType: 'research_started', summary: 'Research job queued for this request.' },
+      mark_reviewed: { status: 'ready_for_review', eventType: 'marked_reviewed', summary: 'Research handoff marked ready for review.' },
+      mark_contacted: { status: 'contacted', eventType: 'contacted', summary: 'Operator recorded a customer contact attempt.' },
+      reject: { status: 'rejected', eventType: 'rejected', summary: 'Request rejected by an operator.' }
+    };
+    const next = actionMap[normalized];
+    if (!next) return { ok: false, reason: 'unsupported_action', request: current };
+    const patch = { status: next.status };
+    if (normalized === 'claim') patch.assigned_to = actor;
+    if (normalized === 'start_research') patch.research_job_id = researchJobId;
+    const request = this.update(id, patch, {
+      actor,
+      eventType: next.eventType,
+      summary: next.summary,
+      metadata: metadata || { action: normalized, researchJobId },
+      now
+    });
+    return { ok: true, action: normalized, request };
+  }
+};
+
+export const integrationVerificationReceipts = {
+  record({
+    provider,
+    status,
+    mode = 'local',
+    verificationKind = 'adapter_contract',
+    durationMs = null,
+    request = null,
+    response = null,
+    error = null,
+    actor = 'operator',
+    idempotencyKey = null,
+    now = Date.now()
+  } = {}) {
+    if (idempotencyKey) {
+      const existing = this.getByIdempotencyKey(idempotencyKey);
+      if (existing) return { receipt: existing, reused: true };
+    }
+    const id = `integration_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
+    db.prepare(`
+      INSERT INTO integration_verification_receipts (
+        id, provider, status, mode, verification_kind, duration_ms,
+        request_json, response_json, error, actor, idempotency_key, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      provider,
+      status,
+      mode,
+      verificationKind,
+      durationMs === null ? null : Math.max(0, Math.trunc(Number(durationMs) || 0)),
+      jsonText(redact(request || {})),
+      jsonText(redact(response || {})),
+      error ? redact(String(error)).slice(0, 1000) : null,
+      actor,
+      idempotencyKey || null,
+      now
+    );
+    return { receipt: this.get(id), reused: false };
+  },
+  get(id) {
+    const row = db.prepare(`SELECT * FROM integration_verification_receipts WHERE id = ?`).get(id);
+    return row ? {
+      ...row,
+      request: safeJson(row.request_json) || {},
+      response: safeJson(row.response_json) || {}
+    } : null;
+  },
+  getByIdempotencyKey(key) {
+    if (!key) return null;
+    const row = db.prepare(`SELECT id FROM integration_verification_receipts WHERE idempotency_key = ?`).get(key);
+    return row ? this.get(row.id) : null;
+  },
+  list({ provider = null, limit = 100 } = {}) {
+    const capped = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const rows = provider
+      ? db.prepare(`SELECT * FROM integration_verification_receipts WHERE provider = ? ORDER BY created_at DESC LIMIT ?`).all(provider, capped)
+      : db.prepare(`SELECT * FROM integration_verification_receipts ORDER BY created_at DESC LIMIT ?`).all(capped);
+    return rows.map((row) => this.get(row.id));
+  },
+  latestByProvider() {
+    const rows = db.prepare(`
+      SELECT r.* FROM integration_verification_receipts r
+      JOIN (
+        SELECT provider, MAX(created_at) AS created_at
+        FROM integration_verification_receipts GROUP BY provider
+      ) latest ON latest.provider = r.provider AND latest.created_at = r.created_at
+      ORDER BY r.provider
+    `).all();
+    return Object.fromEntries(rows.map((row) => [row.provider, this.get(row.id)]));
   }
 };
 

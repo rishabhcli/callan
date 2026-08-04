@@ -38,7 +38,14 @@ npm run demo:e2e -- --data-dir .data/demo --reset-demo-data
 DATA_DIR=.data/demo npm run dev
 ```
 
-Open the Vite URL and stay on the default **Loop** screen. It automatically selects the latest run and shows:
+Open the Vite URL for the public request site. The primary customer journey is:
+
+1. Submit a business brief at `/` and receive a private `/request/:token` tracking link.
+2. Refresh the tracking page to see the persisted request state and activity trail.
+3. Open `/app`, authenticate with the operator token when configured, and use **Requests** to claim the brief and queue research.
+4. Use **Integrations** to run a redacted local adapter verification. This is explicitly not a live provider smoke.
+
+The operator console's **Loop** screen remains available at `/app` and automatically selects the latest run. It shows:
 
 - the spec → plan → act → observe → repair → verify cycle;
 - the first failed QA result and exact acceptance errors;
@@ -48,6 +55,8 @@ Open the Vite URL and stay on the default **Loop** screen. It automatically sele
 - the underlying decision ledger.
 
 The lightweight agent floor, queues, portfolio controls, memory, scraper, and settings remain available under **Operations**, **Portfolio**, and **Tools**. They are secondary operator surfaces, not the opening explanation.
+
+The public intake is deliberately fail-closed: submission creates a non-callable lead and a durable customer request, but it never places a call, sends email, charges a card, or starts a build. Those actions remain explicit operator decisions.
 
 ## Demo commands
 
@@ -63,6 +72,11 @@ The lightweight agent floor, queues, portfolio controls, memory, scraper, and se
 | `npm run check:production-safety` | Verify production mode refuses unsafe configuration. |
 | `npm run check:ci` | Run the full deterministic suite. |
 | `npm run check:deploy` | Add real-browser and production HTTP verification. |
+| `npm run check:public-intake` | Verify public submission, scoped tracking, refresh persistence, operator claim, and durable research handoff. |
+| `npm run check:public-intake-retry` | Verify transient research failures stay queued while the durable job retries. |
+| `npm run check:public-intake-recovery` | Verify boot-time research reconciliation links orphaned durable jobs and restores interrupted staging. |
+| `npm run check:integrations` | Verify provider registry, local receipts, redaction, idempotency, and unsupported-provider handling. |
+| `npm run check:public-browser` | Run the public landing, tracking, auth denial, request queue, integration, and mobile Playwright journey. |
 
 Useful demo variants:
 
@@ -92,7 +106,11 @@ The project is a React/Vite console backed by an Express service and SQLite even
 
 ```text
 src/
-  App.jsx                 shell, live event state, progressive navigation
+  App.jsx                 public routes, operator shell, live event state
+  views/PublicLandingView.jsx  public acquisition site and intake form
+  views/PublicIntakeTrackView.jsx  scoped request tracking page
+  views/RequestsView.jsx  searchable operator intake queue and actions
+  views/IntegrationsView.jsx  local provider verification and receipt history
   views/LoopView.jsx      judge-facing loop proof
   views/OperationsView.jsx advanced agent workbench
 server/
@@ -102,8 +120,12 @@ server/
   fulfillment/release.js  final publication, portability, ownership, and domain gate
   customerLinks.js        purpose-scoped customer capability URLs
   db.js                   durable operational ledger
+  adminAuth.js            operator roles and route protection
 scripts/
   demo-e2e.js             deterministic full-lifecycle harness
+  public-intake-check.js  public request API and persistence contract
+  public-intake-retry-check.js  transient durable research retry contract
+  public-intake-browser-check.js  public-to-operator Playwright journey
 ```
 
 Key persisted evidence for the build loop:
@@ -176,4 +198,4 @@ Security findings and operational constraints are documented in [security_best_p
 
 ## Current scope
 
-Callan is a production-minded release candidate with a working agency lifecycle and durable self-correcting fulfillment loop. This checkout is not production-live: the current environment lacks live credentials, webhook proof, provider certification, encrypted-storage/restore evidence, MFA enforcement, and legal sign-off. Keep it in mock/review mode until the strict production gates pass. Sponsor qualification remains intentionally deferred for separate review.
+Callan is a production-minded release candidate with a public acquisition journey, a durable operator request queue, a self-correcting fulfillment loop, and a provider verification workbench. This checkout is not production-live: the current environment lacks live credentials, webhook proof, provider certification, encrypted-storage/restore evidence, MFA enforcement, and legal sign-off. Keep it in mock/review mode until the strict production gates pass. Sponsor qualification remains intentionally deferred for separate review.
